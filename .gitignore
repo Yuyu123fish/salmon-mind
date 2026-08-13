@@ -1,0 +1,30 @@
+# Build outputs
+**/target/
+
+# IDEs and local tools
+.idea/
+.vscode/
+.cursor/
+.claude/
+.superpowers/
+.pnpm-store/
+*.iml
+
+# Local plans and generated indexes
+temp/
+**/java_files.txt
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+apps/server/src/main/resources/application-dev.yml
+
+# Local data. Docker-managed data belongs under infra/data.
+/data/
+/infra/data/*
+!/infra/data/.gitkeep
+
+# Operating-system files
+.DS_Store
+Thumbs.db

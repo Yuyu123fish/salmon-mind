@@ -1,0 +1,95 @@
+name: salmon-mind
+
+services:
+  postgres:
+    image: postgres:17.10-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-salmon_mind}
+      POSTGRES_USER: ${POSTGRES_USER:-salmon_mind}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-salmon_mind_local}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - ./infra/data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: ${ELASTICSEARCH_JAVA_OPTS:--Xms512m -Xmx512m}
+    ports:
+      - "127.0.0.1:${ELASTICSEARCH_PORT:-9200}:9200"
+    volumes:
+      - ./infra/data/elasticsearch:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null"]
+      interval: 10s
+      timeout: 6s
+      retries: 30
+
+  rustfs:
+    image: rustfs/rustfs:1.0.0-beta.12
+    restart: unless-stopped
+    command: ["/data"]
+    environment:
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-salmonmind}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-salmonmind-local-change-me}
+    ports:
+      - "127.0.0.1:${RUSTFS_API_PORT:-9000}:9000"
+      - "127.0.0.1:${RUSTFS_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - ./infra/data/rustfs:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  server:
+    build:
+      context: ./apps/server
+    restart: unless-stopped
+    environment:
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: 8080
+      DATABASE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-salmon_mind}
+      DATABASE_USERNAME: ${POSTGRES_USER:-salmon_mind}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-salmon_mind_local}
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      RUSTFS_ENDPOINT: http://rustfs:9000
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-salmonmind}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-salmonmind-local-change-me}
+      RUSTFS_BUCKET_KNOWLEDGE: ${RUSTFS_BUCKET_KNOWLEDGE:-salmon-knowledge}
+      MODEL_CHAT_BASE_URL: ${MODEL_CHAT_BASE_URL:-}
+      MODEL_CHAT_API_KEY: ${MODEL_CHAT_API_KEY:-}
+      MODEL_CHAT_NAME: ${MODEL_CHAT_NAME:-}
+      MODEL_EMBEDDING_BASE_URL: ${MODEL_EMBEDDING_BASE_URL:-}
+      MODEL_EMBEDDING_API_KEY: ${MODEL_EMBEDDING_API_KEY:-}
+      MODEL_EMBEDDING_NAME: ${MODEL_EMBEDDING_NAME:-}
+      JAVA_OPTS: ${JAVA_OPTS:-}
+    ports:
+      - "127.0.0.1:${SERVER_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      rustfs:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/actuator/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s

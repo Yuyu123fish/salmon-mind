@@ -1,0 +1,62 @@
+server:
+  address: ${SERVER_ADDRESS:127.0.0.1}
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: salmon-mind-server
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://127.0.0.1:5432/salmon_mind}
+    username: ${DATABASE_USERNAME:salmon_mind}
+    password: ${DATABASE_PASSWORD:salmon_mind_local}
+  flyway:
+    locations: classpath:db/migration/workspace,classpath:db/migration/knowledge
+  modulith:
+    detection-strategy: explicitly-annotated
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+
+salmon:
+  model:
+    connect-timeout: ${MODEL_CONNECT_TIMEOUT:5s}
+    read-timeout: ${MODEL_READ_TIMEOUT:60s}
+    chat:
+      base-url: ${MODEL_CHAT_BASE_URL:}
+      api-key: ${MODEL_CHAT_API_KEY:}
+      model-name: ${MODEL_CHAT_NAME:}
+    embedding:
+      base-url: ${MODEL_EMBEDDING_BASE_URL:}
+      api-key: ${MODEL_EMBEDDING_API_KEY:}
+      model-name: ${MODEL_EMBEDDING_NAME:}
+  agent:
+    max-steps: ${AGENT_MAX_STEPS:32}
+    max-tool-result-chars: ${AGENT_MAX_TOOL_RESULT_CHARS:200000}
+    max-prompt-chars: ${AGENT_MAX_PROMPT_CHARS:262144}
+    max-model-response-chars: ${AGENT_MAX_MODEL_RESPONSE_CHARS:65536}
+    max-tools: ${AGENT_MAX_TOOLS:64}
+  knowledge:
+    chunk-max-chars: ${KNOWLEDGE_CHUNK_MAX_CHARS:1200}
+    embedding-batch-size: ${KNOWLEDGE_EMBEDDING_BATCH_SIZE:32}
+    max-object-bytes: ${KNOWLEDGE_MAX_OBJECT_BYTES:52428800}
+    default-top-k: ${KNOWLEDGE_DEFAULT_TOP_K:5}
+    max-top-k: ${KNOWLEDGE_MAX_TOP_K:20}
+    content-store:
+      endpoint: ${RUSTFS_ENDPOINT:}
+      access-key: ${RUSTFS_ACCESS_KEY:}
+      secret-key: ${RUSTFS_SECRET_KEY:}
+      bucket: ${RUSTFS_BUCKET_KNOWLEDGE:salmon-knowledge}
+      region: ${RUSTFS_REGION:us-east-1}
+    search:
+      base-url: ${ELASTICSEARCH_URL:}
+      username: ${ELASTICSEARCH_USERNAME:}
+      password: ${ELASTICSEARCH_PASSWORD:}
+      index-prefix: ${KNOWLEDGE_INDEX_PREFIX:salmon-evidence}
+      shards: ${KNOWLEDGE_INDEX_SHARDS:1}
+      replicas: ${KNOWLEDGE_INDEX_REPLICAS:0}

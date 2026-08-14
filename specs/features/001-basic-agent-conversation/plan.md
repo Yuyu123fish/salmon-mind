@@ -1,6 +1,6 @@
 # Feature 001：基础 Agent 多轮对话实施计划
 
-Status: Draft
+Status: Implemented
 
 ## 计划编制基线与前置条件
 
@@ -14,7 +14,7 @@ Status: Draft
 
 当前工作区包含开发者尚未提交的既有修改。实施开始前必须重新读取 `git status`，只处理本 Feature 的重叠文件，不得重置、覆盖或顺手修复无关改动。
 
-当前执行检查点：开发者确认已执行到第 2 步，随后因模块职责与依赖方向不够清晰而暂停。此次修订只调整后续实施计划，不重新判定第 2 步完成情况，也不重复运行其已有验证；接手时以原执行报告和当前工作区为证据，只补第 2.5 步重构实际影响的验证。
+当前执行检查点：第 2、2.5、3、4、5 步均已执行完成并验证，Feature 进入 `Implemented`，等待开发者按 Spec 的 Acceptance Criteria 验收。
 
 项目声明 Spring AI Alibaba BOM `1.1.2.2` 和 Spring AI `1.1.2`。官方制品已发布 `spring-ai-alibaba-agent-framework:1.1.2.2`；当前本机 Maven 缓存中可检查到的是 `1.1.2.0`。本地旧版字节码显示：
 
@@ -687,5 +687,3 @@ HTTP 状态保持简单：输入校验 400、未找到 404、Conversation 状态
 ## 最终完成标准
 
 五个交付步骤和第 2.5 步全部完成且通过相应验证后，Feature 进入 `Implemented`，等待开发者按 Spec 的 Acceptance Criteria 验收。只有开发者确认页面行为、关键代码流程、数据流转和验证证据后，Spec / Plan 才进入 `Accepted`。
-
-确认本 Plan 只允许把状态改为 `Planned`，不授权实施、提交、推送或创建 PR。

@@ -1,6 +1,6 @@
 # Feature 001：基础 Agent 多轮对话
 
-Status: Specified
+Status: Implemented
 
 ## Problem Statement
 

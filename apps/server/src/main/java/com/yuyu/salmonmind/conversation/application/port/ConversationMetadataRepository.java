@@ -43,4 +43,10 @@ public interface ConversationMetadataRepository {
 
     /** 更新 Run 状态与结束时间。 */
     void updateRun(Run run);
+
+    /** 把指定 Conversation 遗留的 RUNNING Run 恢复为 INTERRUPTED（进程中断后的可重试状态）。 */
+    void interruptRunningRuns(UUID conversationId);
+
+    /** 把全部遗留 RUNNING Run 恢复为 INTERRUPTED；返回受影响行数，用于启动恢复。 */
+    int interruptAllRunningRuns();
 }

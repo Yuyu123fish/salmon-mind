@@ -109,6 +109,24 @@ class PostgresConversationMetadataRepository implements ConversationMetadataRepo
         runMapper.updateById(toEntity(run));
     }
 
+    @Override
+    public void interruptRunningRuns(UUID conversationId) {
+        // 只改状态不改结束时间：与恢复重建的 INTERRUPTED Run（endedAt 为 null）保持一致
+        RunEntity update = new RunEntity();
+        update.setStatus(Run.RunStatus.INTERRUPTED.name());
+        runMapper.update(update, Wrappers.<RunEntity>lambdaUpdate()
+                .eq(RunEntity::getConversationId, conversationId)
+                .eq(RunEntity::getStatus, Run.RunStatus.RUNNING.name()));
+    }
+
+    @Override
+    public int interruptAllRunningRuns() {
+        RunEntity update = new RunEntity();
+        update.setStatus(Run.RunStatus.INTERRUPTED.name());
+        return runMapper.update(update, Wrappers.<RunEntity>lambdaUpdate()
+                .eq(RunEntity::getStatus, Run.RunStatus.RUNNING.name()));
+    }
+
     private static ConversationEntity toEntity(Conversation conversation) {
         ConversationEntity entity = new ConversationEntity();
         entity.setId(conversation.id());

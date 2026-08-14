@@ -30,6 +30,10 @@ import java.util.List;
  * 生产 Agent Adapter：封装 ReactAgent、RedisSaver、Redisson 与 Checkpoint 叶子标记。
  * ChatModel 通过 {@link ChatModelProvider} 获取，模型与 Redis 均延迟初始化，
  * 应用未配置时仍可启动，首次对话才报告配置错误。
+ *
+ * Checkpoint 一致性语义：Redis 标记必须等于当前 JSONL 活动叶子才能复用；
+ * 模型成功后标记被推进到预分配的回答叶子，若此后 JSONL 追加 Assistant 前进程中断，
+ * 下一次调用会发现标记与 JSONL 不一致并整体重建，不会采纳未落盘的幽灵回答。
  */
 @Component
 class ReactAgentSessionAdapter implements AgentSession {
@@ -115,6 +119,8 @@ class ReactAgentSessionAdapter implements AgentSession {
     }
 
     private void releaseCheckpoint(RedisSaver saver, RunnableConfig config) {
+        // 必须先释放旧 Checkpoint 再重建：保留它会令 ReactAgent 把新上下文叠加在
+        // 与 JSONL 不一致的陈旧状态上，造成消息重复或上下文错位
         try {
             saver.release(config);
         } catch (IllegalStateException ex) {

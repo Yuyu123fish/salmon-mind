@@ -3,6 +3,7 @@ package com.yuyu.salmonmind.conversation.application;
 import com.yuyu.salmonmind.conversation.api.Conversation;
 import com.yuyu.salmonmind.conversation.api.ConversationDetail;
 import com.yuyu.salmonmind.conversation.api.ConversationException;
+import com.yuyu.salmonmind.conversation.api.ConversationRunResult;
 import com.yuyu.salmonmind.conversation.api.ConversationService;
 import com.yuyu.salmonmind.conversation.api.ConversationSummary;
 import com.yuyu.salmonmind.conversation.api.Entry;
@@ -21,8 +22,9 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * Conversation 用例服务：编排 Workspace、JSONL 历史与 PostgreSQL 元数据的创建、列表与打开。
- * 不直接导入 Mapper、Entity、Jackson 或文件路径；Agent 调用在第 3 步接入。
+ * Conversation 用例服务：编排 Workspace、JSONL 历史与 PostgreSQL 元数据的创建、列表、打开，
+ * 并把打开 / 发送 / 重试经 {@link ConversationExecutionQueue} 按 Conversation 串行后交给
+ * {@link ConversationRunCoordinator}。不直接导入 Mapper、Entity、Jackson 或文件路径。
  */
 @Service
 class ConversationApplicationService implements ConversationService {
@@ -31,17 +33,23 @@ class ConversationApplicationService implements ConversationService {
     private final ConversationHistoryRepository historyRepository;
     private final ConversationMetadataRepository metadataRepository;
     private final ConversationRecoveryService recoveryService;
+    private final ConversationExecutionQueue executionQueue;
+    private final ConversationRunCoordinator runCoordinator;
 
     ConversationApplicationService(
             WorkspaceRegistry workspaceRegistry,
             ConversationHistoryRepository historyRepository,
             ConversationMetadataRepository metadataRepository,
-            ConversationRecoveryService recoveryService
+            ConversationRecoveryService recoveryService,
+            ConversationExecutionQueue executionQueue,
+            ConversationRunCoordinator runCoordinator
     ) {
         this.workspaceRegistry = workspaceRegistry;
         this.historyRepository = historyRepository;
         this.metadataRepository = metadataRepository;
         this.recoveryService = recoveryService;
+        this.executionQueue = executionQueue;
+        this.runCoordinator = runCoordinator;
     }
 
     @Override
@@ -50,6 +58,8 @@ class ConversationApplicationService implements ConversationService {
         UUID workspaceId = workspaceRegistry.current().id();
         UUID id = UUID.randomUUID();
         Instant now = Instant.now();
+        // 必须先落 JSONL 再写数据库：文件写入成功后 DB 失败只是可清理的孤儿文件，
+        // 反向顺序会让数据库引用一个不存在的历史文件，破坏数据权威
         historyRepository.create(id, now);
         try {
             Conversation conversation = new Conversation(
@@ -82,8 +92,24 @@ class ConversationApplicationService implements ConversationService {
     }
 
     @Override
-    @Transactional
     public ConversationDetail open(UUID conversationId) {
+        // 打开与发送 / 重试共用同一 Conversation 队列：读取、恢复与写入互斥，避免看到半程状态。
+        // 不在此处开事务：reconcile 的数据库修复以 JSONL 为权威且幂等，逐语句提交即可，
+        // 若用 @Transactional 则提交发生在队列锁释放之后，破坏“队列内看到上一次已提交状态”的不变量
+        return executionQueue.execute(conversationId, () -> doOpen(conversationId));
+    }
+
+    @Override
+    public ConversationRunResult send(UUID conversationId, String text) {
+        return executionQueue.execute(conversationId, () -> runCoordinator.send(conversationId, text));
+    }
+
+    @Override
+    public ConversationRunResult retry(UUID conversationId, UUID runId) {
+        return executionQueue.execute(conversationId, () -> runCoordinator.retry(conversationId, runId));
+    }
+
+    private ConversationDetail doOpen(UUID conversationId) {
         UUID workspaceId = workspaceRegistry.current().id();
         Conversation entity = metadataRepository.findById(conversationId);
         if (entity == null || !workspaceId.equals(entity.workspaceId())) {
@@ -91,6 +117,8 @@ class ConversationApplicationService implements ConversationService {
                     ConversationException.ConversationErrorCode.CONVERSATION_NOT_FOUND,
                     "Conversation 不存在");
         }
+        // 先 reconcile 以 JSONL 为权威修复数据库索引，再基于修复后的活动叶子构建 Active Path，
+        // 保证返回的路径与数据库索引一致；历史损坏在此步抛 CONVERSATION_HISTORY_CORRUPTED
         ConversationRecoveryService.Reconciliation reconciliation = recoveryService.reconcile(conversationId, entity);
         Conversation conversation = reconciliation.conversation();
         List<Entry> activePath = reconciliation.history().activePath(conversation.activeLeafEntryId());

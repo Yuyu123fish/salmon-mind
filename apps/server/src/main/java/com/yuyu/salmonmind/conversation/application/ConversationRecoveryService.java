@@ -10,6 +10,8 @@ import com.yuyu.salmonmind.conversation.application.port.ConversationHistoryRepo
 import com.yuyu.salmonmind.conversation.application.port.ConversationMetadataRepository;
 import com.yuyu.salmonmind.conversation.domain.ConversationHistory;
 import com.yuyu.salmonmind.conversation.domain.ConversationTitle;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
@@ -19,8 +21,8 @@ import java.util.UUID;
 
 /**
  * 数据库索引与 JSONL 的 reconciliation：以合法 JSONL 为权威推进数据库索引、
- * 补齐 Run 行与终态、校验或修复压缩索引；数据库指向不存在 Entry、
- * Header 身份不一致或文件损坏时拒绝继续。不直接解析 JSON，也不接触 Mapper。
+ * 补齐 Run 行与终态、把遗留 RUNNING Run 恢复为 INTERRUPTED、校验或修复压缩索引；
+ * 数据库指向不存在 Entry、Header 身份不一致或文件损坏时拒绝继续。不直接解析 JSON，也不接触 Mapper。
  */
 @Component
 class ConversationRecoveryService {
@@ -36,10 +38,24 @@ class ConversationRecoveryService {
         this.metadataRepository = metadataRepository;
     }
 
+    // 应用就绪时把所有遗留 RUNNING Run 恢复为 INTERRUPTED（进程中断遗留，可重试）；
+    // 启动后不再有跨进程在飞 Run，单进程队列保证运行期不会产生新的冲突
+    @EventListener(ApplicationReadyEvent.class)
+    void recoverInterruptedRunsAtStartup() {
+        metadataRepository.interruptAllRunningRuns();
+    }
+
     /** reconcile 结果：修复后的 Conversation 元数据与同一次读取的历史。 */
     record Reconciliation(Conversation conversation, ConversationHistory history) {
     }
 
+    /**
+     * 以 JSONL 为权威修复数据库索引并返回修复结果。
+     * 前置条件：调用方已确认 Conversation 行存在且属于当前 Workspace。
+     * 失败语义：数据库指向不存在 Entry、Header 身份不一致或文件损坏时抛
+     * CONVERSATION_HISTORY_CORRUPTED；JSONL 领先数据库时在本步推进索引与 Run，
+     * 下一次读取不再重复修复。
+     */
     Reconciliation reconcile(UUID conversationId, Conversation current) {
         ConversationHistory history = historyRepository.read(conversationId);
         List<Entry> entries = history.entries();
@@ -48,6 +64,9 @@ class ConversationRecoveryService {
         if (current.activeLeafEntryId() != null && !containsEntry(entries, current.activeLeafEntryId())) {
             throw corrupted("数据库活动叶子在 JSONL 中不存在");
         }
+
+        // 队列内不存在本进程的在飞 Run，遗留 RUNNING 只可能是进程中断产物：恢复为可重试的 INTERRUPTED
+        metadataRepository.interruptRunningRuns(conversationId);
 
         // 推进 JSONL 领先数据库的部分
         for (Entry entry : entries) {
@@ -76,6 +95,7 @@ class ConversationRecoveryService {
         UUID compactionEntryId = current.latestCompactionEntryId();
         Long compactionSeq = current.latestCompactionSeq();
         Long compactionOffset = current.latestCompactionByteOffset();
+        // 三个压缩索引字段必须同时为空或同时非空；校验基于字节偏移而不是信任数据库数值
         if (compactionEntryId == null) {
             // 数据库无压缩索引时以 JSONL 补齐
             Entry latest = history.latestCompactionEntry();

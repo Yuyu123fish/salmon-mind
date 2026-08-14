@@ -7,6 +7,7 @@ public class ConversationTitle {
 
     public static final String DEFAULT_TITLE = "新对话";
 
+    // 与 conversations.title VARCHAR(120) 的列宽对齐；截断发生在字符边界，不额外调用模型
     private static final int MAX_TITLE_CHARS = 120;
 
     public static String fromFirstUserEntry(String text) {

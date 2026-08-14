@@ -29,6 +29,8 @@ import java.util.UUID;
 /**
  * Conversation JSONL 历史 Adapter：原子创建、串行追加、强制刷盘、torn-tail 修复
  * 与 Compaction 字节偏移校验。每个 Conversation 由单一写入方串行使用。
+ * 本类只做文件 I/O 与格式校验；Active Path 与压缩节点定位规则属于
+ * domain 的 {@link ConversationHistory}，不在此处重复实现。
  */
 @Component
 class JsonlConversationHistoryRepository implements ConversationHistoryRepository {
@@ -134,6 +136,7 @@ class JsonlConversationHistoryRepository implements ConversationHistoryRepositor
         }
 
         ConversationHistory.Header header;
+        // 解码 Header
         try {
             header = codec.decodeHeader(lines.get(0));
         } catch (TornTailException ex) {

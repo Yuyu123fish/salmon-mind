@@ -1,6 +1,6 @@
 # Feature 001：基础 Agent 多轮对话实施计划
 
-Status: Implemented
+Status: Accepted
 
 ## 计划编制基线与前置条件
 

@@ -10,9 +10,21 @@ spring:
     username: ${DATABASE_USERNAME:salmon_mind}
     password: ${DATABASE_PASSWORD:salmon_mind_local}
   flyway:
-    locations: classpath:db/migration/workspace,classpath:db/migration/knowledge
+    locations: classpath:db/migration/workspace,classpath:db/migration/knowledge,classpath:db/migration/conversation
   modulith:
     detection-strategy: explicitly-annotated
+
+mybatis-plus:
+  type-handlers-package: com.yuyu.salmonmind.persistence.mybatis
+  configuration:
+    map-underscore-to-camel-case: true
+    # PostgreSQL 不能把 JDBC NULL 按 VARCHAR 绑定
+    jdbc-type-for-null: other
+  global-config:
+    banner: false
+    db-config:
+      id-type: none
+      schema: public
 
 management:
   endpoints:
@@ -29,7 +41,7 @@ salmon:
     read-timeout: ${MODEL_READ_TIMEOUT:60s}
     chat:
       base-url: ${MODEL_CHAT_BASE_URL:}
-      api-key: ${MODEL_CHAT_API_KEY:}
+      api-key: ${DEEPSEEK_API_KEY:${MODEL_CHAT_API_KEY:}}
       model-name: ${MODEL_CHAT_NAME:}
     embedding:
       base-url: ${MODEL_EMBEDDING_BASE_URL:}
@@ -41,6 +53,13 @@ salmon:
     max-prompt-chars: ${AGENT_MAX_PROMPT_CHARS:262144}
     max-model-response-chars: ${AGENT_MAX_MODEL_RESPONSE_CHARS:65536}
     max-tools: ${AGENT_MAX_TOOLS:64}
+  redis:
+    # ReactAgent Checkpoint 的短期状态存储；未配置时应用仍可启动，进入对话调用才报错
+    url: ${REDIS_URL:redis://127.0.0.1:6379}
+    password: ${REDIS_PASSWORD:}
+  conversation:
+    # 权威会话历史目录，Server 容器必须显式挂载；不与 infra/data/ 混用
+    data-dir: ${CONVERSATION_DATA_DIR:data}
   knowledge:
     chunk-max-chars: ${KNOWLEDGE_CHUNK_MAX_CHARS:1200}
     embedding-batch-size: ${KNOWLEDGE_EMBEDDING_BATCH_SIZE:32}

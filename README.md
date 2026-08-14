@@ -41,6 +41,7 @@ SalmonMind 要解决的正是这种“项目已经完成，但能力还没有真
 ```text
 apps/
   server/          Spring Boot 3.5 / Java 21 后端
+  web/             React / Vite 前端
 docs/
   architecture.md  当前架构与边界
   development.md   本地开发约定
@@ -65,7 +66,7 @@ compose.yaml        PostgreSQL + Elasticsearch + RustFS + Server
 
 ## 快速启动
 
-需要 Docker Compose。首次启动前复制本地配置：
+需要 Docker Compose。首次启动前复制本地配置（`.env` 不入库）：
 
 ```powershell
 Copy-Item .env.example .env
@@ -73,7 +74,16 @@ docker compose up --build -d
 Invoke-RestMethod http://127.0.0.1:8080/actuator/health
 ```
 
-模型配置可以暂时留空；服务能够启动，但调用模型、重建索引或检索前必须配置对应的 Chat / Embedding 端点。当前唯一 HTTP 入口是 `/actuator/health`，知识与 Agent 能力暂时只通过 Java 模块端口暴露。
+模型配置写在仓库根目录 `.env`；Chat 默认使用 DeepSeek `deepseek-v4-flash`，密钥读取 `DEEPSEEK_API_KEY`。服务能够启动，但调用模型、重建索引或检索前必须配置对应端点。当前业务 HTTP 入口是 `GET /api/workspace`。知识与 Agent 能力暂时仍主要通过 Java 模块端口暴露。
+
+另开终端启动前端：
+
+```powershell
+npm install --prefix apps/web
+npm run dev --prefix apps/web
+```
+
+浏览器打开终端里提示的地址（默认 `http://127.0.0.1:5173`）。开发服务器会把 `/api` 代理到后端。
 
 停止服务但保留数据：
 
@@ -83,11 +93,12 @@ docker compose down
 
 
 
-## 后端验证
+## 验证
 
 ```powershell
 mvn -f apps/server/pom.xml test
 mvn -f apps/server/pom.xml package -DskipTests
+npm run build --prefix apps/web
 docker compose config
 ```
 

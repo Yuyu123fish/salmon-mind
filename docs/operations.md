@@ -9,7 +9,7 @@
 | Elasticsearch | `127.0.0.1:9200` | `infra/data/elasticsearch` | 可重建检索投影 |
 | RustFS | `127.0.0.1:9000` / `:9001` | `infra/data/rustfs` | S3 API / Console 与知识原件 |
 
-所有发布端口默认只绑定本机。`.env.example` 的凭据只适合本地开发；任何端口暴露到其他主机前都必须更换凭据并重新评估 Elasticsearch 的无鉴权配置。
+Compose 项目名为 `salmon-mind-infra`，这些容器会作为同一分组运行。所有发布端口默认只绑定本机。`.env.example` 的凭据只适合本地开发；任何端口暴露到其他主机前都必须更换凭据并重新评估 Elasticsearch 的无鉴权配置。
 
 ## 启停与检查
 
@@ -31,4 +31,4 @@ docker compose down
 - 可以重建：`infra/data/elasticsearch`。只有在 PostgreSQL、RustFS 和 Embedding 模型均可用时，才能通过 `KnowledgeBase.rebuild()` 创建并切换新索引代次。
 - 不持久化：Agent Run。当前没有会话恢复语义。
 
-`KnowledgeBase.rebuild()` 目前是 Java 模块端口，不是 HTTP 运维接口。业务 API 或管理界面会在相应 Feature 确认后再实现。
+`KnowledgeBase.rebuild()` 目前是 Java 模块端口，不是 HTTP 运维接口。当前页面只读取 `GET /api/workspace`，前端仍在宿主机用 Vite 开发，尚未加入 Compose。

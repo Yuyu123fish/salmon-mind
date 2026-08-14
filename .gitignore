@@ -1,5 +1,7 @@
 # Build outputs
 **/target/
+**/node_modules/
+**/dist/
 
 # IDEs and local tools
 .idea/
@@ -18,7 +20,6 @@ temp/
 .env
 .env.*
 !.env.example
-apps/server/src/main/resources/application-dev.yml
 
 # Local data. Docker-managed data belongs under infra/data.
 /data/

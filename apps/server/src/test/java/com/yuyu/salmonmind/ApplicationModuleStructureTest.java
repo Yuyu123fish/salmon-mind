@@ -10,10 +10,11 @@ import org.springframework.modulith.core.ApplicationModules;
 class ApplicationModuleStructureTest {
 
     private static final Set<String> EXPECTED_MODULES = Set.of(
-            "agent",
-            "knowledge",
+            "persistence",
+            "workspace",
             "model",
-            "workspace"
+            "agent",
+            "conversation"
     );
 
     @Test

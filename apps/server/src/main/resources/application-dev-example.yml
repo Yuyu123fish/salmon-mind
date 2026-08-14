@@ -1,0 +1,25 @@
+# 本地开发配置模板：复制为 application-dev.yml 并填写真实值。
+# application-dev.yml 已被 .gitignore 忽略，不会入库；本模板文件随仓库维护。
+# 运行 `mvn spring-boot:run` 时默认激活 dev profile，自动加载本文件。
+spring:
+  datasource:
+    username: salmon_mind
+    password: salmon_mind_local
+
+salmon:
+  model:
+    chat:
+      # OpenAI-compatible API key；base-url 与 model-name 保留在 application.yml 的非敏感默认值中
+      api-key: your-chat-api-key
+    embedding:
+      api-key: your-embedding-api-key
+  redis:
+    # 本地 Redis 无密码时留空
+    password:
+  knowledge:
+    content-store:
+      access-key: salmonmind
+      secret-key: salmonmind-local-change-me
+    search:
+      username:
+      password:

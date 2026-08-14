@@ -29,10 +29,11 @@ SalmonMind 要解决的正是这种“项目已经完成，但能力还没有真
 
 ## 数据边界
 
-- PostgreSQL 保存 Workspace、Source、Revision、Evidence 与索引代次元数据。
+- PostgreSQL 保存 Workspace、Conversation 与 Run 的元数据（消息正文不落库）。
+- JSONL 是 Conversation 历史的权威来源，保存在 `data/conversations/`，本地可通过 `CONVERSATION_DATA_DIR` 配置。
+- Redis 只保存 ReactAgent 可重建的短期 Checkpoint 状态，不是历史权威；缺失或与 JSONL 叶子不一致时从历史重建。
 - RustFS 保存知识原件，是索引重建的数据来源。
 - Elasticsearch 仅保存可丢弃、可全量重建的检索投影。
-- Agent Run 当前只存在于进程内，不做会话或长期状态持久化。
 
 
 
@@ -48,7 +49,8 @@ docs/
   operations.md    Compose 与数据运维
 infra/
   data/             本地容器挂载数据（内容不入 Git）
-compose.yaml        PostgreSQL + Elasticsearch + RustFS + Server
+data/               Conversation 权威历史（JSONL，内容不入 Git）
+compose.yaml        PostgreSQL + Redis + Elasticsearch + RustFS + Server
 ```
 
 
@@ -66,17 +68,35 @@ compose.yaml        PostgreSQL + Elasticsearch + RustFS + Server
 
 ## 快速启动
 
-需要 Docker Compose。首次启动前复制本地配置（`.env` 不入库）：
+本地开发推荐分三步启动：Docker 只起基础设施，后端和前端在宿主机运行，便于调试与热更新。
+
+本地开发敏感配置写在 `apps/server/src/main/resources/application-dev.yml`（不入库）。首次启动前复制模板并填写真实值：
 
 ```powershell
-Copy-Item .env.example .env
-docker compose up --build -d
-Invoke-RestMethod http://127.0.0.1:8080/actuator/health
+Copy-Item apps/server/src/main/resources/application-dev-example.yml apps/server/src/main/resources/application-dev.yml
 ```
 
-模型配置写在仓库根目录 `.env`；Chat 默认使用 DeepSeek `deepseek-v4-flash`，密钥读取 `DEEPSEEK_API_KEY`。服务能够启动，但调用模型、重建索引或检索前必须配置对应端点。当前业务 HTTP 入口是 `GET /api/workspace`。知识与 Agent 能力暂时仍主要通过 Java 模块端口暴露。
+该文件覆盖数据库账号、模型 API key 等敏感项；非敏感默认值保留在 `application.yml`。后端启动时默认激活 `dev` profile 自动加载它。
 
-另开终端启动前端：
+### 1. 启动 Docker 基础设施
+
+需要 Docker Compose。只启动 PostgreSQL、Redis 等依赖，后端与前端不打包进容器：
+
+```powershell
+docker compose up -d postgres redis
+```
+
+### 2. 启动后端
+
+Chat 默认使用 DeepSeek `deepseek-v4-flash`，API key 在 `application-dev.yml` 的 `salmon.model.chat.api-key` 填写。服务能够启动，但调用模型前必须配置 key。
+
+```powershell
+mvn -f apps/server/pom.xml spring-boot:run
+```
+
+### 3. 启动前端
+
+另开终端：
 
 ```powershell
 npm install --prefix apps/web
@@ -85,11 +105,25 @@ npm run dev --prefix apps/web
 
 浏览器打开终端里提示的地址（默认 `http://127.0.0.1:5173`）。开发服务器会把 `/api` 代理到后端。
 
+当前可用业务能力：Workspace 查询（`GET /api/workspace`）与 Conversation 对话闭环（`/api/conversations`：创建、列表、打开、发送消息与失败 Run 重试）。知识与 Agent 编排之外的 RAG 能力暂时仍主要通过 Java 模块端口暴露。
+
 停止服务但保留数据：
 
 ```powershell
 docker compose down
 ```
+
+## 一键部署
+
+不区分进程、由 Docker Compose 全部容器化运行（Server 容器会挂载 Conversation 数据目录，Redis 与 PostgreSQL 数据保留在 `infra/data/`）。敏感配置通过宿主环境变量注入（如 `MODEL_CHAT_API_KEY`），不写入仓库：
+
+```powershell
+$env:MODEL_CHAT_API_KEY = "你的 API key"
+docker compose up --build -d
+Invoke-RestMethod http://127.0.0.1:8080/actuator/health
+```
+
+前端尚未加入 Compose，仍需在宿主机启动（见上文快速启动第 3 步），并把 `/api` 代理到 `http://127.0.0.1:8080`；需要修改代码时回到上面的快速启动方式。
 
 
 

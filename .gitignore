@@ -17,12 +17,12 @@ temp/
 **/java_files.txt
 
 # Secrets and machine-local configuration
-.env
-.env.*
-!.env.example
+# 本地开发敏感配置：复制 application-dev-example.yml 为 application-dev.yml 填写
+apps/server/src/main/resources/application-dev.yml
 
 # Local data. Docker-managed data belongs under infra/data.
 /data/
+**/data/
 /infra/data/*
 !/infra/data/.gitkeep
 

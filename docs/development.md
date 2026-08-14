@@ -17,26 +17,25 @@ npm install --prefix apps/web
 npm run dev --prefix apps/web
 ```
 
-集成测试通过 Testcontainers 启动 PostgreSQL，因此运行测试时 Docker 必须可用。测试只覆盖当前基座的重要合同：模块依赖、Workspace、模型适配、知识存储/重建和最小 Agent Loop。
+集成测试通过 Testcontainers 启动 PostgreSQL 与 Redis，因此运行测试时 Docker 必须可用。测试只覆盖当前基座的重要合同：模块依赖、Workspace、模型适配、Conversation 持久化/HTTP 闭环、Agent Checkpoint 与 Redis 恢复。
 
 只启动基础设施、在宿主机运行后端：
 
 ```powershell
-Copy-Item .env.example .env
-docker compose up -d postgres elasticsearch rustfs
+Copy-Item apps/server/src/main/resources/application-dev-example.yml apps/server/src/main/resources/application-dev.yml
+docker compose up -d postgres redis elasticsearch rustfs
 mvn -f apps/server/pom.xml spring-boot:run
 ```
 
-仓库根目录的 `.env` 不入库。Docker Compose 和后端启动都会读取它；已有环境变量优先于文件中的同名项。PostgreSQL 默认值已与 `.env.example` 对齐。Chat 默认走 DeepSeek（`DEEPSEEK_API_KEY` + `deepseek-v4-flash`）。
+本地开发敏感配置写在 `apps/server/src/main/resources/application-dev.yml`（不入库），覆盖数据库账号、模型 API key 等；非敏感默认值保留在 `application.yml`，后端默认激活 `dev` profile 自动加载。Chat 默认走 DeepSeek（`deepseek-v4-flash`，key 在 `application-dev.yml` 的 `salmon.model.chat.api-key`）。对话能力需要 Redis（Checkpoint 短期状态）与模型配置；模型或 Redis 未配置时服务仍可启动，调用对话时才报错。
 
 ## 配置原则
 
-- `MODEL_CHAT_BASE_URL` 指向 OpenAI-compatible API 根路径，代码会追加 `/chat/completions`。
+- `MODEL_CHAT_BASE_URL` 指向 OpenAI-compatible API 根路径，代码会追加 `/chat/completions`；默认值 `https://api.deepseek.com` 已写在 `application.yml`。
 - `MODEL_EMBEDDING_BASE_URL` 指向 OpenAI-compatible API 根路径，代码会追加 `/embeddings`。
 - Chat 与 Embedding 分开配置，允许使用不同提供方与模型。
 - RustFS、Elasticsearch 和模型未配置时不做静默假实现；只有实际调用对应能力时才失败。
-
-完整变量名以 [application.yml](../apps/server/src/main/resources/application.yml) 和 [.env.example](../.env.example) 为准。
+- 非敏感配置以 [application.yml](../apps/server/src/main/resources/application.yml) 为准；敏感配置以 [application-dev-example.yml](../apps/server/src/main/resources/application-dev-example.yml) 为模板。
 
 ## 模块约定
 
@@ -51,11 +50,11 @@ mvn -f apps/server/pom.xml spring-boot:run
 
 前端在 `apps/web`，开发时默认监听 `127.0.0.1:5173`，并把 `/api` 代理到 `http://127.0.0.1:8080`。后端不在 8080 时设置 `SALMON_SERVER_URL`；5173 被占用时 Vite 会改用下一个可用端口。
 
-只看工作空间页时，后端只需 PostgreSQL：
+本地完整启动对话页面：
 
 ```powershell
-Copy-Item .env.example .env
-docker compose up -d postgres
+Copy-Item apps/server/src/main/resources/application-dev-example.yml apps/server/src/main/resources/application-dev.yml
+docker compose up -d postgres redis
 mvn -f apps/server/pom.xml spring-boot:run
 npm run dev --prefix apps/web
 ```

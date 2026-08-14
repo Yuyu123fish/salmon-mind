@@ -5,10 +5,15 @@ server:
 spring:
   application:
     name: salmon-mind-server
+  # 未显式指定 profile 时默认 dev：本地开发加载 config/application-dev.yml（不入库）。
+  # 生产/容器部署用环境变量注入敏感配置，或在启动命令显式指定 profile。
+  profiles:
+    default: dev
   datasource:
     url: ${DATABASE_URL:jdbc:postgresql://127.0.0.1:5432/salmon_mind}
-    username: ${DATABASE_USERNAME:salmon_mind}
-    password: ${DATABASE_PASSWORD:salmon_mind_local}
+    # 账号密码属于敏感配置：本地开发由 config/application-dev.yml 提供，容器由环境变量提供
+    username: ${DATABASE_USERNAME:}
+    password: ${DATABASE_PASSWORD:}
   flyway:
     locations: classpath:db/migration/workspace,classpath:db/migration/knowledge,classpath:db/migration/conversation
   modulith:
@@ -40,9 +45,10 @@ salmon:
     connect-timeout: ${MODEL_CONNECT_TIMEOUT:5s}
     read-timeout: ${MODEL_READ_TIMEOUT:60s}
     chat:
-      base-url: ${MODEL_CHAT_BASE_URL:}
-      api-key: ${DEEPSEEK_API_KEY:${MODEL_CHAT_API_KEY:}}
-      model-name: ${MODEL_CHAT_NAME:}
+      # base-url 与 model-name 是不敏感的提供方约定；api-key 属敏感配置，由 dev profile 或环境变量提供
+      base-url: ${MODEL_CHAT_BASE_URL:https://api.deepseek.com}
+      api-key: ${MODEL_CHAT_API_KEY:}
+      model-name: ${MODEL_CHAT_NAME:deepseek-v4-flash}
     embedding:
       base-url: ${MODEL_EMBEDDING_BASE_URL:}
       api-key: ${MODEL_EMBEDDING_API_KEY:}

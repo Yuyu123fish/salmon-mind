@@ -161,6 +161,11 @@ button {
   border-color: var(--line);
 }
 
+.conv-item[data-running='true'] .conv-time {
+  color: var(--river);
+  font-weight: 600;
+}
+
 .conv-title {
   font-size: 0.95rem;
   overflow: hidden;
@@ -205,6 +210,7 @@ button {
   gap: 12px;
   padding: 18px 28px 12px;
   border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
 }
 
 .chat-head h2 {
@@ -224,6 +230,31 @@ button {
   border: 1px solid var(--bad);
   border-radius: 999px;
   padding: 2px 10px;
+}
+
+.run-badge {
+  flex-shrink: 0;
+  color: var(--river);
+  font-size: 0.78rem;
+  border: 1px solid var(--river);
+  border-radius: 999px;
+  padding: 2px 10px;
+}
+
+.compaction-jump {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  border: 1px dashed var(--muted);
+  border-radius: 999px;
+  padding: 2px 10px;
+  background: transparent;
+}
+
+.compaction-jump:hover {
+  border-style: solid;
+  color: var(--river);
+  border-color: var(--river);
 }
 
 .messages {
@@ -350,6 +381,42 @@ button {
 .msg-row.note p {
   color: var(--muted);
   font-size: 0.82rem;
+}
+
+.compaction-marker p {
+  margin: 0;
+  border: 1px dashed var(--line);
+  border-radius: 999px;
+  padding: 4px 14px;
+  background: rgba(47, 79, 72, 0.05);
+}
+
+.thinking {
+  margin: 0;
+  color: var(--muted);
+}
+
+.streaming .markdown {
+  /* 流式渲染的占位光标，提示回答仍在生成 */
+  margin: 0;
+}
+
+.streaming .markdown::after {
+  content: '▍';
+  color: var(--salmon);
+  animation: streaming-blink 1s steps(2) infinite;
+}
+
+@keyframes streaming-blink {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.2;
+  }
+  100% {
+    opacity: 1;
+  }
 }
 
 .retry-bar {

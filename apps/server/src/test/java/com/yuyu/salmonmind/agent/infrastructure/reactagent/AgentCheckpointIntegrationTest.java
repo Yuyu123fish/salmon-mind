@@ -13,6 +13,7 @@ import com.yuyu.salmonmind.agent.api.AgentExecutionException.AgentErrorCode;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
 import com.yuyu.salmonmind.agent.api.AgentRequest;
 import com.yuyu.salmonmind.agent.api.AgentResult;
+import com.yuyu.salmonmind.agent.api.AgentStreamListener;
 import com.yuyu.salmonmind.model.chat.ChatModelHandle;
 import com.yuyu.salmonmind.model.chat.ChatModelProvider;
 import org.junit.jupiter.api.AfterEach;
@@ -66,7 +67,7 @@ class AgentCheckpointIntegrationTest {
         var adapter = newAdapter(model);
 
         // 第一轮：无 Checkpoint 标记，完整消息直接发送
-        var first = adapter.complete(new AgentRequest(
+        var first = completeSync(adapter, new AgentRequest(
                 "thread-a", null, UUID.randomUUID(), userList("你好")));
         assertThat(first.text()).isEqualTo("pong");
         assertThat(first.provider()).isEqualTo("test-provider");
@@ -75,7 +76,7 @@ class AgentCheckpointIntegrationTest {
         var firstThreadId = activeThreadId("thread-a");
 
         // 第二轮：标记等于用户 Entry 的 parentId，复用 Checkpoint，模型仍看到完整上下文
-        var second = adapter.complete(new AgentRequest(
+        var second = completeSync(adapter, new AgentRequest(
                 "thread-a",
                 firstLeafOf(),
                 UUID.randomUUID(),
@@ -87,7 +88,7 @@ class AgentCheckpointIntegrationTest {
         assertThat(activeThreadId("thread-a")).isEqualTo(firstThreadId);
 
         // 另一个线程互不影响
-        var other = adapter.complete(new AgentRequest(
+        var other = completeSync(adapter, new AgentRequest(
                 "thread-b", null, UUID.randomUUID(), userList("另一个话题")));
         assertThat(other.text()).isEqualTo("pong");
         assertThat(visible(model.calls.get(2))).containsExactly(user("另一个话题"));
@@ -98,11 +99,11 @@ class AgentCheckpointIntegrationTest {
         var model = new RecordingChatModel("pong");
         var adapter = newAdapter(model);
 
-        adapter.complete(new AgentRequest("thread-a", null, UUID.randomUUID(), userList("你好")));
+        completeSync(adapter, new AgentRequest("thread-a", null, UUID.randomUUID(), userList("你好")));
         var releasedThreadId = activeThreadId("thread-a");
 
         // 期望叶子与实际标记不一致：先释放旧 Checkpoint，再以完整投影重建，且不重复消息
-        var rebuilt = adapter.complete(new AgentRequest(
+        var rebuilt = completeSync(adapter, new AgentRequest(
                 "thread-a",
                 UUID.randomUUID(),
                 UUID.randomUUID(),
@@ -119,10 +120,34 @@ class AgentCheckpointIntegrationTest {
         var closedPort = unusedLocalPort();
         var adapter = newAdapter(redisUrl.replaceAll(":\\d+$", ":" + closedPort), new RecordingChatModel("pong"));
 
-        assertThatThrownBy(() -> adapter.complete(
+        assertThatThrownBy(() -> completeSync(adapter,
                 new AgentRequest("thread-a", null, UUID.randomUUID(), userList("你好"))))
                 .isInstanceOfSatisfying(AgentExecutionException.class, ex ->
                         assertThat(ex.code()).isEqualTo(AgentErrorCode.REDIS_UNAVAILABLE));
+    }
+
+    // 通过流式合同同步完成一次调用；失败时抛出原异常（与旧同步 complete 语义一致）
+    private static AgentResult completeSync(ReactAgentSessionAdapter adapter, AgentRequest request) {
+        AgentResult[] result = new AgentResult[1];
+        adapter.stream(request, new AgentStreamListener() {
+            @Override
+            public void onDelta(String delta) {
+            }
+
+            @Override
+            public void onComplete(AgentResult complete) {
+                result[0] = complete;
+            }
+
+            @Override
+            public void onError(AgentExecutionException error) {
+                throw error;
+            }
+        });
+        if (result[0] == null) {
+            throw new AssertionError("流式调用未完成");
+        }
+        return result[0];
     }
 
     private ReactAgentSessionAdapter newAdapter(RecordingChatModel model) {
@@ -131,7 +156,8 @@ class AgentCheckpointIntegrationTest {
 
     private ReactAgentSessionAdapter newAdapter(String url, RecordingChatModel model) {
         var adapter = new ReactAgentSessionAdapter(
-                () -> new ChatModelHandle(model, "test-provider", "test-model"), url, "");
+                () -> new ChatModelHandle(model, "test-provider", "test-model"), url, "",
+                65_432, 32_768, 0.1);
         adapters.add(adapter);
         return adapter;
     }

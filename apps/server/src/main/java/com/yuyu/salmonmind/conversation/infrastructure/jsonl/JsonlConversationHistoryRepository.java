@@ -113,10 +113,12 @@ class JsonlConversationHistoryRepository implements ConversationHistoryRepositor
         List<String> lines;
         List<Long> offsets;
         try {
+            //一次读取整个文件
             byte[] bytes = Files.readAllBytes(file);
             lines = new ArrayList<>();
             offsets = new ArrayList<>();
             int start = 0;
+            // 内存中按字节扫描换行符
             for (int i = 0; i < bytes.length; i++) {
                 if (bytes[i] == '\n') {
                     lines.add(new String(bytes, start, i - start, StandardCharsets.UTF_8));

@@ -25,6 +25,8 @@ public class AgentExecutionException extends RuntimeException {
     public enum AgentErrorCode {
         CHAT_MODEL_NOT_CONFIGURED,
         CHAT_MODEL_FAILED,
+        /** 提供方明确返回上下文溢出（如 context length exceeded）；主回答未输出 delta 时可据此压缩重试一次。 */
+        CONTEXT_OVERFLOW,
         REDIS_UNAVAILABLE
     }
 }

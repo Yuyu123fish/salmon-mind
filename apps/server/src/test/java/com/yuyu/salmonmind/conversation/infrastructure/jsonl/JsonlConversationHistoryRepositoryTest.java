@@ -15,6 +15,7 @@ import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
 import com.yuyu.salmonmind.conversation.api.CompactionPayload;
 import com.yuyu.salmonmind.conversation.api.ConversationException;
 import com.yuyu.salmonmind.conversation.api.Entry;
+import com.yuyu.salmonmind.conversation.api.TitlePayload;
 import com.yuyu.salmonmind.conversation.api.TokenUsage;
 import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
 import org.junit.jupiter.api.BeforeEach;
@@ -161,6 +162,82 @@ class JsonlConversationHistoryRepositoryTest {
         assertThat(payload.coveredThroughEntryId()).isEqualTo(a1.id());
         assertThat(payload.retainedTail()).containsExactly(u1, a1);
         assertThat(payload.tokensBefore()).isEqualTo(120L);
+    }
+
+    @Test
+    void titleEntryRoundTripsAndDoesNotAdvanceActivePath() {
+        store.create(conversationId, Instant.parse("2026-08-01T00:00:00Z"));
+        Entry u1 = user(1, null, "第一问");
+        Entry a1 = assistant(2, u1.id(), "回答");
+        Entry title = title(3, a1.id(), "对话标题");
+        store.append(conversationId, u1);
+        store.append(conversationId, a1);
+        store.append(conversationId, title);
+
+        var history = store.read(conversationId);
+        assertThat(history.entries()).containsExactly(u1, a1, title);
+        TitlePayload payload = (TitlePayload) history.entries().get(2).payload();
+        assertThat(payload.title()).isEqualTo("对话标题");
+        assertThat(payload.sourceAssistantEntryId()).isEqualTo(a1.id());
+        assertThat(payload.sourceRunId()).isNotNull();
+        assertThat(payload.provider()).isEqualTo("test-provider");
+        // Title 不推进 Active Path：从助手叶子回溯不包含 Title Entry
+        assertThat(history.activePath(a1.id())).containsExactly(u1, a1);
+        assertThat(history.latestTitleEntry()).isEqualTo(title);
+    }
+
+    @Test
+    void findsLatestTitleEntryFromFullHistory() {
+        store.create(conversationId, Instant.parse("2026-08-01T00:00:00Z"));
+        Entry u1 = user(1, null, "第一问");
+        Entry a1 = assistant(2, u1.id(), "回答");
+        Entry t1 = title(3, a1.id(), "旧标题");
+        store.append(conversationId, u1);
+        store.append(conversationId, a1);
+        store.append(conversationId, t1);
+        // 第二次成功交互后标题被更新：Title 是元数据事件，可多次追加，最新一条为准
+        Entry u2 = user(4, a1.id(), "第二问");
+        Entry a2 = assistant(5, u2.id(), "回答二");
+        Entry t2 = title(6, a2.id(), "新标题");
+        store.append(conversationId, u2);
+        store.append(conversationId, a2);
+        store.append(conversationId, t2);
+
+        var history = store.read(conversationId);
+        assertThat(history.latestTitleEntry()).isEqualTo(t2);
+        assertThat(history.activePath(a2.id())).containsExactly(u1, a1, u2, a2);
+    }
+
+    @Test
+    void latestCompactionIsLocatedOnlyOnActivePath() {
+        store.create(conversationId, Instant.parse("2026-08-01T00:00:00Z"));
+        Entry u1 = user(1, null, "第一问");
+        Entry a1 = assistant(2, u1.id(), "回答");
+        Entry u2 = user(3, a1.id(), "第二问");
+        Entry a2 = assistant(4, u2.id(), "回答二");
+        // 压缩发生在主路径上
+        Entry c1 = compaction(5, a2.id(), a2.id(), List.of(u1, a1, u2, a2));
+        store.append(conversationId, u1);
+        store.append(conversationId, a1);
+        store.append(conversationId, u2);
+        store.append(conversationId, a2);
+        store.append(conversationId, c1);
+        // 之后从旧叶子 a1 开出分支：物理 seq 连续，但 parent 链回到 a1
+        Entry branch = user(6, a1.id(), "分支问题");
+        store.append(conversationId, branch);
+
+        var history = store.read(conversationId);
+        // 分支路径不含压缩：不能把主路径的 Compaction 当作分支的"最新压缩"
+        assertThat(history.latestCompactionOnPath(branch.id())).isNull();
+        // 主路径包含压缩
+        assertThat(history.latestCompactionOnPath(c1.id())).isEqualTo(c1);
+        assertThat(history.activePath(branch.id())).containsExactly(u1, a1, branch);
+    }
+
+    private Entry title(long seq, UUID parentId, String text) {
+        return new Entry(1, conversationId, UUID.randomUUID(), seq, parentId,
+                Entry.EntryType.TITLE, Instant.parse("2026-08-01T00:00:00Z"),
+                new TitlePayload(text, UUID.randomUUID(), parentId, "test-provider", "test-model"));
     }
 
     private void appendRaw(String line) throws Exception {

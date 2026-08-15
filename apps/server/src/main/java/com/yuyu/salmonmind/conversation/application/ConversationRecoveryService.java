@@ -5,11 +5,11 @@ import com.yuyu.salmonmind.conversation.api.Conversation;
 import com.yuyu.salmonmind.conversation.api.ConversationException;
 import com.yuyu.salmonmind.conversation.api.Entry;
 import com.yuyu.salmonmind.conversation.api.Run;
+import com.yuyu.salmonmind.conversation.api.TitlePayload;
 import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
 import com.yuyu.salmonmind.conversation.application.port.ConversationHistoryRepository;
 import com.yuyu.salmonmind.conversation.application.port.ConversationMetadataRepository;
 import com.yuyu.salmonmind.conversation.domain.ConversationHistory;
-import com.yuyu.salmonmind.conversation.domain.ConversationTitle;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
@@ -75,58 +75,64 @@ class ConversationRecoveryService {
             }
         }
 
-        // 活动叶子与确认序号以 JSONL 为准
-        Entry lastEntry = entries.isEmpty() ? null : entries.get(entries.size() - 1);
-        UUID leaf = lastEntry == null ? null : lastEntry.id();
+        // 活动叶子与确认序号以 JSONL 为准：Title Entry 是元数据事件，只推进 seq，不推进 Active Path，
+        // 因此叶子取物理最后一条非 Title Entry，而 seq 包含 Title
+        Entry lastContextEntry = null;
+        Entry lastEntry = null;
+        for (Entry entry : entries) {
+            if (entry.type() != Entry.EntryType.TITLE) {
+                lastContextEntry = entry;
+            }
+            lastEntry = entry;
+        }
+        UUID leaf = lastContextEntry == null ? null : lastContextEntry.id();
         long lastSeq = lastEntry == null ? 0 : lastEntry.seq();
 
-        // 临时标题在首条用户 Entry 确认后替换为单行截断文本
+        // 标题以最新有效 Title Entry 为权威修复；Stage 2 起标题只来自模型生成，
+        // 不再从首条用户消息截断；数据库已有的旧截断标题保留，等 Title Entry 覆盖
         String title = current.title();
-        if (ConversationTitle.DEFAULT_TITLE.equals(title)) {
-            Entry firstUser = entries.stream()
-                    .filter(e -> e.type() == Entry.EntryType.USER_MESSAGE)
-                    .findFirst()
-                    .orElse(null);
-            if (firstUser != null) {
-                title = ConversationTitle.fromFirstUserEntry(((UserMessagePayload) firstUser.payload()).text());
-            }
+        Entry titleEntry = history.latestTitleEntry();
+        if (titleEntry != null) {
+            title = ((TitlePayload) titleEntry.payload()).title();
         }
 
+        // 压缩索引只沿当前 Active Path 定位：数据库指针必须等于路径上最新 Compaction 且字节偏移可校验，
+        // 否则按路径修复；分支上的 Compaction 不是当前模型投影的一部分，不得采用
         UUID compactionEntryId = current.latestCompactionEntryId();
         Long compactionSeq = current.latestCompactionSeq();
         Long compactionOffset = current.latestCompactionByteOffset();
-        // 三个压缩索引字段必须同时为空或同时非空；校验基于字节偏移而不是信任数据库数值
-        if (compactionEntryId == null) {
-            // 数据库无压缩索引时以 JSONL 补齐
-            Entry latest = history.latestCompactionEntry();
-            if (latest != null) {
-                compactionEntryId = latest.id();
-                compactionSeq = latest.seq();
-                compactionOffset = history.byteOffsetOf(latest);
-            }
-        } else if (!historyRepository.validateCompaction(
-                conversationId, compactionEntryId, compactionSeq, compactionOffset)) {
-            // 索引校验失败：扫描 JSONL 修复，无压缩则置 NULL
-            Entry latest = history.latestCompactionEntry();
-            if (latest == null) {
-                compactionEntryId = null;
-                compactionSeq = null;
-                compactionOffset = null;
-            } else {
-                compactionEntryId = latest.id();
-                compactionSeq = latest.seq();
-                compactionOffset = history.byteOffsetOf(latest);
-            }
+        Entry latestOnPath = history.latestCompactionOnPath(leaf);
+        boolean pointerValid = latestOnPath != null
+                && compactionEntryId != null
+                && compactionEntryId.equals(latestOnPath.id())
+                && compactionSeq != null
+                && compactionSeq == latestOnPath.seq()
+                && historyRepository.validateCompaction(
+                        conversationId, compactionEntryId, compactionSeq, compactionOffset);
+        if (!pointerValid) {
+            // 指针缺失、越界、不一致或不在当前 Active Path：沿 Active Path 反向修复
+            compactionEntryId = latestOnPath == null ? null : latestOnPath.id();
+            compactionSeq = latestOnPath == null ? null : latestOnPath.seq();
+            compactionOffset = latestOnPath == null ? null : history.byteOffsetOf(latestOnPath);
         }
 
         Conversation repaired = new Conversation(
-                current.id(), current.workspaceId(), title, current.historyFormatVersion(),
+                current.id(),
+                current.workspaceId(),
+                title,
+                current.historyFormatVersion(),
                 leaf, lastSeq, compactionEntryId, compactionSeq, compactionOffset,
-                current.createdAt(), current.updatedAt());
+                current.createdAt(),
+                current.updatedAt()
+        );
 
+        // changed 判定必须覆盖标题与压缩索引：仅 Title 或 Compaction 索引变化也要写回 PostgreSQL
         boolean changed = !Objects.equals(leaf, current.activeLeafEntryId())
                 || lastSeq != current.lastConfirmedSeq()
-                || !Objects.equals(title, current.title());
+                || !Objects.equals(title, current.title())
+                || !Objects.equals(compactionEntryId, current.latestCompactionEntryId())
+                || !Objects.equals(compactionSeq, current.latestCompactionSeq())
+                || !Objects.equals(compactionOffset, current.latestCompactionByteOffset());
         if (changed) {
             repaired = new Conversation(
                     repaired.id(), repaired.workspaceId(), repaired.title(), repaired.historyFormatVersion(),
@@ -168,6 +174,9 @@ class ConversationRecoveryService {
             }
             case COMPACTION -> {
                 // 压缩 Entry 只参与压缩索引校验，不改变 Run 或活动叶子
+            }
+            case TITLE -> {
+                // 标题修复由最新 Title Entry 单独完成；Title 不改变 Run 或活动叶子
             }
         }
     }

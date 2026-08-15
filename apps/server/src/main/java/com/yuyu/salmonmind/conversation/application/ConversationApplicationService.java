@@ -3,11 +3,11 @@ package com.yuyu.salmonmind.conversation.application;
 import com.yuyu.salmonmind.conversation.api.Conversation;
 import com.yuyu.salmonmind.conversation.api.ConversationDetail;
 import com.yuyu.salmonmind.conversation.api.ConversationException;
-import com.yuyu.salmonmind.conversation.api.ConversationRunResult;
 import com.yuyu.salmonmind.conversation.api.ConversationService;
 import com.yuyu.salmonmind.conversation.api.ConversationSummary;
 import com.yuyu.salmonmind.conversation.api.Entry;
 import com.yuyu.salmonmind.conversation.api.Run;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener;
 import com.yuyu.salmonmind.conversation.application.port.ConversationHistoryRepository;
 import com.yuyu.salmonmind.conversation.application.port.ConversationMetadataRepository;
 import com.yuyu.salmonmind.conversation.domain.ConversationHistory;
@@ -100,13 +100,19 @@ class ConversationApplicationService implements ConversationService {
     }
 
     @Override
-    public ConversationRunResult send(UUID conversationId, String text) {
-        return executionQueue.execute(conversationId, () -> runCoordinator.send(conversationId, text));
+    public void send(UUID conversationId, String text, RunStreamListener listener) {
+        executionQueue.execute(conversationId, () -> {
+            runCoordinator.send(conversationId, text, listener);
+            return null;
+        });
     }
 
     @Override
-    public ConversationRunResult retry(UUID conversationId, UUID runId) {
-        return executionQueue.execute(conversationId, () -> runCoordinator.retry(conversationId, runId));
+    public void retry(UUID conversationId, UUID runId, RunStreamListener listener) {
+        executionQueue.execute(conversationId, () -> {
+            runCoordinator.retry(conversationId, runId, listener);
+            return null;
+        });
     }
 
     private ConversationDetail doOpen(UUID conversationId) {
@@ -126,15 +132,25 @@ class ConversationApplicationService implements ConversationService {
         return new ConversationDetail(conversation, activePath, pendingRun);
     }
 
-    // 活动叶子是待回答用户 Entry 时，返回其最新未成功 Run
+    // 活动叶子是待回答上下文节点（User 或本 Run 追加的 Compaction）时，
+    // 返回 Active Path 上最近一个尚未成功的触发 User 的最新 Run，用于前端展示重试入口
     private Run pendingRun(Conversation conversation, List<Entry> activePath) {
         if (activePath.isEmpty() || conversation.activeLeafEntryId() == null) {
             return null;
         }
         Entry leaf = activePath.get(activePath.size() - 1);
-        if (leaf.type() != Entry.EntryType.USER_MESSAGE) {
+        if (leaf.type() == Entry.EntryType.ASSISTANT_MESSAGE) {
             return null;
         }
-        return metadataRepository.latestUnsuccessfulRun(conversation.id(), leaf.id());
+        for (int i = activePath.size() - 1; i >= 0; i--) {
+            Entry entry = activePath.get(i);
+            if (entry.type() == Entry.EntryType.USER_MESSAGE) {
+                Run run = metadataRepository.latestUnsuccessfulRun(conversation.id(), entry.id());
+                if (run != null) {
+                    return run;
+                }
+            }
+        }
+        return null;
     }
 }

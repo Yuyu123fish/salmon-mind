@@ -26,6 +26,8 @@ public class ConversationException extends RuntimeException {
         CONVERSATION_BUSY,
         CONVERSATION_AWAITING_RETRY,
         CONTEXT_LIMIT_REACHED,
+        /** 摘要调用失败、结果空白、结构非法或被长度截断；User Entry 与失败 Run 保留，可重试。 */
+        COMPACTION_FAILED,
         CONVERSATION_HISTORY_CORRUPTED
     }
 }

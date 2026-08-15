@@ -30,31 +30,29 @@ public interface ConversationService {
     ConversationDetail open(UUID conversationId);
 
     /**
-     * 发送一条用户消息并等待完整回答。用户 Entry 先落 JSONL，再以数据库事务创建 RUNNING Run
-     * 并推进活动叶子与标题，之后调用 Agent；成功后再追加 Assistant Entry 并完成 Run。
-     * Agent 失败时不追加 Assistant Entry，只把 Run 置为 FAILED 后抛出稳定异常。
+     * 发送一条用户消息，以 SSE Run Stream 返回结果。User Entry 先落 JSONL，再以数据库
+     * 事务创建 RUNNING Run 并推进活动叶子；durable 状态成立后回调
+     * {@link RunStreamListener#onRunStarted}，随后按 Spec 顺序发送压缩、delta、完成、
+     * 标题与终态事件。成功时不追加不完整内容：只有模型成功且文本非空才追加一个
+     * Assistant Entry。
      *
-     * @param text 去首尾空白后必须非空的用户消息正文
-     * @throws ConversationException CONVERSATION_NOT_FOUND（不存在或不属于当前 Workspace）、
-     *                               CONVERSATION_AWAITING_RETRY（活动叶子仍是待重试的用户消息）、
-     *                               CONTEXT_LIMIT_REACHED（模型上下文超过硬限制）、
-     *                               CONVERSATION_HISTORY_CORRUPTED（历史损坏）
-     * @throws com.yuyu.salmonmind.agent.api.AgentExecutionException
-     *         模型未配置、模型调用失败或 Redis 不可用；Run 已标记 FAILED，可重试
+     * <p>失败边界：onRunStarted 之前（Conversation 不存在、历史损坏、输入非法、忙碌）
+     * 抛异常，由 HTTP 层映射为 JSON 错误；之后的一切失败（模型、Redis、压缩、持久化）
+     * 通过 {@link RunStreamListener#onRunFailed} 收束，方法正常返回表示流已结束。
+     *
+     * @param text     去首尾空白后必须非空的用户消息正文
+     * @param listener 本次 Run 的事件消费者；本方法同步阻塞直到 Run 完成
      */
-    ConversationRunResult send(UUID conversationId, String text);
+    void send(UUID conversationId, String text, RunStreamListener listener);
 
     /**
      * 重试指定失败或中断的 Run：复用原用户 Entry，不追加重复用户消息，并为同一触发 Entry
-     * 创建新的 Run 记录。重试成功后返回新的终态结果。
+     * 创建新的 Run 记录。若旧 Run 已追加 Compaction 但没有成功 Assistant，活动叶子可以
+     * 是该 Compaction：重试直接复用压缩结果，不得因活动叶子不再是 User Entry 而拒绝。
+     * 事件合同与 {@link #send} 一致，onRunStarted 标记 isRetry=true。
      *
-     * @param runId 待重试的 Run ID；只有当前活动叶子（待回答用户 Entry）的最新失败 Run 可重试
-     * @throws ConversationException CONVERSATION_NOT_FOUND（Conversation 或 Run 不存在、Run 不属于该 Conversation）、
-     *                               CONVERSATION_BUSY（Run 仍处于 RUNNING）、
-     *                               CONVERSATION_AWAITING_RETRY（Run 已成功或该消息已得到回答）、
-     *                               CONTEXT_LIMIT_REACHED、CONVERSATION_HISTORY_CORRUPTED
-     * @throws com.yuyu.salmonmind.agent.api.AgentExecutionException
-     *         模型未配置、模型调用失败或 Redis 不可用；新 Run 已标记 FAILED，可再次重试
+     * @param runId    待重试的 Run ID；只有当前活动叶子仍等待回答的最新失败 Run 可重试
+     * @param listener 本次 Run 的事件消费者；本方法同步阻塞直到 Run 完成
      */
-    ConversationRunResult retry(UUID conversationId, UUID runId);
+    void retry(UUID conversationId, UUID runId, RunStreamListener listener);
 }

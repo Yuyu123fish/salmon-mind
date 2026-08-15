@@ -17,6 +17,7 @@ import com.yuyu.salmonmind.conversation.api.ConversationService;
 import com.yuyu.salmonmind.conversation.api.ConversationSummary;
 import com.yuyu.salmonmind.conversation.api.Entry;
 import com.yuyu.salmonmind.conversation.api.Run;
+import com.yuyu.salmonmind.conversation.api.TitlePayload;
 import com.yuyu.salmonmind.conversation.api.TokenUsage;
 import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
 import org.junit.jupiter.api.AfterAll;
@@ -138,7 +139,8 @@ class ConversationPersistenceIntegrationTest {
 
         assertThat(detail.activePath()).containsExactly(u1, a1);
         assertThat(detail.pendingRun()).isNull();
-        assertThat(detail.conversation().title()).isEqualTo("你好，世界");
+        // Stage 2 起标题只来自模型 Title Entry，不再从首条用户消息截断
+        assertThat(detail.conversation().title()).isEqualTo("新对话");
         assertThat(detail.conversation().activeLeafEntryId()).isEqualTo(a1.id());
         assertThat(detail.conversation().lastConfirmedSeq()).isEqualTo(2);
 
@@ -229,6 +231,97 @@ class ConversationPersistenceIntegrationTest {
         assertThat(detail.conversation().latestCompactionByteOffset()).isNull();
     }
 
+    @Test
+    void clearsCompactionIndexWhenLatestCompactionIsNotOnActivePath() {
+        ConversationSummary summary = service.create();
+        UUID conversationId = summary.id();
+
+        // 主路径曾经压缩，之后从旧叶子开出分支：分支路径上没有 Compaction
+        Entry u1 = userEntry(conversationId, 1, null, "第一问", UUID.randomUUID());
+        Entry a1 = assistantEntry(conversationId, 2, u1.id(), "回答", UUID.randomUUID());
+        Entry c1 = compactionEntry(conversationId, 3, a1.id(), a1.id());
+        Entry branch = userEntry(conversationId, 4, a1.id(), "分支问题", UUID.randomUUID());
+        appendRaw(conversationId, u1);
+        appendRaw(conversationId, a1);
+        appendRaw(conversationId, c1);
+        appendRaw(conversationId, branch);
+
+        // 数据库指针仍指向主路径上的 Compaction：不在当前 Active Path，必须修复为 NULL
+        jdbcTemplate.update(
+                "UPDATE conversations SET latest_compaction_entry_id = ?, latest_compaction_seq = ?,"
+                        + " latest_compaction_byte_offset = ? WHERE id = ?",
+                c1.id(), c1.seq(), 10L, conversationId);
+
+        ConversationDetail detail = service.open(conversationId);
+        assertThat(detail.conversation().activeLeafEntryId()).isEqualTo(branch.id());
+        assertThat(detail.conversation().latestCompactionEntryId()).isNull();
+        assertThat(detail.conversation().latestCompactionSeq()).isNull();
+        assertThat(detail.conversation().latestCompactionByteOffset()).isNull();
+        // 修复已写回数据库，第二次打开不再变化
+        ConversationDetail again = service.open(conversationId);
+        assertThat(again.conversation().latestCompactionEntryId()).isNull();
+    }
+
+    @Test
+    void advancesCompactionIndexToLatestOnActivePath() {
+        ConversationSummary summary = service.create();
+        UUID conversationId = summary.id();
+
+        // 两次压缩都在当前路径上：数据库只保存最新三元组
+        Entry u1 = userEntry(conversationId, 1, null, "第一问", UUID.randomUUID());
+        Entry a1 = assistantEntry(conversationId, 2, u1.id(), "回答", UUID.randomUUID());
+        Entry c1 = compactionEntry(conversationId, 3, a1.id(), a1.id());
+        Entry u2 = userEntry(conversationId, 4, c1.id(), "第二问", UUID.randomUUID());
+        Entry a2 = assistantEntry(conversationId, 5, u2.id(), "回答二", UUID.randomUUID());
+        Entry c2 = compactionEntry(conversationId, 6, a2.id(), a2.id());
+        appendRaw(conversationId, u1);
+        appendRaw(conversationId, a1);
+        appendRaw(conversationId, c1);
+        appendRaw(conversationId, u2);
+        appendRaw(conversationId, a2);
+        appendRaw(conversationId, c2);
+
+        // 数据库指针停留在第一次压缩：必须推进到当前路径上的最新 Compaction
+        jdbcTemplate.update(
+                "UPDATE conversations SET latest_compaction_entry_id = ?, latest_compaction_seq = ?,"
+                        + " latest_compaction_byte_offset = ? WHERE id = ?",
+                c1.id(), c1.seq(), 10L, conversationId);
+
+        ConversationDetail detail = service.open(conversationId);
+        assertThat(detail.conversation().latestCompactionEntryId()).isEqualTo(c2.id());
+        assertThat(detail.conversation().latestCompactionSeq()).isEqualTo(c2.seq());
+        assertThat(detail.conversation().latestCompactionByteOffset()).isNotNull();
+    }
+
+    @Test
+    void repairsTitleFromLatestTitleEntryWithoutAdvancingActiveLeaf() {
+        ConversationSummary summary = service.create();
+        UUID conversationId = summary.id();
+
+        // JSONL 领先：User、Assistant 与 Title Entry 已落盘，数据库仍停留在创建态
+        Entry u1 = userEntry(conversationId, 1, null, "第一问", UUID.randomUUID());
+        Entry a1 = assistantEntry(conversationId, 2, u1.id(), "回答", UUID.randomUUID());
+        Entry t1 = titleEntry(conversationId, 3, a1.id(), "模型标题");
+        appendRaw(conversationId, u1);
+        appendRaw(conversationId, a1);
+        appendRaw(conversationId, t1);
+
+        ConversationDetail detail = service.open(conversationId);
+        // 标题从最新 Title Entry 修复
+        assertThat(detail.conversation().title()).isEqualTo("模型标题");
+        // Title 不推进 Active Path：叶子仍是 Assistant，seq 包含 Title
+        assertThat(detail.conversation().activeLeafEntryId()).isEqualTo(a1.id());
+        assertThat(detail.conversation().lastConfirmedSeq()).isEqualTo(3);
+        assertThat(detail.activePath()).containsExactly(u1, a1);
+        // 修复已写回数据库
+        String dbTitle = jdbcTemplate.queryForObject(
+                "SELECT title FROM conversations WHERE id = ?", String.class, conversationId);
+        assertThat(dbTitle).isEqualTo("模型标题");
+        Long dbSeq = jdbcTemplate.queryForObject(
+                "SELECT last_confirmed_seq FROM conversations WHERE id = ?", Long.class, conversationId);
+        assertThat(dbSeq).isEqualTo(3L);
+    }
+
     // 模拟旧进程已落盘但数据库未提交的写入：直接追加原始 JSONL 行
     private void appendRaw(UUID conversationId, Entry entry) throws RuntimeException {
         try {
@@ -277,6 +370,11 @@ class ConversationPersistenceIntegrationTest {
             case CompactionPayload p -> "{\"summary\":\"" + p.summary()
                     + "\",\"coveredThroughEntryId\":\"" + p.coveredThroughEntryId()
                     + "\",\"retainedTail\":[],\"tokensBefore\":" + p.tokensBefore() + "}";
+            case TitlePayload p -> "{\"title\":\"" + p.title()
+                    + "\",\"sourceRunId\":\"" + p.sourceRunId()
+                    + "\",\"sourceAssistantEntryId\":\"" + p.sourceAssistantEntryId()
+                    + "\",\"provider\":\"" + p.provider()
+                    + "\",\"model\":\"" + p.model() + "\"}";
         };
     }
 
@@ -285,6 +383,7 @@ class ConversationPersistenceIntegrationTest {
             case USER_MESSAGE -> "user_message";
             case ASSISTANT_MESSAGE -> "assistant_message";
             case COMPACTION -> "compaction";
+            case TITLE -> "title";
         };
     }
 
@@ -309,5 +408,11 @@ class ConversationPersistenceIntegrationTest {
         return new Entry(1, conversationId, UUID.randomUUID(), seq, parentId,
                 Entry.EntryType.COMPACTION, Instant.parse("2026-08-01T00:00:00Z"),
                 new CompactionPayload("摘要", coveredThroughEntryId, List.of(), 100L, null));
+    }
+
+    private Entry titleEntry(UUID conversationId, long seq, UUID parentId, String title) {
+        return new Entry(1, conversationId, UUID.randomUUID(), seq, parentId,
+                Entry.EntryType.TITLE, Instant.parse("2026-08-01T00:00:00Z"),
+                new TitlePayload(title, UUID.randomUUID(), parentId, "test-provider", "test-model"));
     }
 }

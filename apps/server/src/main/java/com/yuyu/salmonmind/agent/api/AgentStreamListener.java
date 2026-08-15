@@ -1,0 +1,17 @@
+package com.yuyu.salmonmind.agent.api;
+
+/**
+ * 流式主回答的稳定监听合同：按序收到增量 delta，最终以 onComplete 或 onError 恰好一次结束。
+ * delta 只用于临时显示，不构成最终结果；最终结果以 onComplete 携带的完整文本与 usage 为准。
+ */
+public interface AgentStreamListener {
+
+    /** 收到一段有序增量文本；多次调用按到达顺序拼接即为完整回答。 */
+    void onDelta(String delta);
+
+    /** 主调用成功结束：完整文本、provider/model 与可取得的 usage；与 onError 互斥。 */
+    void onComplete(AgentResult result);
+
+    /** 主调用失败：错误码表达明确失败语义（含上下文溢出）；与 onComplete 互斥。 */
+    void onError(AgentExecutionException error);
+}

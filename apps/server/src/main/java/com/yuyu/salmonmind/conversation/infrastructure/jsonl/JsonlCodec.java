@@ -12,6 +12,7 @@ import com.yuyu.salmonmind.conversation.api.CompactionPayload;
 import com.yuyu.salmonmind.conversation.api.Entry;
 import com.yuyu.salmonmind.conversation.api.EntryPayload;
 import com.yuyu.salmonmind.conversation.api.TokenUsage;
+import com.yuyu.salmonmind.conversation.api.TitlePayload;
 import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
 import com.yuyu.salmonmind.conversation.domain.ConversationHistory;
 import org.springframework.stereotype.Component;
@@ -118,6 +119,15 @@ class JsonlCodec {
                 }
                 yield node;
             }
+            case TitlePayload p -> {
+                ObjectNode node = mapper.createObjectNode();
+                node.put("title", p.title());
+                node.put("sourceRunId", p.sourceRunId().toString());
+                node.put("sourceAssistantEntryId", p.sourceAssistantEntryId().toString());
+                node.put("provider", p.provider());
+                node.put("model", p.model());
+                yield node;
+            }
         };
     }
 
@@ -182,6 +192,12 @@ class JsonlCodec {
                         node.hasNonNull("tokensBefore") ? node.get("tokensBefore").asLong() : null,
                         usage);
             }
+            case TITLE -> new TitlePayload(
+                    text(node, "title"),
+                    uuid(node, "sourceRunId"),
+                    uuid(node, "sourceAssistantEntryId"),
+                    text(node, "provider"),
+                    text(node, "model"));
         };
     }
 
@@ -222,6 +238,7 @@ class JsonlCodec {
             case USER_MESSAGE -> "user_message";
             case ASSISTANT_MESSAGE -> "assistant_message";
             case COMPACTION -> "compaction";
+            case TITLE -> "title";
         };
     }
 
@@ -230,6 +247,7 @@ class JsonlCodec {
             case "user_message" -> Entry.EntryType.USER_MESSAGE;
             case "assistant_message" -> Entry.EntryType.ASSISTANT_MESSAGE;
             case "compaction" -> Entry.EntryType.COMPACTION;
+            case "title" -> Entry.EntryType.TITLE;
             default -> throw corrupted("未知 Entry type: " + name);
         };
     }

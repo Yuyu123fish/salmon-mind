@@ -63,6 +63,17 @@ salmon:
     # ReactAgent Checkpoint 的短期状态存储；未配置时应用仍可启动，进入对话调用才报错
     url: ${REDIS_URL:redis://127.0.0.1:6379}
     password: ${REDIS_PASSWORD:}
+  compaction:
+    # 运行时上下文压缩预算：物理窗口是模型能力，工作窗口是产品主动采用的硬预算；
+    # 主输入触发阈值 = working-window − output-reserve（当前 196,712）。五个数值相互独立。
+    physical-window: ${COMPACTION_PHYSICAL_WINDOW:1000000}
+    working-window: ${COMPACTION_WORKING_WINDOW:262144}
+    output-reserve: ${COMPACTION_OUTPUT_RESERVE:65432}
+    retained-tail-target: ${COMPACTION_RETAINED_TAIL_TARGET:65536}
+    summary-max-output-tokens: ${COMPACTION_SUMMARY_MAX_OUTPUT_TOKENS:32768}
+    summary-temperature: ${COMPACTION_SUMMARY_TEMPERATURE:0.1}
+    # 无 usage 锚点时参与首次计量的 system prompt 保守估算（覆盖 Agent 提示与框架注入开销）
+    system-prompt-tokens: ${COMPACTION_SYSTEM_PROMPT_TOKENS:256}
   conversation:
     # 权威会话历史目录，Server 容器必须显式挂载；不与 infra/data/ 混用
     data-dir: ${CONVERSATION_DATA_DIR:data}

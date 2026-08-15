@@ -57,15 +57,32 @@ public record ConversationHistory(Header header, List<Entry> entries, List<Long>
         return List.copyOf(path);
     }
 
-    /** 最后一个 Compaction Entry；无压缩时为空。 */
-    public Entry latestCompactionEntry() {
-        Entry latest = null;
-        for (Entry entry : entries) {
-            if (entry.type() == Entry.EntryType.COMPACTION) {
-                latest = entry;
+    /**
+     * 从活动叶子沿当前 Active Path 倒序定位最近一个 Compaction Entry；路径上没有压缩时返回 null。
+     * 不扫描物理 Entries 尾部：分支（不在当前路径上）的 Compaction 不是当前模型投影的一部分，
+     * 不能作为"最新压缩"参与 usage 锚点或 PostgreSQL 指针修复。
+     */
+    public Entry latestCompactionOnPath(UUID activeLeafEntryId) {
+        List<Entry> path = activePath(activeLeafEntryId);
+        for (int i = path.size() - 1; i >= 0; i--) {
+            if (path.get(i).type() == Entry.EntryType.COMPACTION) {
+                return path.get(i);
             }
         }
-        return latest;
+        return null;
+    }
+
+    /**
+     * 最新 Title Entry；没有时返回 null。Title 是 Conversation 级元数据事件，不属于分支上下文，
+     * 因此基于完整合法 JSONL 倒序定位，不沿 Active Path 过滤。
+     */
+    public Entry latestTitleEntry() {
+        for (int i = entries.size() - 1; i >= 0; i--) {
+            if (entries.get(i).type() == Entry.EntryType.TITLE) {
+                return entries.get(i);
+            }
+        }
+        return null;
     }
 
     /** Entry 所在行的起始字节偏移；Entry 不在本快照中时为空。 */

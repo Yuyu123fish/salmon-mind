@@ -22,6 +22,7 @@ public record Entry(
     public enum EntryType {
         USER_MESSAGE,
         ASSISTANT_MESSAGE,
-        COMPACTION
+        COMPACTION,
+        TITLE
     }
 }

@@ -20,6 +20,7 @@ import com.yuyu.salmonmind.agent.api.AgentTitleRequest;
 import com.yuyu.salmonmind.agent.api.AgentTitleResult;
 import com.yuyu.salmonmind.agent.api.AgentTitleService;
 import com.yuyu.salmonmind.agent.api.AgentUsage;
+import com.yuyu.salmonmind.agent.api.CheckpointPolicy;
 import com.yuyu.salmonmind.model.chat.ChatModelException;
 import com.yuyu.salmonmind.model.chat.ChatModelHandle;
 import com.yuyu.salmonmind.model.chat.ChatModelProvider;
@@ -36,6 +37,8 @@ import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.openai.api.OpenAiApi;
+import org.springframework.ai.tool.ToolCallback;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
@@ -52,7 +55,14 @@ import java.util.regex.Pattern;
  * <p>主回答走 ReactAgent 流式执行（{@code agent.stream}）：事件流按序给出
  * AGENT_MODEL_STREAMING 增量 delta，末尾 AGENT_MODEL_FINISHED 事件携带累积完整文本
  * 与最终 ChatResponse（usage 与 finishReason 在 originData 中）。Checkpoint 语义与
- * 同步调用一致：Redis 标记等于期望 JSONL 叶子才复用，否则释放并用完整投影重建。
+ * 同步调用一致：Redis 标记等于期望 JSONL 叶子才复用，否则释放并用完整投影重建；
+ * 调用方可以通过 AgentRequest 的 CheckpointPolicy 显式要求强制重建。
+ *
+ * <p>工具生命周期通过平台 ToolLifecycleInterceptor 映射为 agent::api 的
+ * started/completed/failed 事件：每次 stream 把当前 listener 挂到 RunnableConfig
+ * metadata，拦截器在执行前取回并按 Tool Call ID 至多发出一对终态；工具结果在进入
+ * 下一轮模型上下文前按 max-tool-result-chars 有界截断。生产 Bean 不注册任何
+ * ToolCallback，测试工具只经包内构造 seam 注入。
  *
  * <p>摘要与标题是独立于 ReactAgent Checkpoint 的非流式轻量调用，请求级
  * temperature/maxTokens 通过 OpenAiChatOptions 传入，不修改模型全局默认选项。
@@ -77,19 +87,58 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
     private final int maxOutputTokens;
     private final int summaryMaxOutputTokens;
     private final double summaryTemperature;
+    private final int maxToolResultChars;
+    private final List<ToolCallback> testTools;
 
     private volatile ChatModelHandle chatModelHandle;
     private volatile ReactAgent reactAgent;
     private volatile RedisSaver redisSaver;
     private volatile RedissonClient redissonClient;
 
+    /**
+     * Spring 使用的注入构造：不注册任何 ToolCallback，生产 Agent 是纯对话 Agent；
+     * 工具生命周期拦截器始终挂载，无工具时为空操作。
+     */
+    @Autowired
     ReactAgentSessionAdapter(
             ChatModelProvider chatModelProvider,
             @Value("${salmon.redis.url:}") String redisUrl,
             @Value("${salmon.redis.password:}") String redisPassword,
             @Value("${salmon.compaction.output-reserve:65432}") int maxOutputTokens,
             @Value("${salmon.compaction.summary-max-output-tokens:32768}") int summaryMaxOutputTokens,
-            @Value("${salmon.compaction.summary-temperature:0.1}") double summaryTemperature
+            @Value("${salmon.compaction.summary-temperature:0.1}") double summaryTemperature,
+            @Value("${salmon.agent.max-tool-result-chars:200000}") int maxToolResultChars
+    ) {
+        this(chatModelProvider, redisUrl, redisPassword, maxOutputTokens, summaryMaxOutputTokens,
+                summaryTemperature, maxToolResultChars, List.of());
+    }
+
+    /** 兼容既有测试的包内构造：使用默认结果上限，不注册测试工具。 */
+    ReactAgentSessionAdapter(
+            ChatModelProvider chatModelProvider,
+            String redisUrl,
+            String redisPassword,
+            int maxOutputTokens,
+            int summaryMaxOutputTokens,
+            double summaryTemperature
+    ) {
+        this(chatModelProvider, redisUrl, redisPassword, maxOutputTokens, summaryMaxOutputTokens,
+                summaryTemperature, 200_000, List.of());
+    }
+
+    /**
+     * 包内测试注入 seam：允许集成测试注册测试专用 ToolCallback 与更小的结果上限；
+     * 测试工具永远只存在于包内构造的实例中，不会进入生产 Spring Bean。
+     */
+    ReactAgentSessionAdapter(
+            ChatModelProvider chatModelProvider,
+            String redisUrl,
+            String redisPassword,
+            int maxOutputTokens,
+            int summaryMaxOutputTokens,
+            double summaryTemperature,
+            int maxToolResultChars,
+            List<ToolCallback> testTools
     ) {
         this.chatModelProvider = chatModelProvider;
         this.redisUrl = redisUrl;
@@ -97,20 +146,33 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
         this.maxOutputTokens = maxOutputTokens;
         this.summaryMaxOutputTokens = summaryMaxOutputTokens;
         this.summaryTemperature = summaryTemperature;
+        this.maxToolResultChars = maxToolResultChars;
+        this.testTools = List.copyOf(testTools);
     }
 
+    /**
+     * 同步阻塞的流式主回答；失败一律收束为 onError，成功后再写回 Checkpoint 叶子。
+     */
     @Override
     public void stream(AgentRequest request, AgentStreamListener listener) {
         try {
             ChatModelHandle handle = handle();
             ReactAgent agent = reactAgent(handle);
             RedisSaver saver = saver();
-            RunnableConfig config = RunnableConfig.builder().threadId(request.threadId()).build();
 
-            // 标记与期望叶子一致才复用 Checkpoint，否则先释放再用完整模型可见消息重建
-            reactor.core.publisher.Flux<NodeOutput> flux = canReuseCheckpoint(request)
-                    ? agent.stream(List.of(toSpringMessage(lastUserMessage(request))), config)
-                    : rebuildFlux(agent, saver, config, request.modelVisibleMessages());
+            // 把当前流监听器挂到 config metadata：工具生命周期拦截器在执行前从中取回；
+            // 同一 Adapter 上的并发流各自携带独立 listener，互不干扰
+            RunnableConfig.Builder configBuilder = RunnableConfig.builder().threadId(request.threadId());
+            configBuilder.addMetadata(ToolLifecycleInterceptor.LISTENER_METADATA_KEY, listener);
+            RunnableConfig config = configBuilder.build();
+
+            // 显式强制重建（工具轮次）或叶子标记不匹配（Feature 002 语义）时，
+            // 先释放旧 Checkpoint，再只使用调用方提供的 JSONL 投影重建
+            boolean rebuild = request.checkpointPolicy() == CheckpointPolicy.REBUILD_FROM_PROJECTION
+                    || !canReuseCheckpoint(request);
+            reactor.core.publisher.Flux<NodeOutput> flux = rebuild
+                    ? rebuildFlux(agent, saver, config, request.modelVisibleMessages())
+                    : agent.stream(List.of(toSpringMessage(lastUserMessage(request))), config);
 
             StringBuilder accumulated = new StringBuilder();
             final ChatResponse[] finalOrigin = new ChatResponse[1];
@@ -131,7 +193,7 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
                         accumulated.append(chunk.getText());
                         listener.onDelta(chunk.getText());
                     }
-                }).blockLast();
+                }).blockLast();// 流结束后才会执行下面的代码
 
                 Usage usage = finalOrigin[0] != null && finalOrigin[0].getMetadata() != null
                         ? finalOrigin[0].getMetadata().getUsage() : null;
@@ -269,6 +331,9 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
         }
     }
 
+    /**
+     * 写入叶子标记，下一轮会拿它和 JSONL 的期望标记做比较
+     */
     private void writeCheckpointLeaf(AgentRequest request) {
         try {
             RBucket<String> bucket = redissonClient().getBucket(CHECKPOINT_LEAF_KEY_PREFIX + request.threadId());
@@ -279,8 +344,6 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
     }
 
     private void releaseCheckpoint(RedisSaver saver, RunnableConfig config) {
-        // 必须先释放旧 Checkpoint 再重建：保留它会令 ReactAgent 把新上下文叠加在
-        // 与 JSONL 不一致的陈旧状态上，造成消息重复或上下文错位
         try {
             saver.release(config);
         } catch (IllegalStateException ex) {
@@ -290,10 +353,16 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
         }
     }
 
+    /**
+     * 必须先释放旧 Checkpoint 再重建：保留它会令 ReactAgent 把新上下文叠加在
+     * 与 JSONL 不一致的陈旧状态上，造成消息重复或上下文错位
+     */
     private reactor.core.publisher.Flux<NodeOutput> rebuildFlux(
             ReactAgent agent, RedisSaver saver, RunnableConfig config, List<AgentMessage> messages
     ) {
+        // 释放旧 Checkpoint
         releaseCheckpoint(saver, config);
+        // 重建 Checkpoint
         try {
             return agent.stream(toSpringMessages(messages), config);
         } catch (com.alibaba.cloud.ai.graph.exception.GraphRunnerException ex) {
@@ -370,6 +439,9 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
                     // 主回答输出上限与流式 usage：与模型默认选项字段级合并，不修改默认 temperature
                     .chatOptions(mainOptions)
                     .saver(saver())
+                    // 平台工具生命周期拦截器：无工具注册时为空操作；测试工具经包内构造 seam 注入
+                    .interceptors(new ToolLifecycleInterceptor(maxToolResultChars))
+                    .tools(testTools)
                     .build();
         }
         return reactAgent;

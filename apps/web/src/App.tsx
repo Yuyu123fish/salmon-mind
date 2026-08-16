@@ -126,12 +126,13 @@ function App() {
   }, [rememberSelection])
 
   // 打开选中的 Conversation（含刷新恢复）：已有缓存时静默刷新对齐权威状态
-  const openConversation = useCallback(
+  const openConversation = useCallback(// 当[caches, rememberSelection]的内容没变时，缓存函数本身
     async (id: string) => {
       setSelectedId(id)
       rememberSelection(id)
-      setDetailError(null)
+      setDetailError(null)// 清除上一次的错误提示
       const seq = ++openedSeqRef.current
+      // 如果缓存中没有该对话，则设置为加载中
       if (caches[id] === undefined) {
         setDetailLoading(true)
       }
@@ -342,6 +343,7 @@ function App() {
   // 开始一次 send / retry：先占用该 Conversation 的 Run 槽位（防重复点击），再发起 SSE
   const startRun = useCallback(
     async (id: string, start: (listener: RunStreamListener) => Promise<void>) => {
+      // 用 Set 占位防止重复点击
       if (runSlotsRef.current.has(id)) return
       runSlotsRef.current.add(id)
       setRunStates((current) => ({ ...current, [id]: { runId: null, userEntry: null, assistantText: '' } }))

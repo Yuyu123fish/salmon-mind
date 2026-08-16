@@ -34,6 +34,8 @@ import com.yuyu.salmonmind.conversation.domain.ConversationHistory;
 import com.yuyu.salmonmind.conversation.domain.ConversationTitle;
 import com.yuyu.salmonmind.conversation.domain.TitleTemplate;
 import com.yuyu.salmonmind.workspace.api.WorkspaceRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -56,9 +58,12 @@ import java.util.UUID;
  *    从「Summary + Retained Tail + Compaction 后消息」的新投影重建；
  * 5. 流式主回答：delta 只在内存/SSE 中累积，只有模型成功且文本非空才追加一个完整
  *    Assistant Entry；模型成功前失败不写 Assistant；
- * 6. 成功落盘后在同一事务完成 Run 并推进叶子；无 Title Entry 时基于第一次成功交互
- *    尝试生成标题（失败不影响成功 Run）；
- * 7. run_started 之后的一切失败通过 run_failed 收束为唯一终态。
+ * 6. 成功提交点：Assistant JSONL 刷盘后，在同一数据库事务把 Run 更新为 SUCCEEDED
+ *    并推进活动叶子，随后独立尝试标题持久化。事务提交后业务成功不可降级；
+ * 7. 传输阶段：按序尽力发送 assistant_completed → 可选 title_updated → run_completed，
+ *    写出失败只结束当前连接，绝不把 SUCCEEDED 降级为 FAILED；客户端刷新后从
+ *    JSONL / 数据库读取权威成功状态；
+ * 8. run_started 之后、成功提交点之前的一切失败通过 run_failed 收束为唯一终态。
  *
  * <p>上下文投影规则：路径上最后一个 Compaction 之前的内容全部被摘要或 Tail 覆盖；
  * 投影只展开最新 Compaction 的 Summary 与 Retained Tail 原文，再加其后的新消息。
@@ -67,6 +72,8 @@ import java.util.UUID;
  */
 @Component
 class ConversationRunCoordinator {
+
+    private static final Logger log = LoggerFactory.getLogger(ConversationRunCoordinator.class);
 
     /** Summary 进入模型上下文的前缀消息；摘要是历史事实整理，不是用户新指令。 */
     private static final String SUMMARY_PREFIX = "以下为此前对话的结构化摘要，请基于它继续对话：\n";
@@ -476,6 +483,10 @@ class ConversationRunCoordinator {
      * Checkpoint 叶子标记，下一轮 {@link #expectedCheckpointLeaf}（活动叶子的 parent）
      * 与之相等才能复用；换成随机 ID 会导致复用永不成立。空回答视为模型失败，不追加空
      * Assistant，由 {@link #execute} 走失败路径后可重试。
+     *
+     * <p>本方法只负责「业务完成」：成功提交点就是下面的数据库事务提交。事务提交后
+     * Run 已是不可降级的 SUCCEEDED，成功事件写出交给 {@link #sendSuccessEvents}，
+     * 传输失败绝不回头调用 {@link #failRun}。
      */
     private void finishSuccess(
             RunStreamListener listener, UUID conversationId, MainOutcome outcome, Run running, UUID answerEntryId
@@ -505,31 +516,59 @@ class ConversationRunCoordinator {
             metadataRepository.updateRun(finished);
             metadataRepository.update(finalConversation);
         });
-        listener.onAssistantCompleted(new RunStreamListener.AssistantCompleted(conversationId, assistantEntry));
-        // 首次标题在成功终态事件之前：失败不影响已成功的主 Run
-        maybeGenerateTitle(listener, conversationId, finalConversation, assistantEntry, running);
-        listener.onRunCompleted(new RunStreamListener.RunCompleted(
-                conversationId, finished, finalConversation));
+
+        // 标题持久化也属于业务侧（失败不影响已成功的主 Run），成功则产出待发送事件
+        RunStreamListener.TitleUpdated titleEvent = maybeGenerateTitle(
+                conversationId, finalConversation, assistantEntry, running);
+        sendSuccessEvents(listener, conversationId, finished, finalConversation, assistantEntry, titleEvent);
     }
 
     /**
-     * 首次成功交互后尝试生成标题。路径上已有 Title Entry 时直接返回；模型调用独立于
-     * ReactAgent Checkpoint，失败保留默认标题且不回滚已成功的 Assistant 或 Run。
+     * 传输阶段：成功提交点之后，按对外顺序尽力写出成功事件
+     * {@code assistant_completed → 可选 title_updated → run_completed}。
+     *
+     * <p>这里的任何异常都只可能是 Listener/SSE 写出失败：Run 与 Conversation 已在该点
+     * 之前提交为 SUCCEEDED，传输中断只是结束当前连接，绝不调用 {@link #failRun} 降级。
+     * 客户端重新打开 Conversation 会读取 JSONL 与数据库的权威成功状态；某次写出失败后
+     * 停止继续发送后续事件，但不回滚任何业务状态。此 catch 不得覆盖成功提交点之前的
+     * 业务异常——那些异常仍由 {@link #execute} 走失败路径。
+     */
+    private void sendSuccessEvents(
+            RunStreamListener listener, UUID conversationId, Run finished, Conversation finalConversation,
+            Entry assistantEntry, RunStreamListener.TitleUpdated titleEvent
+    ) {
+        try {
+            listener.onAssistantCompleted(new RunStreamListener.AssistantCompleted(conversationId, assistantEntry));
+            if (titleEvent != null) {
+                listener.onTitleUpdated(titleEvent);
+            }
+            listener.onRunCompleted(new RunStreamListener.RunCompleted(
+                    conversationId, finished, finalConversation));
+        } catch (RuntimeException ex) {
+            // 已越过成功提交点：只记录传输中断，业务状态保持 SUCCEEDED
+            log.warn("成功事件传输中断（conversation={}）：只结束当前连接，业务状态保持 SUCCEEDED",
+                    conversationId, ex);
+        }
+    }
+
+    /**
+     * 首次成功交互后尝试生成标题并落盘，成功时返回待发送的 TitleUpdated 事件，否则返回
+     * {@code null}。路径上已有 Title Entry 时直接返回 null；模型调用独立于 ReactAgent
+     * Checkpoint，失败保留默认标题且不回滚已成功的 Assistant 或 Run。
      *
      * <p>Title 只推进确认序号与 Conversation 标题，不推进活动叶子，因此模型上下文与
      * Checkpoint 仍停在 Assistant。Title Entry 已写入 JSONL 而数据库未更新时，由下次
-     * 打开的恢复流程修复。
+     * 打开的恢复流程修复。事件发送由调用方在传输阶段统一执行，本方法不做传输。
      */
-    private void maybeGenerateTitle(
-            RunStreamListener listener, UUID conversationId, Conversation conversation,
-            Entry assistantEntry, Run running
+    private RunStreamListener.TitleUpdated maybeGenerateTitle(
+            UUID conversationId, Conversation conversation, Entry assistantEntry, Run running
     ) {
         Entry titleEntry = null;
         String normalized = null;
         try {
             List<Entry> path = historyRepository.read(conversationId).activePath(conversation.activeLeafEntryId());
             if (path.stream().anyMatch(e -> e.type() == EntryType.TITLE)) {
-                return;
+                return null;
             }
             Entry firstUser = null;
             Entry firstAssistant = null;
@@ -543,18 +582,18 @@ class ConversationRunCoordinator {
                 }
             }
             if (firstUser == null || firstAssistant == null) {
-                return;
+                return null;
             }
             AgentTitleResult result = titleService.generateTitle(new AgentTitleRequest(List.of(
                     new AgentMessage(AgentMessage.Role.USER, TitleTemplate.render(
                             ((UserMessagePayload) firstUser.payload()).text(),
                             ((AssistantMessagePayload) firstAssistant.payload()).text())))));
             if (result.title() == null || result.title().isBlank()) {
-                return;
+                return null;
             }
             normalized = ConversationTitle.normalize(result.title());
             if (normalized.isBlank()) {
-                return;
+                return null;
             }
             long seq = conversation.lastConfirmedSeq() + 1;
             titleEntry = new Entry(
@@ -573,12 +612,9 @@ class ConversationRunCoordinator {
         } catch (RuntimeException ex) {
             // 标题失败或标题落盘异常不回滚已成功的 Assistant 或 Run：保留默认标题，
             // 下一次成功 Run 再尝试；Title Entry 已写而数据库未更新时由恢复流程修复
-            return;
+            return null;
         }
-        if (titleEntry != null) {
-            listener.onTitleUpdated(new RunStreamListener.TitleUpdated(
-                    conversationId, titleEntry, normalized));
-        }
+        return titleEntry == null ? null : new RunStreamListener.TitleUpdated(conversationId, titleEntry, normalized);
     }
 
     /**

@@ -44,6 +44,28 @@ export type TokenUsage = {
   totalTokens: number | null
 }
 
+export type LocalCitation = {
+  kind: 'local'
+  referenceId: string
+  evidenceId: string
+  revisionId: string
+  documentName: string
+  location: string
+}
+
+export type WebCitation = {
+  kind: 'web'
+  referenceId: string
+  provider: string
+  title: string
+  url: string
+  site: string
+  dateLabel: string | null
+  retrievedAt: string
+}
+
+export type CitationPayload = LocalCitation | WebCitation
+
 // 类型化 payload：后端按实际类型序列化字段，前端依据 entry.type 读取对应字段
 export type EntryPayload = {
   text?: string
@@ -51,6 +73,7 @@ export type EntryPayload = {
   provider?: string
   model?: string
   usage?: TokenUsage | null
+  citations?: CitationPayload[]
   // TITLE
   title?: string
   sourceRunId?: string
@@ -109,6 +132,10 @@ export type ToolCompletedEvent = {
   toolCallId: string
   toolName: string
   durationMillis: number
+  provider: string | null
+  sourceCount: number
+  truncated: boolean
+  degraded: boolean
 }
 
 export type ToolFailedEvent = {

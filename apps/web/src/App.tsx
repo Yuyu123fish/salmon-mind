@@ -8,6 +8,7 @@ import {
   fetchConversations,
   streamRetry,
   streamSend,
+  type CitationPayload,
   type ConversationDetail,
   type ConversationSummary,
   type Entry,
@@ -39,6 +40,7 @@ type ActiveRunState = {
   assistantText: string
   /** 工具事件只用于当前连接的短状态，终态后随 Run 一起清理。 */
   toolStatus: 'searching' | 'completed' | 'unavailable' | null
+  toolProvider: string | null
 }
 
 // 可重试的失败 Run（FAILED / INTERRUPTED）；RUNNING 是单进程串行队列之外的残留，不提供操作
@@ -286,21 +288,42 @@ function App() {
           setRunStates((current) => {
             const state = current[conversationId]
             if (state === undefined || state.runId !== event.runId) return current
-            return { ...current, [conversationId]: { ...state, toolStatus: 'searching' } }
+            return {
+              ...current,
+              [conversationId]: {
+                ...state,
+                toolStatus: 'searching',
+                toolProvider: providerLabel(event.toolName),
+              },
+            }
           })
         },
         onToolCompleted(event) {
           setRunStates((current) => {
             const state = current[conversationId]
             if (state === undefined || state.runId !== event.runId) return current
-            return { ...current, [conversationId]: { ...state, toolStatus: 'completed' } }
+            return {
+              ...current,
+              [conversationId]: {
+                ...state,
+                toolStatus: 'completed',
+                toolProvider: providerLabel(event.provider ?? event.toolName),
+              },
+            }
           })
         },
         onToolFailed(event) {
           setRunStates((current) => {
             const state = current[conversationId]
             if (state === undefined || state.runId !== event.runId) return current
-            return { ...current, [conversationId]: { ...state, toolStatus: 'unavailable' } }
+            return {
+              ...current,
+              [conversationId]: {
+                ...state,
+                toolStatus: 'unavailable',
+                toolProvider: providerLabel(event.toolName),
+              },
+            }
           })
         },
         onAssistantDelta(event) {
@@ -397,7 +420,13 @@ function App() {
       runSlotsRef.current.add(id)
       setRunStates((current) => ({
         ...current,
-        [id]: { runId: null, userEntry: null, assistantText: '', toolStatus: null },
+        [id]: {
+          runId: null,
+          userEntry: null,
+          assistantText: '',
+          toolStatus: null,
+          toolProvider: null,
+        },
       }))
       setSendErrors((current) => ({ ...current, [id]: null }))
       try {
@@ -637,13 +666,13 @@ function App() {
                 <h2>{isDraft ? DRAFT_TITLE : selectedDetail!.conversation.title}</h2>
                 {running && <span className="run-badge">回答中…</span>}
                 {running && selectedRun.toolStatus === 'searching' && (
-                  <span className="tool-badge">正在检索本地知识库</span>
+                  <span className="tool-badge">正在检索{selectedRun.toolProvider ?? '资料'}</span>
                 )}
                 {running && selectedRun.toolStatus === 'completed' && (
-                  <span className="tool-badge">本地检索完成</span>
+                  <span className="tool-badge">{selectedRun.toolProvider ?? '资料'}检索完成</span>
                 )}
                 {running && selectedRun.toolStatus === 'unavailable' && (
-                  <span className="tool-badge unavailable">本地检索暂不可用</span>
+                  <span className="tool-badge unavailable">{selectedRun.toolProvider ?? '资料'}检索暂不可用</span>
                 )}
                 {!running && !isDraft && pendingRun !== null && isRetryable(pendingRun) && (
                   <span className="retry-badge">回答失败</span>
@@ -752,6 +781,7 @@ function MessageEntry({ entry }: { entry: Entry }) {
           <p className="model-line">
             {entry.payload.model ?? '模型'} · {formatTimeShort(entry.createdAt)}
           </p>
+          <CitationCards citations={entry.payload.citations ?? []} />
         </div>
       </div>
     )
@@ -766,6 +796,57 @@ function MessageEntry({ entry }: { entry: Entry }) {
   }
   // TITLE 是 Conversation 级元数据，不进入 Active Path；兜底时不渲染
   return null
+}
+
+function providerLabel(toolName: string): string {
+  if (toolName === 'search_web_bocha') return '博查'
+  if (toolName === 'search_web_searchapi') return 'SearchApi.io'
+  if (toolName === 'search_local_knowledge') return '本地知识库'
+  if (toolName === 'BOCHA') return '博查'
+  if (toolName === 'SEARCH_API') return 'SearchApi.io'
+  if (toolName === 'LOCAL') return '本地知识库'
+  return '资料'
+}
+
+function CitationCards({ citations }: { citations: CitationPayload[] }) {
+  if (citations.length === 0) return null
+  return (
+    <div className="citation-list" aria-label="回答来源">
+      {citations.map((citation) => {
+        if (citation.kind === 'local') {
+          return (
+            <div className="citation-card local-citation" key={citation.referenceId}>
+              <span className="citation-ref">[{citation.referenceId}]</span>
+              <div>
+                <strong>{citation.documentName}</strong>
+                <small>{citation.location}</small>
+              </div>
+            </div>
+          )
+        }
+        const safeUrl = /^https?:\/\//i.test(citation.url) ? citation.url : null
+        return (
+          <div className="citation-card web-citation" key={citation.referenceId}>
+            <span className="citation-ref">[{citation.referenceId}]</span>
+            <div>
+              {safeUrl === null ? (
+                <strong>{citation.title}</strong>
+              ) : (
+                <a href={safeUrl} target="_blank" rel="noopener noreferrer">
+                  {citation.title}
+                </a>
+              )}
+              <small>
+                {citation.provider} · {citation.site}
+                {citation.dateLabel ? ` · ${citation.dateLabel}` : ''} · 检索于{' '}
+                {formatTime(citation.retrievedAt)}
+              </small>
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
 }
 
 // 运行中的临时 Assistant：只用于展示 delta，最终以持久化 Entry 替换

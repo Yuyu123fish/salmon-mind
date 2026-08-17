@@ -361,6 +361,65 @@ button {
   font-size: 0.72rem;
 }
 
+.citation-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 9px;
+}
+
+.citation-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border-left: 2px solid var(--salmon);
+  padding: 6px 8px;
+  background: rgba(47, 79, 72, 0.04);
+  font-size: 0.76rem;
+}
+
+.citation-card > div {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+
+.citation-card strong,
+.citation-card a {
+  overflow: hidden;
+  color: var(--ink);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.citation-card a {
+  color: var(--river);
+  text-decoration: none;
+}
+
+.citation-card a:hover {
+  text-decoration: underline;
+}
+
+.citation-card small {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.68rem;
+}
+
+.citation-ref {
+  flex: 0 0 auto;
+  color: var(--salmon);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+}
+
 /* Markdown 渲染：不启用原始 HTML */
 .markdown > :first-child {
   margin-top: 0;

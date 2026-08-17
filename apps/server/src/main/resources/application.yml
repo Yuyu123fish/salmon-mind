@@ -70,6 +70,18 @@ salmon:
     max-model-response-chars: ${AGENT_MAX_MODEL_RESPONSE_CHARS:65536}
     max-tools: ${AGENT_MAX_TOOLS:64}
     max-tool-calls-per-run: ${AGENT_MAX_TOOL_CALLS_PER_RUN:4}
+  websearch:
+    connect-timeout: ${WEB_SEARCH_CONNECT_TIMEOUT:5s}
+    read-timeout: ${WEB_SEARCH_READ_TIMEOUT:15s}
+    bocha:
+      base-url: ${BOCHA_SEARCH_BASE_URL:https://api.bochaai.com}
+      api-key: ${BOCHA_SEARCH_API_KEY:}
+    search-api:
+      base-url: ${SEARCH_API_BASE_URL:https://www.searchapi.io}
+      api-key: ${SEARCH_API_API_KEY:}
+      gl: ${SEARCH_API_GL:cn}
+      hl: ${SEARCH_API_HL:zh-cn}
+      safe: ${SEARCH_API_SAFE:active}
   redis:
     # ReactAgent Checkpoint 的短期状态存储；未配置时应用仍可启动，进入对话调用才报错
     url: ${REDIS_URL:redis://127.0.0.1:6379}

@@ -38,8 +38,8 @@ class LocalKnowledgeToolCallbackTest {
         assertThat(callback.getToolDefinition().name()).isEqualTo(LocalKnowledgeToolCallback.NAME);
         assertThat(result.path("status").asText()).isEqualTo("SUCCESS");
         assertThat(result.path("reason").asText()).isEqualTo("COMPLETE");
-        assertThat(result.path("evidences")).hasSize(5);
-        assertThat(result.path("evidences").get(0).path("text").asText()).hasSize(4_001);
+        assertThat(result.path("items")).hasSize(5);
+        assertThat(result.path("items").get(0).path("text").asText()).hasSize(4_001);
     }
 
     @Test
@@ -57,6 +57,6 @@ class LocalKnowledgeToolCallbackTest {
         JsonNode failedResult = mapper.readTree(failed.call("{\"query\":\"本地资料\"}"));
         assertThat(failedResult.path("status").asText()).isEqualTo("UNAVAILABLE");
         assertThat(failedResult.path("reason").asText()).isEqualTo("RETRIEVAL_UNAVAILABLE");
-        assertThat(failedResult.path("evidences")).isEmpty();
+        assertThat(failedResult.path("items")).isEmpty();
     }
 }

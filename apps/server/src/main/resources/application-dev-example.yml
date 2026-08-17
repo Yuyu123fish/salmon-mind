@@ -19,6 +19,18 @@ salmon:
       # SiliconFlow API 根路径；代码会追加 /rerank
       base-url: https://api.siliconflow.cn/v1
       api-key: your-rerank-api-key
+  websearch:
+    bocha:
+      # 原始 Web Search API；缺少 key 时服务仍可启动，调用网页工具时返回未配置
+      base-url: https://api.bochaai.com
+      api-key: your-bocha-api-key
+    search-api:
+      # SearchApi.io Google organic results；不在浏览器或 query 参数中保存 key
+      base-url: https://www.searchapi.io
+      api-key: your-searchapi-api-key
+      gl: cn
+      hl: zh-cn
+      safe: active
   redis:
     # 本地 Redis 无密码时留空
     password:

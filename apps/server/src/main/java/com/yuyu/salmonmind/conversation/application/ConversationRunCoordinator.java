@@ -2,6 +2,8 @@ package com.yuyu.salmonmind.conversation.application;
 
 import com.yuyu.salmonmind.agent.api.AgentExecutionException;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException.AgentErrorCode;
+import com.yuyu.salmonmind.agent.api.AgentCitation;
+import com.yuyu.salmonmind.agent.api.AgentLocalCitation;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
 import com.yuyu.salmonmind.agent.api.AgentRequest;
 import com.yuyu.salmonmind.agent.api.AgentResult;
@@ -14,6 +16,7 @@ import com.yuyu.salmonmind.agent.api.AgentTitleRequest;
 import com.yuyu.salmonmind.agent.api.AgentTitleResult;
 import com.yuyu.salmonmind.agent.api.AgentTitleService;
 import com.yuyu.salmonmind.agent.api.AgentUsage;
+import com.yuyu.salmonmind.agent.api.AgentWebCitation;
 import com.yuyu.salmonmind.agent.api.CheckpointPolicy;
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
 import com.yuyu.salmonmind.conversation.api.CompactionPayload;
@@ -22,12 +25,15 @@ import com.yuyu.salmonmind.conversation.api.ConversationException;
 import com.yuyu.salmonmind.conversation.api.ConversationException.ConversationErrorCode;
 import com.yuyu.salmonmind.conversation.api.Entry;
 import com.yuyu.salmonmind.conversation.api.Entry.EntryType;
+import com.yuyu.salmonmind.conversation.api.CitationPayload;
+import com.yuyu.salmonmind.conversation.api.LocalCitationPayload;
 import com.yuyu.salmonmind.conversation.api.Run;
 import com.yuyu.salmonmind.conversation.api.Run.RunStatus;
 import com.yuyu.salmonmind.conversation.api.RunStreamListener;
 import com.yuyu.salmonmind.conversation.api.TitlePayload;
 import com.yuyu.salmonmind.conversation.api.TokenUsage;
 import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
+import com.yuyu.salmonmind.conversation.api.WebCitationPayload;
 import com.yuyu.salmonmind.conversation.application.port.ConversationHistoryRepository;
 import com.yuyu.salmonmind.conversation.application.port.ConversationMetadataRepository;
 import com.yuyu.salmonmind.conversation.domain.ConversationCompactionPolicy;
@@ -462,7 +468,8 @@ class ConversationRunCoordinator {
             @Override
             public void onToolCompleted(com.yuyu.salmonmind.agent.api.AgentToolCompleted event) {
                 listener.onToolCompleted(new RunStreamListener.ToolCompleted(
-                        running.id(), event.toolCallId(), event.toolName(), event.durationMillis()));
+                        running.id(), event.toolCallId(), event.toolName(), event.durationMillis(),
+                        event.provider(), event.sourceCount(), event.truncated(), event.degraded()));
             }
 
             @Override
@@ -527,7 +534,8 @@ class ConversationRunCoordinator {
                 ConversationHistory.FORMAT_VERSION, conversationId, answerEntryId, answerSeq,
                 outcome.conversation().activeLeafEntryId(), EntryType.ASSISTANT_MESSAGE, answeredAt,
                 new AssistantMessagePayload(
-                        result.text(), running.id(), result.provider(), result.model(), mapUsage(result.usage())));
+                        result.text(), running.id(), result.provider(), result.model(), mapUsage(result.usage()),
+                        mapCitations(result.citations())));
         historyRepository.append(conversationId, assistantEntry);
 
         Run finished = new Run(
@@ -770,6 +778,21 @@ class ConversationRunCoordinator {
      */
     private static TokenUsage mapUsage(AgentUsage usage) {
         return usage == null ? null : new TokenUsage(usage.promptTokens(), usage.completionTokens(), usage.totalTokens());
+    }
+
+    /** Conversation 只接收 Agent 已核对的 Citation，不重新访问检索模块或解析回答正文。 */
+    private static List<CitationPayload> mapCitations(List<AgentCitation> citations) {
+        if (citations == null || citations.isEmpty()) {
+            return List.of();
+        }
+        return citations.stream().map(citation -> switch (citation) {
+            case AgentLocalCitation local -> new LocalCitationPayload(
+                    local.referenceId(), local.evidenceId(), local.revisionId(),
+                    local.documentName(), local.location());
+            case AgentWebCitation web -> new WebCitationPayload(
+                    web.referenceId(), web.provider(), web.title(), web.url(), web.site(),
+                    web.dateLabel(), web.retrievedAt());
+        }).map(CitationPayload.class::cast).toList();
     }
 
     private static Entry findEntry(ConversationHistory history, UUID entryId) {

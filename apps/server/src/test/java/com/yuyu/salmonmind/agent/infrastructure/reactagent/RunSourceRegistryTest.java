@@ -1,0 +1,93 @@
+package com.yuyu.salmonmind.agent.infrastructure.reactagent;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.Test;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.UUID;
+
+/** Run-local L/W 身份唯一性、正文核对和结构化边界测试。 */
+class RunSourceRegistryTest {
+
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    @Test
+    void sharesWebSequenceAndPersistsOnlyExactReferencedSources() throws Exception {
+        RunSourceRegistry registry = new RunSourceRegistry(mapper);
+        String local = envelope("LOCAL", "LOCAL", """
+                {"evidenceId":"%s","revisionId":"%s","documentName":"manual.md","location":"p1","text":"local"}
+                """.formatted(UUID.randomUUID(), UUID.randomUUID()));
+        String bocha = webEnvelope("BOCHA", "https://example.com/a", "博查结果");
+        String searchApi = webEnvelope("SEARCH_API", "https://example.org/b", "SearchApi 结果");
+
+        RunSourceRegistry.Decoration localDecoration = registry.decorate(local, 10_000);
+        RunSourceRegistry.Decoration bochaDecoration = registry.decorate(bocha, 10_000);
+        RunSourceRegistry.Decoration searchApiDecoration = registry.decorate(searchApi, 10_000);
+
+        assertThat(mapper.readTree(localDecoration.result()).path("items").get(0).path("referenceId").asText())
+                .isEqualTo("L1");
+        assertThat(mapper.readTree(bochaDecoration.result()).path("items").get(0).path("referenceId").asText())
+                .isEqualTo("W1");
+        assertThat(mapper.readTree(searchApiDecoration.result()).path("items").get(0).path("referenceId").asText())
+                .isEqualTo("W2");
+
+        var citations = registry.citationsFor("依据 [W2]、[L1]、[W2] 和伪造 [W99]");
+        assertThat(citations).extracting("referenceId").containsExactly("W2", "L1");
+    }
+
+    @Test
+    void removesWholeItemsWhenBoundIsSmallAndKeepsJsonValid() throws Exception {
+        RunSourceRegistry registry = new RunSourceRegistry(mapper);
+        String result = webEnvelope("BOCHA", "https://example.com/a", "x".repeat(2_000));
+
+        RunSourceRegistry.Decoration decoration = registry.decorate(result, 300);
+
+        JsonNode bounded = mapper.readTree(decoration.result());
+        assertThat(bounded.isObject()).isTrue();
+        assertThat(bounded.path("truncated").asBoolean()).isTrue();
+        assertThat(bounded.path("items").isArray()).isTrue();
+    }
+
+    @Test
+    void keepsCitationWhenTrimmedDuplicateSharesTheSurvivingReference() throws Exception {
+        String single = webEnvelope("BOCHA", "https://example.com/a", "first");
+        int oneItemLimit = new RunSourceRegistry(mapper).decorate(single, 10_000).result().length() + 5;
+        RunSourceRegistry registry = new RunSourceRegistry(mapper);
+
+        RunSourceRegistry.Decoration decoration = registry.decorate(duplicateWebEnvelope(), oneItemLimit);
+
+        assertThat(decoration.truncated()).isTrue();
+        assertThat(mapper.readTree(decoration.result()).path("items")).singleElement()
+                .extracting(node -> node.path("referenceId").asText())
+                .isEqualTo("W1");
+        assertThat(registry.citationsFor("依据 [W1]")).hasSize(1);
+    }
+
+    private String envelope(String kind, String provider, String item) {
+        return "{\"status\":\"SUCCESS\",\"reason\":\"NONE\",\"sourceKind\":\""
+                + kind + "\",\"provider\":\"" + provider + "\",\"items\":[" + item + "]}";
+    }
+
+    private String webEnvelope(String provider, String url, String title) {
+        return "{\"status\":\"SUCCESS\",\"reason\":\"NONE\",\"sourceKind\":\"WEB\",
+                + "\"provider\":\"" + provider + "\",\"items\":[{"
+                + "\"title\":\"" + title + "\",\"url\":\"" + url + "\","
+                + "\"site\":\"example\",\"snippet\":\"snippet\","
+                + "\"retrievedAt\":\"" + Instant.parse("2026-08-17T00:00:00Z") + "\"}]}";
+    }
+
+    private String duplicateWebEnvelope() {
+        return "{\"status\":\"SUCCESS\",\"reason\":\"NONE\",\"sourceKind\":\"WEB\","
+                + "\"provider\":\"BOCHA\",\"items\":["
+                + "{\"title\":\"first\",\"url\":\"https://example.com/a\","
+                + "\"site\":\"example\",\"snippet\":\"snippet\","
+                + "\"retrievedAt\":\"2026-08-17T00:00:00Z\"},"
+                + "{\"title\":\"second\",\"url\":\"https://example.com/a\","
+                + "\"site\":\"example\",\"snippet\":\"snippet\","
+                + "\"retrievedAt\":\"2026-08-17T00:00:00Z\"}]}";
+    }
+}

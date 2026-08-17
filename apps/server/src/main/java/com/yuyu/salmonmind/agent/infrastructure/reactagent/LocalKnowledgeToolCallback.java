@@ -2,6 +2,7 @@ package com.yuyu.salmonmind.agent.infrastructure.reactagent;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yuyu.salmonmind.knowledge.retrieval.LocalKnowledgeRetriever;
 import com.yuyu.salmonmind.knowledge.retrieval.LocalKnowledgeRetriever.LocalEvidence;
 import com.yuyu.salmonmind.knowledge.retrieval.LocalKnowledgeRetriever.LocalKnowledgeReason;
@@ -86,9 +87,28 @@ final class LocalKnowledgeToolCallback implements ToolCallback {
 
     private String write(LocalKnowledgeResult result) {
         try {
-            return objectMapper.writeValueAsString(result);
+            ObjectNode envelope = objectMapper.createObjectNode();
+            envelope.put("status", result.status().name());
+            envelope.put("reason", result.reason().name());
+            envelope.put("sourceKind", "LOCAL");
+            envelope.put("provider", "LOCAL");
+            envelope.put("truncated", false);
+            var items = envelope.putArray("items");
+            for (LocalEvidence evidence : result.evidences()) {
+                if (evidence.evidenceId() == null || evidence.revisionId() == null) {
+                    continue;
+                }
+                ObjectNode item = items.addObject();
+                item.put("evidenceId", evidence.evidenceId().toString());
+                item.put("revisionId", evidence.revisionId().toString());
+                item.put("documentName", evidence.documentName() == null ? "" : evidence.documentName());
+                item.put("location", evidence.location() == null ? "" : evidence.location());
+                item.put("text", evidence.text() == null ? "" : evidence.text());
+            }
+            return objectMapper.writeValueAsString(envelope);
         } catch (Exception ex) {
-            return "{\"status\":\"UNAVAILABLE\",\"reason\":\"RETRIEVAL_UNAVAILABLE\",\"evidences\":[]}";
+            return "{\"status\":\"UNAVAILABLE\",\"reason\":\"RETRIEVAL_UNAVAILABLE\","
+                    + "\"sourceKind\":\"LOCAL\",\"provider\":\"LOCAL\",\"items\":[]}";
         }
     }
 }

@@ -15,7 +15,8 @@ class ApplicationModuleStructureTest {
             "model",
             "agent",
             "conversation",
-            "knowledge"
+            "knowledge",
+            "websearch"
     );
 
     @Test

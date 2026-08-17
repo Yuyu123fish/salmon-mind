@@ -36,8 +36,14 @@ public interface RunStreamListener {
     record ToolStarted(UUID runId, String toolCallId, String toolName) {
     }
 
-    /** 工具成功结束事件；只携带耗时。 */
-    record ToolCompleted(UUID runId, String toolCallId, String toolName, long durationMillis) {
+    /** 工具成功结束事件；来源状态只保留 Provider、数量和边界标记。 */
+    record ToolCompleted(
+            UUID runId, String toolCallId, String toolName, long durationMillis,
+            String provider, int sourceCount, boolean truncated, boolean degraded
+    ) {
+        public ToolCompleted(UUID runId, String toolCallId, String toolName, long durationMillis) {
+            this(runId, toolCallId, toolName, durationMillis, null, 0, false, false);
+        }
     }
 
     /** 工具失败事件；错误码稳定且不携带内部堆栈或工具结果。 */

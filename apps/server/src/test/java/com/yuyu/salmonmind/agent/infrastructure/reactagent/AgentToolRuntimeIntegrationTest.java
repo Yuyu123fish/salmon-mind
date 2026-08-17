@@ -171,6 +171,30 @@ class AgentToolRuntimeIntegrationTest {
     }
 
     @Test
+    void decoratesSourceResultAndReturnsOnlyReferencedCitation() {
+        String source = """
+                {"status":"SUCCESS","reason":"NONE","sourceKind":"WEB","provider":"BOCHA","items":[{"title":"官方页面","url":"https://example.com","site":"example.com","snippet":"摘要","retrievedAt":"2026-08-17T00:00:00Z"}]}
+                """;
+        var tool = new RecordingSearchTool(false, source);
+        var model = new ToolCallingChatModel("回答依据 [W1]，未知标记 [W99] 不应成为来源。");
+        var adapter = newAdapter(model, List.of(tool), 200_000);
+        var events = new RecordingListener();
+
+        AgentResult result = completeSync(adapter, events, new AgentRequest(
+                "citation-thread", null, UUID.randomUUID(), userList("搜索网页"),
+                CheckpointPolicy.REUSE_IF_MATCH));
+
+        assertThat(toolResponseOf(model.calls.get(1)).getResponses().get(0).responseData())
+                .contains("referenceId\":\"W1");
+        assertThat(result.citations()).hasSize(1);
+        assertThat(result.citations().get(0).referenceId()).isEqualTo("W1");
+        assertThat(events.completed).singleElement().satisfies(event -> {
+            assertThat(event.provider()).isEqualTo("BOCHA");
+            assertThat(event.sourceCount()).isEqualTo(1);
+        });
+    }
+
+    @Test
     void rebuildFromProjectionDoesNotCarryPreviousToolMessages() {
         var tool = new RecordingSearchTool();
         var model = new ToolCallingChatModel();
@@ -376,6 +400,16 @@ class AgentToolRuntimeIntegrationTest {
 
         static final String FINAL_ANSWER = "根据检索结果，SalmonMind 支持本地文档问答。";
 
+        private final String finalAnswer;
+
+        ToolCallingChatModel() {
+            this(FINAL_ANSWER);
+        }
+
+        ToolCallingChatModel(String finalAnswer) {
+            this.finalAnswer = finalAnswer;
+        }
+
         private final List<List<Message>> calls = new CopyOnWriteArrayList<>();
 
         @Override
@@ -394,7 +428,7 @@ class AgentToolRuntimeIntegrationTest {
                         .build();
                 return new ChatResponse(List.of(new Generation(toolCallMessage)));
             }
-            var answer = AssistantMessage.builder().content(FINAL_ANSWER).build();
+            var answer = AssistantMessage.builder().content(finalAnswer).build();
             var metadata = ChatResponseMetadata.builder().usage(new DefaultUsage(42, 7, 49)).build();
             return new ChatResponse(List.of(new Generation(answer)), metadata);
         }

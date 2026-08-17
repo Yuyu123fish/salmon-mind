@@ -4,6 +4,8 @@ import com.alibaba.cloud.ai.graph.agent.interceptor.ToolCallHandler;
 import com.alibaba.cloud.ai.graph.agent.interceptor.ToolCallRequest;
 import com.alibaba.cloud.ai.graph.agent.interceptor.ToolCallResponse;
 import com.alibaba.cloud.ai.graph.agent.interceptor.ToolInterceptor;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yuyu.salmonmind.agent.api.AgentStreamListener;
 import com.yuyu.salmonmind.agent.api.AgentToolCompleted;
 import com.yuyu.salmonmind.agent.api.AgentToolFailed;
@@ -43,14 +45,22 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
 
     /** 每次 Agent stream 独立的工具预算 metadata 键。 */
     static final String INVOCATION_BUDGET_METADATA_KEY = "salmon:agent:tool-budget";
+    static final String WEB_SEARCH_ALLOWED_METADATA_KEY = "salmon:agent:web-search-allowed";
     static final String TOOL_BUDGET_EXCEEDED = "TOOL_BUDGET_EXCEEDED";
     private static final String TOOL_BUDGET_RESULT =
-            "{\"status\":\"UNAVAILABLE\",\"reason\":\"TOOL_BUDGET_EXCEEDED\",\"evidences\":[]}";
+            "{\"status\":\"UNAVAILABLE\",\"reason\":\"TOOL_BUDGET_EXCEEDED\","
+                    + "\"sourceKind\":\"UNKNOWN\",\"items\":[]}";
 
     private final int maxToolResultChars;
+    private final ObjectMapper objectMapper;
 
     ToolLifecycleInterceptor(int maxToolResultChars) {
+        this(maxToolResultChars, new ObjectMapper());
+    }
+
+    ToolLifecycleInterceptor(int maxToolResultChars, ObjectMapper objectMapper) {
         this.maxToolResultChars = Math.max(0, maxToolResultChars);
+        this.objectMapper = objectMapper;
     }
 
     @Override
@@ -64,7 +74,8 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
         long startedNanos = System.nanoTime();
         if (listener != null) {
             listener.onToolStarted(new AgentToolStarted(
-                    request.getToolCallId(), request.getToolName(), safeSummary(request.getArguments())));
+                    request.getToolCallId(), request.getToolName(),
+                    toolStartSummary(request.getToolName(), request.getArguments())));
         }
         InvocationBudget budget = budgetOf(request);
         if (budget != null && !budget.tryAcquire()) {
@@ -76,8 +87,19 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             // 预算耗尽仍返回可被模型理解的结构化结果；不抛异常，避免工具失败制造 Run 双终态。
             return ToolCallResponse.error(request.getToolCallId(), request.getToolName(), TOOL_BUDGET_RESULT);
         }
+        if (isWebTool(request.getToolName()) && !webSearchAllowed(request)) {
+            if (listener != null) {
+                listener.onToolFailed(new AgentToolFailed(
+                        request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
+                        "WEB_SEARCH_DISABLED", "用户已禁止联网"));
+            }
+            return ToolCallResponse.error(request.getToolCallId(), request.getToolName(),
+                    disabledWebSearchResult(request.getToolName()));
+        }
         try {
-            ToolCallResponse response = boundResultSize(handler.call(request));
+            BoundResult bounded = boundResultSize(handler.call(request), request);
+            ToolCallResponse response = bounded.response();
+            RunSourceRegistry.Decoration source = bounded.decoration();
             long durationMillis = elapsedMillis(startedNanos);
             if (listener != null) {
                 if (response.isError() || isStructuredUnavailable(response.getResult())) {
@@ -86,7 +108,9 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                             stableErrorCode(response), safeSummary(response.getResult())));
                 } else {
                     listener.onToolCompleted(new AgentToolCompleted(
-                            response.getToolCallId(), response.getToolName(), durationMillis));
+                            response.getToolCallId(), response.getToolName(), durationMillis,
+                            source == null ? null : source.provider(), source == null ? 0 : source.sourceCount(),
+                            source != null && source.truncated(), source != null && source.degraded()));
                 }
             }
             return response;
@@ -119,16 +143,55 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                 .orElse(null);
     }
 
-    /** 工具结果进入模型上下文前的有界控制点：超出上限按字符截断，不携带完整原始结果。 */
-    private ToolCallResponse boundResultSize(ToolCallResponse response) {
+    private static boolean webSearchAllowed(ToolCallRequest request) {
+        return request.getExecutionContext()
+                .flatMap(context -> context.config().metadata(WEB_SEARCH_ALLOWED_METADATA_KEY))
+                .filter(Boolean.class::isInstance)
+                .map(Boolean.class::cast)
+                .orElse(true);
+    }
+
+    private static boolean isWebTool(String toolName) {
+        return "search_web_bocha".equals(toolName) || "search_web_searchapi".equals(toolName);
+    }
+
+    private static String disabledWebSearchResult(String toolName) {
+        String provider = "search_web_bocha".equals(toolName) ? "BOCHA" : "SEARCH_API";
+        return "{\"status\":\"UNAVAILABLE\",\"reason\":\"USER_DISABLED\","
+                + "\"sourceKind\":\"WEB\",\"provider\":\"" + provider + "\",\"items\":[]}";
+    }
+
+    /** 工具结果进入模型上下文前的有界控制点；来源结果必须按完整 item 边界裁剪。 */
+    private BoundResult boundResultSize(ToolCallResponse response, ToolCallRequest request) {
         String result = response.getResult();
+        RunSourceRegistry registry = sourceRegistryOf(request);
+        if (registry != null) {
+            RunSourceRegistry.Decoration decoration = registry.decorate(result, maxToolResultChars);
+            if (decoration != null) {
+                return new BoundResult(rebuild(response, decoration.result()), decoration);
+            }
+        }
         if (result == null || result.length() <= maxToolResultChars) {
-            return response;
+            return new BoundResult(response, null);
         }
         ToolCallResponse.Builder builder = ToolCallResponse.builder()
                 .toolCallId(response.getToolCallId())
                 .toolName(response.getToolName())
                 .content(result.substring(0, maxToolResultChars));
+        if (response.getStatus() != null) {
+            builder.status(response.getStatus());
+        }
+        if (response.getMetadata() != null) {
+            builder.metadata(response.getMetadata());
+        }
+        return new BoundResult(builder.build(), null);
+    }
+
+    private static ToolCallResponse rebuild(ToolCallResponse response, String content) {
+        ToolCallResponse.Builder builder = ToolCallResponse.builder()
+                .toolCallId(response.getToolCallId())
+                .toolName(response.getToolName())
+                .content(content);
         if (response.getStatus() != null) {
             builder.status(response.getStatus());
         }
@@ -142,9 +205,9 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
      * 错误响应优先使用框架 status，但框架统一使用 "error" 表达所有失败：
      * 映射为平台稳定错误码，避免把内部 status 直接暴露为业务错误码。
      */
-    private static String stableErrorCode(ToolCallResponse response) {
+    private String stableErrorCode(ToolCallResponse response) {
         if (isStructuredUnavailable(response.getResult())) {
-            return "RETRIEVAL_UNAVAILABLE";
+            return structuredErrorCode(response.getResult());
         }
         String status = response.getStatus();
         return status == null || status.isBlank() || "error".equalsIgnoreCase(status)
@@ -155,6 +218,44 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
     /** 本地 Knowledge Tool 以结构化内容返回可理解失败，不能被误报成成功工具调用。 */
     private static boolean isStructuredUnavailable(String result) {
         return result != null && result.stripLeading().startsWith("{\"status\":\"UNAVAILABLE\"");
+    }
+
+    /** 按来源种类保留网页 Provider-aware 错误，不把所有失败压成同一个检索码。 */
+    private String structuredErrorCode(String result) {
+        try {
+            JsonNode root = objectMapper.readTree(result);
+            if ("WEB".equals(root.path("sourceKind").asText())) {
+                return switch (root.path("reason").asText()) {
+                    case "NOT_CONFIGURED" -> "WEB_SEARCH_NOT_CONFIGURED";
+                    case "AUTH_FAILED" -> "WEB_SEARCH_AUTH_FAILED";
+                    case "RATE_LIMITED" -> "WEB_SEARCH_RATE_LIMITED";
+                    case "TIMEOUT" -> "WEB_SEARCH_TIMEOUT";
+                    case "USER_DISABLED" -> "WEB_SEARCH_DISABLED";
+                    default -> "WEB_SEARCH_FAILED";
+                };
+            }
+        } catch (Exception ignored) {
+            // 结构化前缀已经成立，解析失败时退回稳定通用码
+        }
+        return "RETRIEVAL_UNAVAILABLE";
+    }
+
+    private static RunSourceRegistry sourceRegistryOf(ToolCallRequest request) {
+        return request.getExecutionContext()
+                .flatMap(context -> context.config().metadata(RunSourceRegistry.METADATA_KEY))
+                .filter(RunSourceRegistry.class::isInstance)
+                .map(RunSourceRegistry.class::cast)
+                .orElse(null);
+    }
+
+
+    private record BoundResult(ToolCallResponse response, RunSourceRegistry.Decoration decoration) {
+    }
+
+    /** 网页工具事件只报告能力名称，不把完整用户查询写入 SSE。 */
+    private static String toolStartSummary(String toolName, String arguments) {
+        // 网页查询正文可能包含个人问题或完整检索词；SSE 只需展示工具名对应的短状态。
+        return isWebTool(toolName) ? "网页检索" : safeSummary(arguments);
     }
 
     /** 安全摘要：去掉控制字符后按固定长度截断，避免原始参数/结果泄露到事件中。 */

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Markdown from 'react-markdown'
+import KnowledgeView from './KnowledgeView.tsx'
 import { fetchCurrentWorkspace, type Workspace } from './workspaceApi.ts'
 import {
   createConversation,
@@ -80,6 +81,7 @@ function App() {
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [sendErrors, setSendErrors] = useState<Record<string, string | null>>({})
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [activeView, setActiveView] = useState<'chat' | 'knowledge'>('chat')
   const messagesRef = useRef<HTMLDivElement>(null)
   // 防止快速切换 Conversation 时过期打开请求覆盖新选择的加载/错误状态
   const openedSeqRef = useRef(0)
@@ -510,6 +512,24 @@ function App() {
           </svg>
           <span className="product">SalmonMind</span>
         </div>
+        <nav className="view-switch" aria-label="工作区视图">
+          <button
+            type="button"
+            className="view-switch-button"
+            aria-pressed={activeView === 'chat'}
+            onClick={() => setActiveView('chat')}
+          >
+            对话
+          </button>
+          <button
+            type="button"
+            className="view-switch-button"
+            aria-pressed={activeView === 'knowledge'}
+            onClick={() => setActiveView('knowledge')}
+          >
+            Knowledge
+          </button>
+        </nav>
         <p className="status">
           {workspaceState.status === 'ready' && '已连接'}
           {workspaceState.status === 'loading' && '正在连接'}
@@ -517,7 +537,9 @@ function App() {
         </p>
       </header>
 
-      <div className="workspace">
+      <div className="workspace" data-view={activeView}>
+        {activeView === 'chat' ? (
+          <>
         <aside className="sidebar" data-open={sidebarOpen}>
           <button type="button" className="new-chat" onClick={handleNewChat}>
             ＋ 新对话
@@ -663,6 +685,12 @@ function App() {
             </section>
           )}
         </main>
+          </>
+        ) : (
+          <main className="knowledge-main">
+            <KnowledgeView />
+          </main>
+        )}
       </div>
     </div>
   )

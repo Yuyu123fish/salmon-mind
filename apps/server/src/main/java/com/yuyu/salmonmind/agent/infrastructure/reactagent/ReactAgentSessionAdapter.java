@@ -24,11 +24,12 @@ import com.yuyu.salmonmind.agent.api.CheckpointPolicy;
 import com.yuyu.salmonmind.model.chat.ChatModelException;
 import com.yuyu.salmonmind.model.chat.ChatModelHandle;
 import com.yuyu.salmonmind.model.chat.ChatModelProvider;
-import org.redisson.Redisson;
 import org.redisson.api.RBucket;
 import org.redisson.api.RedissonClient;
 import org.redisson.client.RedisException;
-import org.redisson.config.Config;
+import com.yuyu.salmonmind.persistence.redis.RedisClientProvider;
+import com.yuyu.salmonmind.persistence.redis.RedisClientUnavailableException;
+import com.yuyu.salmonmind.persistence.redis.RedissonClientProvider;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.UserMessage;
@@ -41,7 +42,6 @@ import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
-import org.springframework.util.StringUtils;
 
 import java.util.List;
 import java.util.Locale;
@@ -82,8 +82,7 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
             "(?i).*(context|window|length).*(exceed|overflow|too (long|many|large)|limit|maximum).*");
 
     private final ChatModelProvider chatModelProvider;
-    private final String redisUrl;
-    private final String redisPassword;
+    private final RedisClientProvider redisClientProvider;
     private final int maxOutputTokens;
     private final int summaryMaxOutputTokens;
     private final double summaryTemperature;
@@ -102,14 +101,13 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
     @Autowired
     ReactAgentSessionAdapter(
             ChatModelProvider chatModelProvider,
-            @Value("${salmon.redis.url:}") String redisUrl,
-            @Value("${salmon.redis.password:}") String redisPassword,
+            RedisClientProvider redisClientProvider,
             @Value("${salmon.compaction.output-reserve:65432}") int maxOutputTokens,
             @Value("${salmon.compaction.summary-max-output-tokens:32768}") int summaryMaxOutputTokens,
             @Value("${salmon.compaction.summary-temperature:0.1}") double summaryTemperature,
             @Value("${salmon.agent.max-tool-result-chars:200000}") int maxToolResultChars
     ) {
-        this(chatModelProvider, redisUrl, redisPassword, maxOutputTokens, summaryMaxOutputTokens,
+        this(chatModelProvider, redisClientProvider, maxOutputTokens, summaryMaxOutputTokens,
                 summaryTemperature, maxToolResultChars, List.of());
     }
 
@@ -122,7 +120,8 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
             int summaryMaxOutputTokens,
             double summaryTemperature
     ) {
-        this(chatModelProvider, redisUrl, redisPassword, maxOutputTokens, summaryMaxOutputTokens,
+        this(chatModelProvider, new RedissonClientProvider(redisUrl, redisPassword, true),
+                maxOutputTokens, summaryMaxOutputTokens,
                 summaryTemperature, 200_000, List.of());
     }
 
@@ -130,6 +129,25 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
      * 包内测试注入 seam：允许集成测试注册测试专用 ToolCallback 与更小的结果上限；
      * 测试工具永远只存在于包内构造的实例中，不会进入生产 Spring Bean。
      */
+    ReactAgentSessionAdapter(
+            ChatModelProvider chatModelProvider,
+            RedisClientProvider redisClientProvider,
+            int maxOutputTokens,
+            int summaryMaxOutputTokens,
+            double summaryTemperature,
+            int maxToolResultChars,
+            List<ToolCallback> testTools
+    ) {
+        this.chatModelProvider = chatModelProvider;
+        this.redisClientProvider = redisClientProvider;
+        this.maxOutputTokens = maxOutputTokens;
+        this.summaryMaxOutputTokens = summaryMaxOutputTokens;
+        this.summaryTemperature = summaryTemperature;
+        this.maxToolResultChars = maxToolResultChars;
+        this.testTools = List.copyOf(testTools);
+    }
+
+    /** 兼容既有 Tool Runtime 集成测试的字符串 Redis 构造。 */
     ReactAgentSessionAdapter(
             ChatModelProvider chatModelProvider,
             String redisUrl,
@@ -140,14 +158,9 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
             int maxToolResultChars,
             List<ToolCallback> testTools
     ) {
-        this.chatModelProvider = chatModelProvider;
-        this.redisUrl = redisUrl;
-        this.redisPassword = redisPassword;
-        this.maxOutputTokens = maxOutputTokens;
-        this.summaryMaxOutputTokens = summaryMaxOutputTokens;
-        this.summaryTemperature = summaryTemperature;
-        this.maxToolResultChars = maxToolResultChars;
-        this.testTools = List.copyOf(testTools);
+        this(chatModelProvider, new RedissonClientProvider(redisUrl, redisPassword, true),
+                maxOutputTokens, summaryMaxOutputTokens, summaryTemperature,
+                maxToolResultChars, testTools);
     }
 
     /**
@@ -226,6 +239,8 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
         } catch (ChatModelException ex) {
             listener.onError(new AgentExecutionException(
                     AgentErrorCode.CHAT_MODEL_NOT_CONFIGURED, "Chat 模型未配置", ex));
+        } catch (RedisClientUnavailableException ex) {
+            listener.onError(new AgentExecutionException(AgentErrorCode.REDIS_UNAVAILABLE, ex.getMessage(), ex));
         } catch (RedisException ex) {
             listener.onError(redisFailure("Redis 不可用", ex));
         } catch (Exception ex) {
@@ -458,18 +473,11 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
 
     private synchronized RedissonClient redissonClient() {
         if (redissonClient == null) {
-            if (!StringUtils.hasText(redisUrl)) {
-                throw new AgentExecutionException(AgentErrorCode.REDIS_UNAVAILABLE, "Redis 未配置");
+            try {
+                redissonClient = redisClientProvider.client();
+            } catch (RedisClientUnavailableException ex) {
+                throw new AgentExecutionException(AgentErrorCode.REDIS_UNAVAILABLE, ex.getMessage(), ex);
             }
-            Config config = new Config();
-            config.useSingleServer()
-                    .setAddress(redisUrl)
-                    .setPassword(StringUtils.hasText(redisPassword) ? redisPassword : null)
-                    // 缩短超时与重试，保证 Redis 不可用时快速映射为 REDIS_UNAVAILABLE
-                    .setConnectTimeout(3000)
-                    .setTimeout(3000)
-                    .setRetryAttempts(1);
-            redissonClient = Redisson.create(config);
         }
         return redissonClient;
     }
@@ -481,7 +489,9 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
         redisSaver = null;
         reactAgent = null;
         chatModelHandle = null;
-        if (client != null) {
+        if (redisClientProvider instanceof RedissonClientProvider provider) {
+            provider.close();
+        } else if (client != null) {
             client.shutdown();
         }
     }

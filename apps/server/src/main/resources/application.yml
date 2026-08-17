@@ -14,6 +14,10 @@ spring:
     # 账号密码属于敏感配置：本地开发由 config/application-dev.yml 提供，容器由环境变量提供
     username: ${DATABASE_USERNAME:}
     password: ${DATABASE_PASSWORD:}
+  servlet:
+    multipart:
+      max-file-size: ${KNOWLEDGE_MAX_FILE_SIZE:52428800}
+      max-request-size: ${KNOWLEDGE_MAX_REQUEST_SIZE:53477376}
   flyway:
     locations: classpath:db/migration/workspace,classpath:db/migration/knowledge,classpath:db/migration/conversation
   modulith:
@@ -52,7 +56,8 @@ salmon:
     embedding:
       base-url: ${MODEL_EMBEDDING_BASE_URL:}
       api-key: ${MODEL_EMBEDDING_API_KEY:}
-      model-name: ${MODEL_EMBEDDING_NAME:}
+      # Stage 02 固定模型与维数；未配置 base-url/key 时仍只在 Worker 使用时失败
+      model-name: ${MODEL_EMBEDDING_NAME:Qwen/Qwen3-Embedding-4B}
   agent:
     max-steps: ${AGENT_MAX_STEPS:32}
     max-tool-result-chars: ${AGENT_MAX_TOOL_RESULT_CHARS:200000}
@@ -83,6 +88,15 @@ salmon:
     max-object-bytes: ${KNOWLEDGE_MAX_OBJECT_BYTES:52428800}
     default-top-k: ${KNOWLEDGE_DEFAULT_TOP_K:5}
     max-top-k: ${KNOWLEDGE_MAX_TOP_K:20}
+    queue:
+      stream: ${KNOWLEDGE_QUEUE_STREAM:salmon:knowledge:ingestion}
+      group: ${KNOWLEDGE_QUEUE_GROUP:salmon-knowledge-workers}
+    worker:
+      enabled: ${KNOWLEDGE_WORKER_ENABLED:true}
+      batch-size: ${KNOWLEDGE_WORKER_BATCH_SIZE:4}
+      max-auto-retries: ${KNOWLEDGE_WORKER_MAX_AUTO_RETRIES:2}
+      reclaim-idle: ${KNOWLEDGE_WORKER_RECLAIM_IDLE:30s}
+      repair-interval: ${KNOWLEDGE_WORKER_REPAIR_INTERVAL:10s}
     content-store:
       endpoint: ${RUSTFS_ENDPOINT:}
       access-key: ${RUSTFS_ACCESS_KEY:}

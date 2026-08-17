@@ -68,4 +68,5 @@ class KnowledgeController {
     DocumentSummary retry(@PathVariable UUID documentId) {
         return knowledgeService.retry(documentId);
     }
+
 }

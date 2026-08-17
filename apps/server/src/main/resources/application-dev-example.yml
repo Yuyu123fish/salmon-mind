@@ -12,14 +12,26 @@ salmon:
       # OpenAI-compatible API key；base-url 与 model-name 保留在 application.yml 的非敏感默认值中
       api-key: your-chat-api-key
     embedding:
+      # SiliconFlow OpenAI-compatible API 根路径；代码会追加 /embeddings
+      base-url: https://api.siliconflow.cn/v1
       api-key: your-embedding-api-key
+    rerank:
+      # SiliconFlow API 根路径；代码会追加 /rerank
+      base-url: https://api.siliconflow.cn/v1
+      api-key: your-rerank-api-key
   redis:
     # 本地 Redis 无密码时留空
     password:
   knowledge:
     content-store:
+      # 宿主机运行后端时，访问 Compose 映射到本机的 RustFS API 端口
+      endpoint: http://127.0.0.1:9000
       access-key: salmonmind
       secret-key: salmonmind-local-change-me
+      bucket: salmon-knowledge
+      region: us-east-1
     search:
+      # 宿主机运行后端时访问 Compose 映射到本机的 Elasticsearch
+      base-url: http://127.0.0.1:9200
       username:
       password:

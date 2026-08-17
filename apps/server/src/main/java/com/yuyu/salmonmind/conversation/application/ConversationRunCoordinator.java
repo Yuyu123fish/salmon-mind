@@ -14,6 +14,7 @@ import com.yuyu.salmonmind.agent.api.AgentTitleRequest;
 import com.yuyu.salmonmind.agent.api.AgentTitleResult;
 import com.yuyu.salmonmind.agent.api.AgentTitleService;
 import com.yuyu.salmonmind.agent.api.AgentUsage;
+import com.yuyu.salmonmind.agent.api.CheckpointPolicy;
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
 import com.yuyu.salmonmind.conversation.api.CompactionPayload;
 import com.yuyu.salmonmind.conversation.api.Conversation;
@@ -425,8 +426,11 @@ class ConversationRunCoordinator {
     ) {
         List<Entry> path = history.activePath(conversation.activeLeafEntryId());
         List<AgentMessage> projection = project(path);
+        CheckpointPolicy checkpointPolicy = agentStream.requiresProjectionRebuild()
+                ? CheckpointPolicy.REBUILD_FROM_PROJECTION : CheckpointPolicy.REUSE_IF_MATCH;
         AgentRequest request = new AgentRequest(
-                conversationId.toString(), expectedCheckpointLeaf(path), answerEntryId, projection);
+                conversationId.toString(), expectedCheckpointLeaf(path), answerEntryId, projection,
+                checkpointPolicy);
 
         boolean[] deltaSeen = {false};
         AgentResult[] success = {null};
@@ -447,6 +451,25 @@ class ConversationRunCoordinator {
             @Override
             public void onError(AgentExecutionException error) {
                 failure[0] = error;
+            }
+
+            @Override
+            public void onToolStarted(com.yuyu.salmonmind.agent.api.AgentToolStarted event) {
+                listener.onToolStarted(new RunStreamListener.ToolStarted(
+                        running.id(), event.toolCallId(), event.toolName()));
+            }
+
+            @Override
+            public void onToolCompleted(com.yuyu.salmonmind.agent.api.AgentToolCompleted event) {
+                listener.onToolCompleted(new RunStreamListener.ToolCompleted(
+                        running.id(), event.toolCallId(), event.toolName(), event.durationMillis()));
+            }
+
+            @Override
+            public void onToolFailed(com.yuyu.salmonmind.agent.api.AgentToolFailed event) {
+                listener.onToolFailed(new RunStreamListener.ToolFailed(
+                        running.id(), event.toolCallId(), event.toolName(), event.durationMillis(),
+                        event.stableErrorCode()));
             }
         });
 

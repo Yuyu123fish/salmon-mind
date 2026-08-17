@@ -37,6 +37,8 @@ type ActiveRunState = {
   userEntry: Entry | null
   /** assistant_delta 按顺序累积的临时文本，assistant_completed 后由持久化 Entry 取代 */
   assistantText: string
+  /** 工具事件只用于当前连接的短状态，终态后随 Run 一起清理。 */
+  toolStatus: 'searching' | 'completed' | 'unavailable' | null
 }
 
 // 可重试的失败 Run（FAILED / INTERRUPTED）；RUNNING 是单进程串行队列之外的残留，不提供操作
@@ -280,6 +282,27 @@ function App() {
             }
           })
         },
+        onToolStarted(event) {
+          setRunStates((current) => {
+            const state = current[conversationId]
+            if (state === undefined || state.runId !== event.runId) return current
+            return { ...current, [conversationId]: { ...state, toolStatus: 'searching' } }
+          })
+        },
+        onToolCompleted(event) {
+          setRunStates((current) => {
+            const state = current[conversationId]
+            if (state === undefined || state.runId !== event.runId) return current
+            return { ...current, [conversationId]: { ...state, toolStatus: 'completed' } }
+          })
+        },
+        onToolFailed(event) {
+          setRunStates((current) => {
+            const state = current[conversationId]
+            if (state === undefined || state.runId !== event.runId) return current
+            return { ...current, [conversationId]: { ...state, toolStatus: 'unavailable' } }
+          })
+        },
         onAssistantDelta(event) {
           setRunStates((current) => {
             const state = current[conversationId]
@@ -372,7 +395,10 @@ function App() {
       // 用 Set 占位防止重复点击
       if (runSlotsRef.current.has(id)) return
       runSlotsRef.current.add(id)
-      setRunStates((current) => ({ ...current, [id]: { runId: null, userEntry: null, assistantText: '' } }))
+      setRunStates((current) => ({
+        ...current,
+        [id]: { runId: null, userEntry: null, assistantText: '', toolStatus: null },
+      }))
       setSendErrors((current) => ({ ...current, [id]: null }))
       try {
         await start(makeListener(id, sentText))
@@ -610,6 +636,15 @@ function App() {
                 {/* isDraft 时 selectedDetail 一定不存在，非草稿分支已由外层条件保证有缓存 */}
                 <h2>{isDraft ? DRAFT_TITLE : selectedDetail!.conversation.title}</h2>
                 {running && <span className="run-badge">回答中…</span>}
+                {running && selectedRun.toolStatus === 'searching' && (
+                  <span className="tool-badge">正在检索本地知识库</span>
+                )}
+                {running && selectedRun.toolStatus === 'completed' && (
+                  <span className="tool-badge">本地检索完成</span>
+                )}
+                {running && selectedRun.toolStatus === 'unavailable' && (
+                  <span className="tool-badge unavailable">本地检索暂不可用</span>
+                )}
                 {!running && !isDraft && pendingRun !== null && isRetryable(pendingRun) && (
                   <span className="retry-badge">回答失败</span>
                 )}

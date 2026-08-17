@@ -6,6 +6,7 @@ import com.yuyu.salmonmind.model.embedding.EmbeddingResult;
 import com.yuyu.salmonmind.model.embedding.EmbeddingService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 import org.springframework.web.client.RestClient;
@@ -16,6 +17,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.time.Duration;
 
 /**
  * SiliconFlow OpenAI-compatible Embedding Adapter。
@@ -29,17 +31,23 @@ class SiliconFlowEmbeddingService implements EmbeddingService {
     private final String baseUrl;
     private final String apiKey;
     private final String modelName;
+    private final Duration connectTimeout;
+    private final Duration readTimeout;
 
     private volatile RestClient client;
 
     SiliconFlowEmbeddingService(
             @Value("${salmon.model.embedding.base-url:}") String baseUrl,
             @Value("${salmon.model.embedding.api-key:}") String apiKey,
-            @Value("${salmon.model.embedding.model-name:Qwen/Qwen3-Embedding-4B}") String modelName
+            @Value("${salmon.model.embedding.model-name:Qwen/Qwen3-Embedding-4B}") String modelName,
+            @Value("${salmon.model.connect-timeout:5s}") Duration connectTimeout,
+            @Value("${salmon.model.read-timeout:60s}") Duration readTimeout
     ) {
         this.baseUrl = baseUrl;
         this.apiKey = apiKey;
         this.modelName = modelName;
+        this.connectTimeout = connectTimeout;
+        this.readTimeout = readTimeout;
     }
 
     @Override
@@ -101,7 +109,13 @@ class SiliconFlowEmbeddingService implements EmbeddingService {
 
     private synchronized RestClient client() {
         if (client == null) {
-            client = RestClient.builder().baseUrl(baseUrl.replaceAll("/+$", "")).build();
+            SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
+            requestFactory.setConnectTimeout(connectTimeout);
+            requestFactory.setReadTimeout(readTimeout);
+            client = RestClient.builder()
+                    .baseUrl(baseUrl.replaceAll("/+$", ""))
+                    .requestFactory(requestFactory)
+                    .build();
         }
         return client;
     }

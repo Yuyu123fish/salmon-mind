@@ -126,6 +126,34 @@ class KnowledgeInfrastructureGateIntegrationTest {
                 .singleElement().extracting(EvidenceIndexPort.IndexedEvidence::id).isEqualTo(evidenceId);
     }
 
+    @Test
+    void bm25AndKnnApplyTheRevisionPrefilterBeforeReturningCandidates() {
+        String index = evidenceIndex.ensureIndex();
+        UUID readyRevision = UUID.randomUUID();
+        UUID residualRevision = UUID.randomUUID();
+        UUID readyEvidence = UUID.randomUUID();
+        UUID residualEvidence = UUID.randomUUID();
+        List<Float> readyVector = java.util.Collections.nCopies(2560, 0.02f);
+        List<Float> residualVector = java.util.Collections.nCopies(2560, 0.03f);
+
+        evidenceIndex.upsert(index, new EvidenceIndexPort.IndexedEvidence(
+                readyEvidence, readyRevision, UUID.randomUUID(), 0, "section 1",
+                "本地知识库 local knowledge", readyVector, "b".repeat(64)));
+        evidenceIndex.upsert(index, new EvidenceIndexPort.IndexedEvidence(
+                residualEvidence, residualRevision, UUID.randomUUID(), 0, "section 2",
+                "本地知识库 local knowledge", residualVector, "c".repeat(64)));
+
+        assertThat(evidenceIndex.searchText(index, "local", List.of(readyRevision), 40))
+                .extracting(EvidenceIndexPort.RankedEvidence::id)
+                .containsExactly(readyEvidence);
+        assertThat(evidenceIndex.searchText(index, "知识库", List.of(readyRevision), 40))
+                .extracting(EvidenceIndexPort.RankedEvidence::id)
+                .containsExactly(readyEvidence);
+        assertThat(evidenceIndex.searchVector(index, readyVector, List.of(readyRevision), 40, 200))
+                .extracting(EvidenceIndexPort.RankedEvidence::id)
+                .containsExactly(readyEvidence);
+    }
+
     private static byte[] minimalPdf() {
         return ("%PDF-1.4\n"
                 + "1 0 obj<< /Type /Catalog /Pages 2 0 R >>endobj\n"

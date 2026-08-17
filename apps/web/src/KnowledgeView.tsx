@@ -4,11 +4,15 @@ import {
   fetchDocuments,
   fetchEvidence,
   retryDocument,
+  searchKnowledge,
   uploadDocument,
   type DocumentDetail,
   type DocumentSummary,
   type EvidencePage,
   type KnowledgeState,
+  type KnowledgeSearchResult,
+  type SearchReason,
+  type SearchStage,
 } from './knowledgeApi.ts'
 
 const TERMINAL_STATES: KnowledgeState[] = ['READY', 'OCR_REQUIRED', 'FAILED']
@@ -50,6 +54,23 @@ function stateClass(state: KnowledgeState): string {
   return state.toLowerCase().replace('_', '-')
 }
 
+const searchStageLabels: Array<[keyof Pick<KnowledgeSearchResult, 'bm25' | 'vector' | 'rrf' | 'finalResults'>, string]> = [
+  ['bm25', 'BM25 Top 40'],
+  ['vector', 'Vector Top 40'],
+  ['rrf', 'RRF Top 20'],
+  ['finalResults', 'Final Top 5'],
+]
+
+const searchReasonLabels: Record<SearchReason, string> = {
+  NO_READY_DOCUMENTS: '当前没有已发布的 READY 资料',
+  COMPLETE: '混合检索与精排完成',
+  NO_MATCH: '两路检索都没有命中',
+  VECTOR_UNAVAILABLE: '向量检索不可用，已降级为 BM25',
+  RERANK_UNAVAILABLE: '精排不可用，已降级为 RRF',
+  INDEX_UNAVAILABLE: '检索索引暂不可用',
+  READY_SCOPE_TOO_LARGE: 'READY 范围超过安全过滤上限',
+}
+
 function KnowledgeView() {
   const [documents, setDocuments] = useState<DocumentSummary[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -62,9 +83,14 @@ function KnowledgeView() {
   const [error, setError] = useState<string | null>(null)
   const [evidenceError, setEvidenceError] = useState<string | null>(null)
   const [evidencePageNumber, setEvidencePageNumber] = useState(0)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searching, setSearching] = useState(false)
+  const [searchResult, setSearchResult] = useState<KnowledgeSearchResult | null>(null)
+  const [searchError, setSearchError] = useState<string | null>(null)
   const [pageVisible, setPageVisible] = useState(window.document.visibilityState === 'visible')
   const detailRequest = useRef(0)
   const documentListRequest = useRef(0)
+  const searchRequest = useRef(0)
 
   useEffect(() => {
     const updateVisibility = () => setPageVisible(window.document.visibilityState === 'visible')
@@ -195,6 +221,23 @@ function KnowledgeView() {
     }
   }
 
+  const handleSearch = async () => {
+    const query = searchQuery.trim()
+    if (query === '' || searching) return
+    const requestId = ++searchRequest.current
+    setSearching(true)
+    setSearchError(null)
+    setSearchResult(null)
+    try {
+      const next = await searchKnowledge(query)
+      if (requestId === searchRequest.current) setSearchResult(next)
+    } catch (requestError: unknown) {
+      if (requestId === searchRequest.current) setSearchError(messageOf(requestError))
+    } finally {
+      if (requestId === searchRequest.current) setSearching(false)
+    }
+  }
+
   return (
     <section className="knowledge-view" aria-labelledby="knowledge-title">
       <header className="knowledge-hero">
@@ -229,6 +272,61 @@ function KnowledgeView() {
         <div><strong>{readyCount}</strong><span>已就绪</span></div>
         <div><strong>{activeCount}</strong><span>处理中</span></div>
       </div>
+
+      <section className="retrieval-diagnostics" aria-labelledby="retrieval-title">
+        <div className="section-heading">
+          <div>
+            <p className="kicker">检索诊断</p>
+            <h2 id="retrieval-title">看看一条查询如何穿过资料</h2>
+          </div>
+          {searchResult !== null && <span>{searchResult.policyVersion}</span>}
+        </div>
+        <form className="retrieval-form" onSubmit={(event) => { event.preventDefault(); void handleSearch() }}>
+          <input
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            placeholder="输入中文或英文查询"
+            maxLength={2000}
+            aria-label="检索查询"
+          />
+          <button type="submit" className="primary-small" disabled={searching || searchQuery.trim() === ''}>
+            {searching ? '检索中…' : '运行检索'}
+          </button>
+        </form>
+        {searchError !== null && <p className="detail-error">{searchError}</p>}
+        {searchResult !== null && (
+          <>
+            <div className={`retrieval-status ${searchResult.status.toLowerCase()}`} role="status">
+              <strong>{searchResult.status}</strong>
+              <span>{searchReasonLabels[searchResult.reason]}</span>
+              <small>已执行：{searchResult.executedStages.join(' → ') || '—'} · 跳过：{searchResult.skippedStages.join('、') || '—'}</small>
+            </div>
+            <div className="retrieval-stages">
+              {searchStageLabels.map(([key, label]) => {
+                const stage: SearchStage = searchResult[key]
+                return (
+                  <section className="retrieval-stage" key={key}>
+                    <div className="section-heading compact"><h3>{label}</h3><span>{stage.items.length} 条</span></div>
+                    {stage.items.length === 0 ? <p className="detail-hint">没有候选</p> : (
+                      <ol>
+                        {stage.items.map((item) => (
+                          <li key={`${key}-${item.evidenceId}`}>
+                            <div>
+                              <strong>#{item.rank ?? '—'} · {item.documentName}</strong>
+                              <small>{item.location} · 诊断分数 {item.score === null ? '—' : item.score.toFixed(4)}</small>
+                            </div>
+                            <p>{item.text}</p>
+                          </li>
+                        ))}
+                      </ol>
+                    )}
+                  </section>
+                )
+              })}
+            </div>
+          </>
+        )}
+      </section>
 
       <div className="knowledge-grid">
         <section className="document-shelf" aria-labelledby="document-list-title">

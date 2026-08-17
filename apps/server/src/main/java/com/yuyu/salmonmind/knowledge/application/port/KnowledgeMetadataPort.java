@@ -6,6 +6,7 @@ import com.yuyu.salmonmind.knowledge.domain.IngestionJobState;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -94,6 +95,16 @@ public interface KnowledgeMetadataPort {
             int textCharCount
     );
 
+    /**
+     * 读取当前 Workspace 可检索的 Active Generation 与 READY Revision 范围。
+     * 返回的 revision 数量超过上限时仍保留完整集合，但标记为不可安全下推，
+     * 调用方必须返回不可用而不能截断集合继续查询。
+     */
+    RetrievalScope currentRetrievalScope(UUID workspaceId, int maxRevisionCount);
+
+    /** 按同一 Generation 二次校验候选 Evidence，并补全文档名、位置等 PostgreSQL 元数据。 */
+    Map<UUID, ReadyEvidence> findReadyEvidence(RetrievalScope scope, Collection<UUID> evidenceIds);
+
     /** 上传事务提交后的稳定身份；后续 Stream 只携带 jobId 和 attemptNumber。 */
     record Submission(UUID sourceId, UUID revisionId, UUID jobId, int attemptNumber) {
     }
@@ -148,6 +159,36 @@ public interface KnowledgeMetadataPort {
 
     /** Active Index Generation 的可追溯模型与物理索引信息。 */
     record Generation(UUID id, String physicalIndex, String provider, String model, int dimensions) {
+    }
+
+    /** 两路召回必须共同使用的 PostgreSQL READY 过滤范围。 */
+    record RetrievalScope(
+            UUID workspaceId,
+            UUID generationId,
+            String physicalIndex,
+            List<UUID> readyRevisionIds,
+            boolean revisionFilterBounded
+    ) {
+        public RetrievalScope {
+            readyRevisionIds = readyRevisionIds == null ? List.of() : List.copyOf(readyRevisionIds);
+        }
+
+        public boolean hasReadyRevision() {
+            return !readyRevisionIds.isEmpty();
+        }
+    }
+
+    /** PostgreSQL 对 Evidence 身份和来源的权威补全；正文仍来自 Elasticsearch。 */
+    record ReadyEvidence(
+            UUID evidenceId,
+            UUID sourceId,
+            UUID revisionId,
+            String documentName,
+            String location,
+            String contentSha256,
+            int ordinal,
+            int charCount
+    ) {
     }
 
     /** READY 发布时写入 PostgreSQL 的 Evidence 元数据，不携带正文和向量。 */

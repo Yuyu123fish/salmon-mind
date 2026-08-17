@@ -44,6 +44,21 @@ class SseEventWriter implements RunStreamListener {
     }
 
     @Override
+    public void onToolStarted(ToolStarted event) {
+        write("tool_started", event);
+    }
+
+    @Override
+    public void onToolCompleted(ToolCompleted event) {
+        write("tool_completed", event);
+    }
+
+    @Override
+    public void onToolFailed(ToolFailed event) {
+        write("tool_failed", event);
+    }
+
+    @Override
     public void onAssistantCompleted(AssistantCompleted event) {
         write("assistant_completed", event);
     }

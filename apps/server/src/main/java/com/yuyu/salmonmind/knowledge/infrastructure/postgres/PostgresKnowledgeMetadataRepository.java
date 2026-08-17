@@ -11,7 +11,10 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -327,6 +330,110 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
         jobMapper.update(update, Wrappers.<KnowledgeIngestionJobEntity>lambdaUpdate()
                 .eq(KnowledgeIngestionJobEntity::getId, jobId)
                 .eq(KnowledgeIngestionJobEntity::getState, IngestionJobState.INDEXING.name()));
+    }
+
+    @Override
+    public RetrievalScope currentRetrievalScope(UUID workspaceId, int maxRevisionCount) {
+        KnowledgeGenerationEntity active = generationMapper.selectOne(Wrappers.<KnowledgeGenerationEntity>lambdaQuery()
+                .eq(KnowledgeGenerationEntity::getStatus, "ACTIVE"));
+        if (active == null) {
+            return null;
+        }
+
+        List<KnowledgeSourceEntity> sources = sourceMapper.selectList(Wrappers.<KnowledgeSourceEntity>lambdaQuery()
+                .eq(KnowledgeSourceEntity::getWorkspaceId, workspaceId));
+        if (sources.isEmpty()) {
+            return new RetrievalScope(workspaceId, active.getId(), active.getPhysicalIndex(), List.of(), true);
+        }
+        List<UUID> sourceIds = sources.stream().map(KnowledgeSourceEntity::getId).toList();
+        List<KnowledgeRevisionEntity> revisions = revisionMapper.selectList(Wrappers.<KnowledgeRevisionEntity>lambdaQuery()
+                .in(KnowledgeRevisionEntity::getSourceId, sourceIds));
+        if (revisions.isEmpty()) {
+            return new RetrievalScope(workspaceId, active.getId(), active.getPhysicalIndex(), List.of(), true);
+        }
+        List<UUID> revisionIds = revisions.stream().map(KnowledgeRevisionEntity::getId).toList();
+        List<KnowledgeEvidenceEntity> evidence = evidenceMapper.selectList(
+                Wrappers.<KnowledgeEvidenceEntity>lambdaQuery()
+                        .eq(KnowledgeEvidenceEntity::getGenerationId, active.getId())
+                        .in(KnowledgeEvidenceEntity::getSourceRevisionId, revisionIds));
+        if (evidence.isEmpty()) {
+            return new RetrievalScope(workspaceId, active.getId(), active.getPhysicalIndex(), List.of(), true);
+        }
+
+        // 同一 Revision 可能保留一组旧 Evidence；只有最新 Job 仍为 READY 时才是当前可检索版本。
+        List<KnowledgeIngestionJobEntity> jobs = jobMapper.selectList(
+                Wrappers.<KnowledgeIngestionJobEntity>lambdaQuery()
+                        .in(KnowledgeIngestionJobEntity::getSourceRevisionId, revisionIds));
+        Map<UUID, KnowledgeIngestionJobEntity> latestJobs = new HashMap<>();
+        for (KnowledgeIngestionJobEntity job : jobs) {
+            KnowledgeIngestionJobEntity current = latestJobs.get(job.getSourceRevisionId());
+            if (current == null || job.getAttemptNumber() > current.getAttemptNumber()) {
+                latestJobs.put(job.getSourceRevisionId(), job);
+            }
+        }
+        List<UUID> readyRevisionIds = evidence.stream()
+                .map(KnowledgeEvidenceEntity::getSourceRevisionId)
+                .distinct()
+                .filter(revisionId -> {
+                    KnowledgeIngestionJobEntity job = latestJobs.get(revisionId);
+                    return job != null && IngestionJobState.READY.name().equals(job.getState());
+                })
+                .sorted(Comparator.comparing(UUID::toString))
+                .toList();
+        int safeLimit = Math.max(1, maxRevisionCount);
+        return new RetrievalScope(
+                workspaceId,
+                active.getId(),
+                active.getPhysicalIndex(),
+                readyRevisionIds,
+                readyRevisionIds.size() <= safeLimit);
+    }
+
+    @Override
+    public Map<UUID, ReadyEvidence> findReadyEvidence(RetrievalScope scope, Collection<UUID> evidenceIds) {
+        if (scope == null || evidenceIds == null || evidenceIds.isEmpty() || !scope.hasReadyRevision()) {
+            return Map.of();
+        }
+        List<UUID> requested = evidenceIds.stream().filter(java.util.Objects::nonNull).distinct().toList();
+        if (requested.isEmpty()) {
+            return Map.of();
+        }
+        List<KnowledgeEvidenceEntity> rows = evidenceMapper.selectList(
+                Wrappers.<KnowledgeEvidenceEntity>lambdaQuery()
+                        .eq(KnowledgeEvidenceEntity::getGenerationId, scope.generationId())
+                        .in(KnowledgeEvidenceEntity::getId, requested)
+                        .in(KnowledgeEvidenceEntity::getSourceRevisionId, scope.readyRevisionIds()));
+        if (rows.isEmpty()) {
+            return Map.of();
+        }
+        List<UUID> revisionIds = rows.stream().map(KnowledgeEvidenceEntity::getSourceRevisionId).distinct().toList();
+        List<KnowledgeRevisionEntity> revisions = revisionMapper.selectList(
+                Wrappers.<KnowledgeRevisionEntity>lambdaQuery().in(KnowledgeRevisionEntity::getId, revisionIds));
+        Map<UUID, KnowledgeRevisionEntity> revisionById = revisions.stream()
+                .collect(java.util.stream.Collectors.toMap(KnowledgeRevisionEntity::getId, value -> value));
+        List<UUID> sourceIds = revisions.stream().map(KnowledgeRevisionEntity::getSourceId).distinct().toList();
+        List<KnowledgeSourceEntity> sources = sourceMapper.selectList(
+                Wrappers.<KnowledgeSourceEntity>lambdaQuery()
+                        .eq(KnowledgeSourceEntity::getWorkspaceId, scope.workspaceId())
+                        .in(KnowledgeSourceEntity::getId, sourceIds));
+        Map<UUID, KnowledgeSourceEntity> sourceById = sources.stream()
+                .collect(java.util.stream.Collectors.toMap(KnowledgeSourceEntity::getId, value -> value));
+
+        Map<UUID, ReadyEvidence> result = new LinkedHashMap<>();
+        for (KnowledgeEvidenceEntity row : rows) {
+            KnowledgeRevisionEntity revision = revisionById.get(row.getSourceRevisionId());
+            if (revision == null || !scope.readyRevisionIds().contains(revision.getId())) {
+                continue;
+            }
+            KnowledgeSourceEntity source = sourceById.get(revision.getSourceId());
+            if (source == null) {
+                continue;
+            }
+            result.put(row.getId(), new ReadyEvidence(
+                    row.getId(), source.getId(), revision.getId(), source.getName(), row.getLocation(),
+                    row.getContentSha256(), row.getOrdinal(), nullToZero(row.getCharCount())));
+        }
+        return result;
     }
 
     private void finishFailure(UUID jobId, IngestionJobState state, String errorCode, String message, boolean retryable) {

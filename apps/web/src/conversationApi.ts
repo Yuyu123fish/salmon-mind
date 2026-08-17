@@ -98,6 +98,27 @@ export type AssistantDeltaEvent = {
   delta: string
 }
 
+export type ToolStartedEvent = {
+  runId: string
+  toolCallId: string
+  toolName: string
+}
+
+export type ToolCompletedEvent = {
+  runId: string
+  toolCallId: string
+  toolName: string
+  durationMillis: number
+}
+
+export type ToolFailedEvent = {
+  runId: string
+  toolCallId: string
+  toolName: string
+  durationMillis: number
+  stableErrorCode: string
+}
+
 export type AssistantCompletedEvent = {
   conversationId: string
   assistantEntry: Entry
@@ -132,6 +153,9 @@ export type RunFailedEvent = {
 export type RunStreamListener = {
   onRunStarted(event: RunStartedEvent): void
   onCompactionCompleted(event: CompactionCompletedEvent): void
+  onToolStarted(event: ToolStartedEvent): void
+  onToolCompleted(event: ToolCompletedEvent): void
+  onToolFailed(event: ToolFailedEvent): void
   onAssistantDelta(event: AssistantDeltaEvent): void
   onAssistantCompleted(event: AssistantCompletedEvent): void
   onTitleUpdated(event: TitleUpdatedEvent): void
@@ -232,6 +256,15 @@ async function streamRun(
         break
       case 'compaction_completed':
         listener.onCompactionCompleted(parsed as CompactionCompletedEvent)
+        break
+      case 'tool_started':
+        listener.onToolStarted(parsed as ToolStartedEvent)
+        break
+      case 'tool_completed':
+        listener.onToolCompleted(parsed as ToolCompletedEvent)
+        break
+      case 'tool_failed':
+        listener.onToolFailed(parsed as ToolFailedEvent)
         break
       case 'assistant_delta':
         listener.onAssistantDelta(parsed as AssistantDeltaEvent)

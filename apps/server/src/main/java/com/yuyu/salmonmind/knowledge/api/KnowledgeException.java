@@ -18,7 +18,8 @@ public class KnowledgeException extends RuntimeException {
         EMBEDDING_MODEL_NOT_CONFIGURED,
         EMBEDDING_FAILED,
         KNOWLEDGE_INDEX_UNAVAILABLE,
-        KNOWLEDGE_JOB_NOT_FOUND
+        KNOWLEDGE_JOB_NOT_FOUND,
+        INVALID_SEARCH_QUERY
     }
 
     private final Code code;

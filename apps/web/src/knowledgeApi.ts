@@ -60,6 +60,43 @@ export type EvidencePage = {
   total: number
 }
 
+export type SearchStatus = 'SUCCESS' | 'DEGRADED' | 'EMPTY' | 'UNAVAILABLE'
+export type SearchReason =
+  | 'NO_READY_DOCUMENTS'
+  | 'COMPLETE'
+  | 'NO_MATCH'
+  | 'VECTOR_UNAVAILABLE'
+  | 'RERANK_UNAVAILABLE'
+  | 'INDEX_UNAVAILABLE'
+  | 'READY_SCOPE_TOO_LARGE'
+
+export type SearchHit = {
+  evidenceId: string
+  sourceId: string
+  revisionId: string
+  documentName: string
+  location: string
+  text: string
+  rank: number | null
+  score: number | null
+}
+
+export type SearchStage = {
+  items: SearchHit[]
+}
+
+export type KnowledgeSearchResult = {
+  policyVersion: string
+  status: SearchStatus
+  reason: SearchReason
+  bm25: SearchStage
+  vector: SearchStage
+  rrf: SearchStage
+  finalResults: SearchStage
+  executedStages: string[]
+  skippedStages: string[]
+}
+
 export class KnowledgeApiError extends Error {
   readonly code: string
   readonly status: number
@@ -114,4 +151,12 @@ export async function fetchEvidence(id: string, page = 0, size = 20): Promise<Ev
 
 export async function retryDocument(id: string): Promise<DocumentSummary> {
   return request(`/api/knowledge/documents/${encodeURIComponent(id)}/retry`, { method: 'POST' })
+}
+
+export async function searchKnowledge(query: string): Promise<KnowledgeSearchResult> {
+  return request('/api/knowledge/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query }),
+  })
 }

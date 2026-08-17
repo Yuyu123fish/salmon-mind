@@ -1,6 +1,7 @@
 @ApplicationModule(allowedDependencies = {
         "workspace :: api",
         "model :: embedding",
+        "model :: rerank",
         "persistence :: mybatis",
         "persistence :: redis"
 })

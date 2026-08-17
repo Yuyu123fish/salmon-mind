@@ -58,8 +58,8 @@ import org.testcontainers.junit.jupiter.Testcontainers;
  *       不携带上一轮工具消息；REUSE_IF_MATCH 默认路径不受影响。</li>
  * </ol>
  *
- * <p>不调用真实模型、不绕过 ReactAgent/ToolNode，不注册任何生产业务工具。
- * 工具与结果上限只经包内构造 seam 注入，生产 Spring Bean 没有任何 ToolCallback。
+ * <p>不调用真实模型、不绕过 ReactAgent/ToolNode；本测试的工具只经包内构造 seam
+ * 注入，不代表生产 Spring Bean 的本地 Knowledge Tool。
  */
 @Testcontainers
 class AgentToolRuntimeIntegrationTest {

@@ -50,8 +50,8 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 /**
  * Conversation + 真实 ReactAgent/RedisSaver 的跨模块恢复测试：通过 conversation 公开 seam
  * （{@link ConversationService}）走生产 Agent 链路，只把 ChatModel 替换为确定性实现。
- * 验证两轮 Checkpoint 复用、删除 Checkpoint 后从 JSONL 重建、错误叶子标记后重建
- * 与 Conversation 隔离；不调用外部模型。
+ * 验证生产本地工具启用后每轮从 JSONL 重建、删除 Checkpoint 后仍可重建、错误叶子标记后
+ * 重建与 Conversation 隔离；不调用外部模型。
  */
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.NONE,
@@ -120,7 +120,7 @@ class ConversationRedisRecoveryIntegrationTest {
     }
 
     @Test
-    void reusesCheckpointAcrossTwoRoundsAndAdvancesMarker() {
+    void rebuildsEveryRoundWhenProductionToolIsEnabled() {
         ConversationSummary conversation = service.create();
 
         // 第一轮：无 Checkpoint 标记，模型只看到首条用户消息
@@ -132,14 +132,14 @@ class ConversationRedisRecoveryIntegrationTest {
 
         String threadIdAfterFirstRound = activeThreadId(conversation);
 
-        // 第二轮：标记与期望叶子一致，复用 Checkpoint，只发送最新用户消息
+        // 第二轮：即使叶子标记匹配，生产 Tool 也要求从 JSONL 投影重建，避免携带旧工具消息
         Run second = send(conversation.id(), "再讲一遍");
         assertThat(second.status()).isEqualTo(Run.RunStatus.SUCCEEDED);
-        // 复用路径下模型仍看到完整上下文：Checkpoint 恢复了第一轮历史
+        // 重建路径下模型仍看到完整上下文：显式 JSONL 投影保留了第一轮历史
         assertThat(visible(mainCalls().get(1))).containsExactly(
                 user("你好"), assistant("pong"), user("再讲一遍"));
-        // 复用路径不释放 Checkpoint：RedisSaver 内部 thread 身份保持不变
-        assertThat(activeThreadId(conversation)).isEqualTo(threadIdAfterFirstRound);
+        // 生产工具每轮释放并重建 Checkpoint，内部 thread 身份必须变化
+        assertThat(activeThreadId(conversation)).isNotEqualTo(threadIdAfterFirstRound);
         assertThat(markerOf(conversation)).isNotBlank();
     }
 
@@ -196,13 +196,13 @@ class ConversationRedisRecoveryIntegrationTest {
         // thread 身份按 Conversation 隔离
         assertThat(activeThreadId(first)).isNotEqualTo(activeThreadId(second));
 
-        // 删除 A 的 Checkpoint 不影响 B：B 下一次仍复用
+        // 删除 A 的 Checkpoint 不影响 B：B 仍从自己的 JSONL 投影重建
         deleteMarker(first);
         String secondThreadBefore = activeThreadId(second);
         send(second.id(), "B 再问");
         assertThat(visible(mainCalls().get(2))).containsExactly(
                 user("B 的问题"), assistant("pong"), user("B 再问"));
-        assertThat(activeThreadId(second)).isEqualTo(secondThreadBefore);
+        assertThat(activeThreadId(second)).isNotEqualTo(secondThreadBefore);
     }
 
     // 过滤掉标题/摘要等轻量调用，只保留主回答调用（它们都经过同一确定性 ChatModel）

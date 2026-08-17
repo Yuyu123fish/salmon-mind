@@ -1,6 +1,9 @@
 package com.yuyu.salmonmind.knowledge.infrastructure.elasticsearch;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch._types.FieldValue;
+import co.elastic.clients.elasticsearch._types.KnnQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.Query;
 import co.elastic.clients.elasticsearch._types.Refresh;
 import co.elastic.clients.elasticsearch._types.SortOrder;
 import co.elastic.clients.elasticsearch.core.SearchResponse;
@@ -23,7 +26,10 @@ import org.springframework.util.StringUtils;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Base64;
+import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -42,6 +48,8 @@ class ElasticsearchEvidenceStore implements EvidenceIndexPort {
     private final String indexPrefix;
     private final int shards;
     private final int replicas;
+    private final Duration connectTimeout;
+    private final Duration readTimeout;
     private final ObjectMapper objectMapper;
 
     private volatile RestClient restClient;
@@ -55,6 +63,8 @@ class ElasticsearchEvidenceStore implements EvidenceIndexPort {
             @Value("${salmon.knowledge.search.index-prefix:salmon-evidence}") String indexPrefix,
             @Value("${salmon.knowledge.search.shards:1}") int shards,
             @Value("${salmon.knowledge.search.replicas:0}") int replicas,
+            @Value("${salmon.knowledge.search.connect-timeout:5s}") Duration connectTimeout,
+            @Value("${salmon.knowledge.search.read-timeout:30s}") Duration readTimeout,
             ObjectMapper objectMapper
     ) {
         this.baseUrl = baseUrl;
@@ -63,6 +73,8 @@ class ElasticsearchEvidenceStore implements EvidenceIndexPort {
         this.indexPrefix = indexPrefix;
         this.shards = shards;
         this.replicas = replicas;
+        this.connectTimeout = connectTimeout;
+        this.readTimeout = readTimeout;
         this.objectMapper = objectMapper;
     }
 
@@ -148,6 +160,62 @@ class ElasticsearchEvidenceStore implements EvidenceIndexPort {
         }
     }
 
+    @Override
+    public List<RankedEvidence> searchText(
+            String indexName, String queryText, Collection<UUID> revisionIds, int limit
+    ) {
+        try {
+            SearchResponse<Map> response = client().search(request -> request
+                            .index(indexName)
+                            .size(Math.max(1, Math.min(limit, 40)))
+                            .source(source -> source.filter(filter -> filter.includes(
+                                    "sourceId", "revisionId", "ordinal", "location", "text", "contentSha256")))
+                            .query(query -> query.bool(bool -> bool
+                                    .must(must -> must.match(match -> match.field("text").query(queryText)))
+                                    .filter(revisionFilter(revisionIds))))
+                            .sort(sort -> sort.field(field -> field.field("_score").order(SortOrder.Desc))),
+                    Map.class);
+            return rankedHits(response);
+        } catch (Exception ex) {
+            throw new KnowledgeException(KnowledgeException.Code.KNOWLEDGE_INDEX_UNAVAILABLE,
+                    "BM25 检索失败", ex);
+        }
+    }
+
+    @Override
+    public List<RankedEvidence> searchVector(
+            String indexName,
+            List<Float> queryVector,
+            Collection<UUID> revisionIds,
+            int limit,
+            int numCandidates
+    ) {
+        if (queryVector == null || queryVector.size() != EmbeddingService.DIMENSIONS) {
+            throw new KnowledgeException(KnowledgeException.Code.KNOWLEDGE_INDEX_UNAVAILABLE,
+                    "查询 Embedding 维数与索引不一致");
+        }
+        try {
+            int boundedLimit = Math.max(1, Math.min(limit, 40));
+            SearchResponse<Map> response = client().search(request -> request
+                            .index(indexName)
+                            .size(boundedLimit)
+                            .source(source -> source.filter(filter -> filter.includes(
+                                    "sourceId", "revisionId", "ordinal", "location", "text", "contentSha256")))
+                            // Elasticsearch 8.13 的 knn filter 位于 approximate kNN 内部，
+                            // 不能退化为查询后过滤，否则残留 Evidence 会挤占候选名额。
+                            .knn(knn -> knn.field("vector")
+                                    .queryVector(queryVector)
+                                    .k(boundedLimit)
+                                    .numCandidates(Math.max(boundedLimit, Math.min(numCandidates, 10_000)))
+                                    .filter(revisionFilter(revisionIds))),
+                    Map.class);
+            return rankedHits(response);
+        } catch (Exception ex) {
+            throw new KnowledgeException(KnowledgeException.Code.KNOWLEDGE_INDEX_UNAVAILABLE,
+                    "向量检索失败", ex);
+        }
+    }
+
     @PreDestroy
     void close() {
         try {
@@ -171,13 +239,31 @@ class ElasticsearchEvidenceStore implements EvidenceIndexPort {
                     (username + ":" + password).getBytes(StandardCharsets.UTF_8));
             restClient = RestClient.builder(host)
                     .setDefaultHeaders(new BasicHeader[]{new BasicHeader("Authorization", "Basic " + token)})
+                    .setRequestConfigCallback(this::requestConfig)
                     .build();
         } else {
-            restClient = RestClient.builder(host).build();
+            restClient = RestClient.builder(host)
+                    .setRequestConfigCallback(this::requestConfig)
+                    .build();
         }
         transport = new RestClientTransport(restClient, new JacksonJsonpMapper(objectMapper));
         client = new ElasticsearchClient(transport);
         return client;
+    }
+
+    /** 为检索与索引写入设置有限的连接、连接池等待和读取超时。 */
+    private org.apache.http.client.config.RequestConfig.Builder requestConfig(
+            org.apache.http.client.config.RequestConfig.Builder builder
+    ) {
+        int connectMillis = timeoutMillis(connectTimeout);
+        return builder
+                .setConnectTimeout(connectMillis)
+                .setConnectionRequestTimeout(connectMillis)
+                .setSocketTimeout(timeoutMillis(readTimeout));
+    }
+
+    private static int timeoutMillis(Duration timeout) {
+        return Math.toIntExact(timeout.toMillis());
     }
 
     @SuppressWarnings("unchecked")
@@ -193,5 +279,42 @@ class ElasticsearchEvidenceStore implements EvidenceIndexPort {
         List<Float> vector = ((List<?>) source.getOrDefault("vector", List.of())).stream()
                 .map(value -> ((Number) value).floatValue()).toList();
         return new IndexedEvidence(id, revisionId, sourceId, ordinal, location, text, vector, sha);
+    }
+
+    private static Query revisionFilter(Collection<UUID> revisionIds) {
+        if (revisionIds == null || revisionIds.isEmpty()) {
+            throw new IllegalArgumentException("READY Revision 过滤范围不能为空");
+        }
+        List<FieldValue> values = revisionIds.stream()
+                .map(revisionId -> FieldValue.of(revisionId.toString()))
+                .toList();
+        return Query.of(query -> query.terms(terms -> terms.field("revisionId")
+                .terms(value -> value.value(values))));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<RankedEvidence> rankedHits(SearchResponse<Map> response) {
+        // ES 返回顺序通常已经按 _score 排列；这里再做一次稳定排序，避免同分候选
+        // 因分片返回顺序变化而让诊断结果漂移。_id 不写入 mapping，故在应用层 tie-break。
+        List<Hit<Map>> hits = response.hits().hits().stream()
+                .sorted(Comparator.comparing(Hit<Map>::score, Comparator.nullsFirst(Comparator.reverseOrder()))
+                        .thenComparing(Hit::id))
+                .toList();
+        List<RankedEvidence> result = new java.util.ArrayList<>(hits.size());
+        for (int i = 0; i < hits.size(); i++) {
+            Hit<Map> hit = hits.get(i);
+            Map<String, Object> source = hit.source() == null ? Map.of() : hit.source();
+            result.add(new RankedEvidence(
+                    UUID.fromString(hit.id()),
+                    UUID.fromString(String.valueOf(source.get("revisionId"))),
+                    UUID.fromString(String.valueOf(source.get("sourceId"))),
+                    ((Number) source.get("ordinal")).intValue(),
+                    String.valueOf(source.get("location")),
+                    String.valueOf(source.get("text")),
+                    String.valueOf(source.get("contentSha256")),
+                    i + 1,
+                    hit.score() == null ? 0.0d : hit.score()));
+        }
+        return result;
     }
 }

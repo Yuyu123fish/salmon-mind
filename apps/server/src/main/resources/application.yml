@@ -58,12 +58,18 @@ salmon:
       api-key: ${MODEL_EMBEDDING_API_KEY:}
       # Stage 02 固定模型与维数；未配置 base-url/key 时仍只在 Worker 使用时失败
       model-name: ${MODEL_EMBEDDING_NAME:Qwen/Qwen3-Embedding-4B}
+    rerank:
+      base-url: ${MODEL_RERANK_BASE_URL:}
+      api-key: ${MODEL_RERANK_API_KEY:}
+      model-name: ${MODEL_RERANK_NAME:Qwen/Qwen3-Reranker-4B}
+      instruction: ${MODEL_RERANK_INSTRUCTION:rerank-v1}
   agent:
     max-steps: ${AGENT_MAX_STEPS:32}
     max-tool-result-chars: ${AGENT_MAX_TOOL_RESULT_CHARS:200000}
     max-prompt-chars: ${AGENT_MAX_PROMPT_CHARS:262144}
     max-model-response-chars: ${AGENT_MAX_MODEL_RESPONSE_CHARS:65536}
     max-tools: ${AGENT_MAX_TOOLS:64}
+    max-tool-calls-per-run: ${AGENT_MAX_TOOL_CALLS_PER_RUN:4}
   redis:
     # ReactAgent Checkpoint 的短期状态存储；未配置时应用仍可启动，进入对话调用才报错
     url: ${REDIS_URL:redis://127.0.0.1:6379}
@@ -110,3 +116,7 @@ salmon:
       index-prefix: ${KNOWLEDGE_INDEX_PREFIX:salmon-evidence}
       shards: ${KNOWLEDGE_INDEX_SHARDS:1}
       replicas: ${KNOWLEDGE_INDEX_REPLICAS:0}
+      connect-timeout: ${KNOWLEDGE_SEARCH_CONNECT_TIMEOUT:5s}
+      read-timeout: ${KNOWLEDGE_SEARCH_READ_TIMEOUT:30s}
+      max-revision-filter: ${KNOWLEDGE_MAX_REVISION_FILTER:512}
+      vector-num-candidates: ${KNOWLEDGE_VECTOR_NUM_CANDIDATES:200}

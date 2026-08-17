@@ -9,6 +9,8 @@ import com.yuyu.salmonmind.agent.api.AgentToolCompleted;
 import com.yuyu.salmonmind.agent.api.AgentToolFailed;
 import com.yuyu.salmonmind.agent.api.AgentToolStarted;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 /**
  * 平台拥有的工具生命周期拦截器：把 Spring AI Alibaba 的 ToolInterceptor 钩子映射为
  * {@code agent::api} 的 started/completed/failed 平台事件，并在此处完成两个 Gate 控制点：
@@ -22,8 +24,7 @@ import com.yuyu.salmonmind.agent.api.AgentToolStarted;
  *
  * <p>拦截器通过 {@link #LISTENER_METADATA_KEY} 从 RunnableConfig metadata 中取出
  * 当前流的 {@link AgentStreamListener}：config 由 Adapter 在每次 stream 时构建并
- * 随图执行流转，因此同一 Agent 上的并发流互不干扰。没有挂载 listener 时为空操作，
- * 生产 Bean 未注册任何 ToolCallback 时该拦截器同样成立。
+ * 随图执行流转，因此同一 Agent 上的并发流互不干扰。没有挂载 listener 时为空操作。
  *
  * <p>异常采用与框架 ToolErrorInterceptor 相同的处理模式：捕获后转为错误
  * ToolCallResponse 送回 Agent 循环，而不是抛出——保证工具失败只产生一次 failed 观察，
@@ -40,10 +41,16 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
     /** 工具参数安全摘要的最大字符数：只用于状态展示，不承载完整参数。 */
     private static final int SUMMARY_MAX_CHARS = 100;
 
+    /** 每次 Agent stream 独立的工具预算 metadata 键。 */
+    static final String INVOCATION_BUDGET_METADATA_KEY = "salmon:agent:tool-budget";
+    static final String TOOL_BUDGET_EXCEEDED = "TOOL_BUDGET_EXCEEDED";
+    private static final String TOOL_BUDGET_RESULT =
+            "{\"status\":\"UNAVAILABLE\",\"reason\":\"TOOL_BUDGET_EXCEEDED\",\"evidences\":[]}";
+
     private final int maxToolResultChars;
 
     ToolLifecycleInterceptor(int maxToolResultChars) {
-        this.maxToolResultChars = maxToolResultChars;
+        this.maxToolResultChars = Math.max(0, maxToolResultChars);
     }
 
     @Override
@@ -59,11 +66,21 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             listener.onToolStarted(new AgentToolStarted(
                     request.getToolCallId(), request.getToolName(), safeSummary(request.getArguments())));
         }
+        InvocationBudget budget = budgetOf(request);
+        if (budget != null && !budget.tryAcquire()) {
+            if (listener != null) {
+                listener.onToolFailed(new AgentToolFailed(
+                        request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
+                        TOOL_BUDGET_EXCEEDED, "已达到本轮工具调用上限"));
+            }
+            // 预算耗尽仍返回可被模型理解的结构化结果；不抛异常，避免工具失败制造 Run 双终态。
+            return ToolCallResponse.error(request.getToolCallId(), request.getToolName(), TOOL_BUDGET_RESULT);
+        }
         try {
             ToolCallResponse response = boundResultSize(handler.call(request));
             long durationMillis = elapsedMillis(startedNanos);
             if (listener != null) {
-                if (response.isError()) {
+                if (response.isError() || isStructuredUnavailable(response.getResult())) {
                     listener.onToolFailed(new AgentToolFailed(
                             response.getToolCallId(), response.getToolName(), durationMillis,
                             stableErrorCode(response), safeSummary(response.getResult())));
@@ -93,6 +110,15 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                 .orElse(null);
     }
 
+    /** 从当前执行上下文取得本次 stream 的有界计数器；没有 metadata 时保持测试兼容。 */
+    private static InvocationBudget budgetOf(ToolCallRequest request) {
+        return request.getExecutionContext()
+                .flatMap(context -> context.config().metadata(INVOCATION_BUDGET_METADATA_KEY))
+                .filter(InvocationBudget.class::isInstance)
+                .map(InvocationBudget.class::cast)
+                .orElse(null);
+    }
+
     /** 工具结果进入模型上下文前的有界控制点：超出上限按字符截断，不携带完整原始结果。 */
     private ToolCallResponse boundResultSize(ToolCallResponse response) {
         String result = response.getResult();
@@ -117,10 +143,18 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
      * 映射为平台稳定错误码，避免把内部 status 直接暴露为业务错误码。
      */
     private static String stableErrorCode(ToolCallResponse response) {
+        if (isStructuredUnavailable(response.getResult())) {
+            return "RETRIEVAL_UNAVAILABLE";
+        }
         String status = response.getStatus();
         return status == null || status.isBlank() || "error".equalsIgnoreCase(status)
                 ? ERROR_CODE_TOOL_EXECUTION_FAILED
                 : status;
+    }
+
+    /** 本地 Knowledge Tool 以结构化内容返回可理解失败，不能被误报成成功工具调用。 */
+    private static boolean isStructuredUnavailable(String result) {
+        return result != null && result.stripLeading().startsWith("{\"status\":\"UNAVAILABLE\"");
     }
 
     /** 安全摘要：去掉控制字符后按固定长度截断，避免原始参数/结果泄露到事件中。 */
@@ -134,5 +168,27 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
 
     private static long elapsedMillis(long startedNanos) {
         return (System.nanoTime() - startedNanos) / 1_000_000L;
+    }
+
+    /** 一个主 Agent Run 的工具调用计数，不跨轮次、不写入 JSONL。 */
+    static final class InvocationBudget {
+        private final int maximum;
+        private final AtomicInteger used = new AtomicInteger();
+
+        InvocationBudget(int maximum) {
+            this.maximum = Math.max(0, maximum);
+        }
+
+        boolean tryAcquire() {
+            while (true) {
+                int current = used.get();
+                if (current >= maximum) {
+                    return false;
+                }
+                if (used.compareAndSet(current, current + 1)) {
+                    return true;
+                }
+            }
+        }
     }
 }

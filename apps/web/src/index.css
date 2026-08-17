@@ -269,6 +269,20 @@ button {
   padding: 2px 10px;
 }
 
+.tool-badge {
+  flex-shrink: 0;
+  color: #99503f;
+  border: 1px solid rgba(196, 92, 74, 0.45);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 0.78rem;
+}
+
+.tool-badge.unavailable {
+  color: var(--bad);
+  border-color: rgba(143, 58, 50, 0.4);
+}
+
 .compaction-jump {
   flex-shrink: 0;
   color: var(--muted);
@@ -661,6 +675,117 @@ button {
 .knowledge-stats span {
   color: var(--muted);
   font-size: 0.8rem;
+}
+
+.retrieval-diagnostics {
+  margin: 0 0 28px;
+  border: 1px solid var(--line);
+  padding: 20px 22px;
+  background: rgba(255, 255, 255, 0.42);
+}
+
+.retrieval-form {
+  display: flex;
+  gap: 9px;
+  margin: 14px 0;
+}
+
+.retrieval-form input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 8px 10px;
+  color: var(--ink);
+  background: #fff;
+  font: inherit;
+}
+
+.retrieval-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: baseline;
+  border-left: 3px solid var(--river);
+  padding: 8px 12px;
+  color: var(--river);
+  background: rgba(47, 79, 72, 0.06);
+  font-size: 0.82rem;
+}
+
+.retrieval-status.degraded {
+  border-color: var(--salmon);
+  color: #99503f;
+  background: rgba(196, 92, 74, 0.07);
+}
+
+.retrieval-status.empty,
+.retrieval-status.unavailable {
+  border-color: var(--bad);
+  color: var(--bad);
+  background: rgba(143, 58, 50, 0.06);
+}
+
+.retrieval-status small {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.retrieval-stages {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.retrieval-stage {
+  min-width: 0;
+  border-top: 2px solid var(--line);
+  padding-top: 9px;
+}
+
+.retrieval-stage ol {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.retrieval-stage li {
+  border: 1px solid var(--line);
+  padding: 8px 9px;
+  background: rgba(238, 243, 241, 0.48);
+}
+
+.retrieval-stage li div {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.retrieval-stage li strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.76rem;
+}
+
+.retrieval-stage li small {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+}
+
+.retrieval-stage li p {
+  margin: 6px 0 0;
+  max-height: 5.2em;
+  overflow: hidden;
+  font-size: 0.76rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
 }
 
 .knowledge-grid {
@@ -1156,6 +1281,10 @@ button:focus-visible {
 
   .knowledge-grid {
     grid-template-columns: 1fr;
+  }
+
+  .retrieval-stages {
+    grid-template-columns: 1fr 1fr;
   }
 
   .document-detail {

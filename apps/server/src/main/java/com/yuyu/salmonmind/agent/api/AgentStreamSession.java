@@ -11,4 +11,12 @@ package com.yuyu.salmonmind.agent.api;
 public interface AgentStreamSession {
 
     void stream(AgentRequest request, AgentStreamListener listener);
+
+    /**
+     * 生产 Agent 若注册了会产生 Run-local tool message 的工具，则每轮主调用都必须从
+     * JSONL 投影重建 Checkpoint；测试替身默认不改变既有叶子匹配复用语义。
+     */
+    default boolean requiresProjectionRebuild() {
+        return false;
+    }
 }

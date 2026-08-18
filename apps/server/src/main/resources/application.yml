@@ -5,6 +5,11 @@ server:
 spring:
   application:
     name: salmon-mind-server
+  threads:
+    virtual:
+      enabled: ${SPRING_THREADS_VIRTUAL_ENABLED:true}
+  main:
+    keep-alive: ${SPRING_MAIN_KEEP_ALIVE:true}
   # 未显式指定 profile 时默认 dev：本地开发加载 config/application-dev.yml（不入库）。
   # 生产/容器部署用环境变量注入敏感配置，或在启动命令显式指定 profile。
   profiles:
@@ -117,6 +122,12 @@ salmon:
   conversation:
     # 权威会话历史目录，Server 容器必须显式挂载；不与 infra/data/ 混用
     data-dir: ${CONVERSATION_DATA_DIR:data}
+    cache:
+      # Redis 只保存可丢弃的完整快照；关闭后完全回退 JSONL，不触碰 Redis
+      enabled: ${CONVERSATION_CACHE_ENABLED:true}
+      ttl: ${CONVERSATION_CACHE_TTL:10m}
+      max-entry-bytes: ${CONVERSATION_CACHE_MAX_ENTRY_BYTES:4194304}
+      key-prefix: ${CONVERSATION_CACHE_KEY_PREFIX:salmon:conversation:snapshot:v1:}
   knowledge:
     chunk-max-chars: ${KNOWLEDGE_CHUNK_MAX_CHARS:1200}
     embedding-batch-size: ${KNOWLEDGE_EMBEDDING_BATCH_SIZE:32}

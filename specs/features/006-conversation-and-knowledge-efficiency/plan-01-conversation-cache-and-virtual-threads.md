@@ -1,6 +1,6 @@
 # Feature 006 Stage 01 Plan：Conversation Cache 与虚拟线程
 
-Status: Draft
+Status: Implementing
 
 对应规格：[spec.md](./spec.md)
 

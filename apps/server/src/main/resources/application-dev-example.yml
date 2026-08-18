@@ -2,6 +2,12 @@
 # application-dev.yml 已被 .gitignore 忽略，不会入库；本模板文件随仓库维护。
 # 运行 `mvn spring-boot:run` 时默认激活 dev profile，自动加载本文件。
 spring:
+  threads:
+    # Java 21 虚拟线程默认开启；修改后需重启 Server，关闭可回退平台线程
+    virtual:
+      enabled: true
+  main:
+    keep-alive: true
   datasource:
     username: salmon_mind
     password: salmon_mind_local
@@ -51,6 +57,13 @@ salmon:
   redis:
     # 本地 Redis 无密码时留空
     password:
+  conversation:
+    cache:
+      # 可选：Redis 快照缓存默认开启；Redis 不可用时自动回退 JSONL
+      enabled: true
+      ttl: 10m
+      max-entry-bytes: 4194304
+      key-prefix: salmon:conversation:snapshot:v1:
   knowledge:
     content-store:
       # 宿主机运行后端时，访问 Compose 映射到本机的 RustFS API 端口

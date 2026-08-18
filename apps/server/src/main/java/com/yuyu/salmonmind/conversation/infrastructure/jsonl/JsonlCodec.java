@@ -43,12 +43,16 @@ class JsonlCodec {
     private final ObjectMapper mapper = new ObjectMapper();
 
     String encodeHeader(ConversationHistory.Header header) {
+        return writeString(encodeHeaderNode(header));
+    }
+
+    ObjectNode encodeHeaderNode(ConversationHistory.Header header) {
         ObjectNode node = mapper.createObjectNode();
         node.put("type", "conversation");
         node.put("formatVersion", header.formatVersion());
         node.put("conversationId", header.conversationId().toString());
         node.put("createdAt", header.createdAt().toString());
-        return writeString(node);
+        return node;
     }
 
     ConversationHistory.Header decodeHeader(String line) {
@@ -59,6 +63,10 @@ class JsonlCodec {
             // Header 行截断说明文件无效，不是可修复的末行写入中断
             throw corrupted("Header 行 JSON 截断");
         }
+        return decodeHeaderNode(node);
+    }
+
+    ConversationHistory.Header decodeHeaderNode(JsonNode node) {
         if (!"conversation".equals(text(node, "type")) || !node.has("formatVersion")) {
             throw corrupted("Header 行缺少 conversation type 或 formatVersion");
         }
@@ -79,7 +87,7 @@ class JsonlCodec {
         return decodeEntryNode(parseWhole(line));
     }
 
-    private ObjectNode encodeEntryNode(Entry entry) {
+    ObjectNode encodeEntryNode(Entry entry) {
         ObjectNode node = mapper.createObjectNode();
         node.put("formatVersion", entry.formatVersion());
         node.put("conversationId", entry.conversationId().toString());
@@ -183,7 +191,7 @@ class JsonlCodec {
         return node;
     }
 
-    private Entry decodeEntryNode(JsonNode node) {
+    Entry decodeEntryNode(JsonNode node) {
         if (!node.has("formatVersion") || !node.has("conversationId") || !node.has("id")
                 || !node.has("seq") || !node.has("type") || !node.has("createdAt") || !node.has("payload")) {
             throw corrupted("Entry 缺少固定公共字段");

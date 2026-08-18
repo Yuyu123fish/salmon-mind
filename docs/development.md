@@ -39,6 +39,12 @@ mvn -f apps/server/pom.xml spring-boot:run
 - Agent 上下文边界可通过 `salmon.agent.max-tool-result-tokens-per-run`（环境变量 `AGENT_MAX_TOOL_RESULT_TOKENS_PER_RUN`，默认 32768）和 `salmon.agent.max-steps`（环境变量 `AGENT_MAX_STEPS`，默认 32）调整；两项均可选，修改后需重启后端，前者不能超过主输入触发阈值。
 - 非敏感配置以 [application.yml](../apps/server/src/main/resources/application.yml) 为准；敏感配置以 [application-dev-example.yml](../apps/server/src/main/resources/application-dev-example.yml) 为模板。
 
+### Conversation Cache 与虚拟线程
+
+- `SPRING_THREADS_VIRTUAL_ENABLED` 控制 Spring 管理的 Java 21 虚拟线程，默认 `true`；`SPRING_MAIN_KEEP_ALIVE` 默认 `true`，用于避免仅剩 daemon 虚拟线程时 JVM 提前退出。两项修改后都需要重启 Server，关闭前者可回退平台线程。
+- `CONVERSATION_CACHE_ENABLED` 控制 Conversation 完整历史快照缓存，默认 `true`；`CONVERSATION_CACHE_TTL` 默认 `10m`（上限 7 天）；`CONVERSATION_CACHE_MAX_ENTRY_BYTES` 默认 `4194304`（上限 64 MiB）；`CONVERSATION_CACHE_KEY_PREFIX` 默认 `salmon:conversation:snapshot:v1:`，必须使用独立、以冒号结尾的 keyspace。
+- 缓存收益需要已有 `REDIS_URL` / `REDIS_PASSWORD`；Redis 未配置、不可用、缓存损坏或快照超限时会透明回退 JSONL，不阻止应用启动。缓存与虚拟线程配置均需要重启生效；关闭 `CONVERSATION_CACHE_ENABLED` 是 JSONL-only 回退点。
+
 ## 开发者补充配置
 
 当一次实施需要开发者补充 API Key、Endpoint、账号、端口或外部服务时，配置交付必须形成闭环：

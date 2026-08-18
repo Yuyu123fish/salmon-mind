@@ -115,6 +115,14 @@ class ConversationApplicationService implements ConversationService {
         });
     }
 
+    @Override
+    public void continueGeneration(UUID conversationId, UUID assistantEntryId, RunStreamListener listener) {
+        executionQueue.execute(conversationId, () -> {
+            runCoordinator.continueGeneration(conversationId, assistantEntryId, listener);
+            return null;
+        });
+    }
+
     private ConversationDetail doOpen(UUID conversationId) {
         UUID workspaceId = workspaceRegistry.current().id();
         Conversation entity = metadataRepository.findById(conversationId);

@@ -23,7 +23,7 @@ import java.util.Locale;
  * 一个固定网页 Provider 的只读 Tool Adapter。它只传递结构化自然结果，
  * 不把原始响应、请求 URL 或 API Key 交给模型。
  */
-final class WebSearchToolCallback implements ToolCallback {
+final class WebSearchToolCallback implements ParallelSafeToolCallback {
 
     static final String BOCHA_NAME = "search_web_bocha";
     static final String SEARCH_API_NAME = "search_web_searchapi";

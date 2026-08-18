@@ -111,6 +111,7 @@ function run(status: Run['status']): Run {
     errorCode: status === 'FAILED' ? 'CHAT_MODEL_FAILED' : null,
     startedAt: '2026-08-18T00:00:00Z',
     endedAt: status === 'RUNNING' ? null : '2026-08-18T00:00:02Z',
+    resultStatus: status === 'SUCCEEDED' ? 'COMPLETE' : null,
   }
 }
 

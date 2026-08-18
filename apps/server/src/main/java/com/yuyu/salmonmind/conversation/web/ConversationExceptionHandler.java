@@ -26,7 +26,8 @@ class ConversationExceptionHandler {
     ResponseEntity<ErrorBody> handleConversation(ConversationException ex) {
         HttpStatus status = switch (ex.code()) {
             case CONVERSATION_NOT_FOUND -> HttpStatus.NOT_FOUND;
-            case CONVERSATION_BUSY, CONVERSATION_AWAITING_RETRY, CONTEXT_LIMIT_REACHED -> HttpStatus.CONFLICT;
+            case CONVERSATION_BUSY, CONVERSATION_AWAITING_RETRY,
+                    CONTINUE_GENERATION_NOT_ALLOWED, CONTEXT_LIMIT_REACHED -> HttpStatus.CONFLICT;
             case COMPACTION_FAILED -> HttpStatus.UNPROCESSABLE_ENTITY;
             case CONVERSATION_HISTORY_CORRUPTED -> HttpStatus.INTERNAL_SERVER_ERROR;
         };

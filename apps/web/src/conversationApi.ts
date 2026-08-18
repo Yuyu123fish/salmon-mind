@@ -1,7 +1,9 @@
 // Conversation HTTP client：列表 / 创建 / 打开使用稳定 JSON 映射，
-// 发送与重试消费 POST SSE Run 流。错误体约定为 {"code": "STABLE_CODE", "message": "用户可理解信息"}。
+// 发送、重试与继续生成消费 POST SSE Run 流。错误体约定为
+// {"code": "STABLE_CODE", "message": "用户可理解信息"}。
 
 export type RunStatus = 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'INTERRUPTED'
+export type RunResultStatus = 'COMPLETE' | 'INCOMPLETE_LENGTH'
 
 export type Run = {
   id: string
@@ -11,6 +13,7 @@ export type Run = {
   errorCode: string | null
   startedAt: string
   endedAt: string | null
+  resultStatus?: RunResultStatus | null
 }
 
 export type ConversationSummary = {
@@ -117,12 +120,15 @@ export type RunTraceItem = ReasoningTraceItem | ToolTraceItem
 export type EntryPayload = {
   text?: string
   runId?: string
+  action?: 'MESSAGE' | 'CONTINUE_GENERATION'
   provider?: string
   model?: string
   usage?: TokenUsage | null
   citations?: CitationPayload[]
   retrievedSources?: RetrievedSourcePayload[]
   trace?: RunTraceItem[]
+  completionStatus?: 'COMPLETE' | 'INCOMPLETE_LENGTH'
+  completionDetailCode?: string | null
   // TITLE
   title?: string
   sourceRunId?: string
@@ -230,7 +236,7 @@ export type RunFailedEvent = {
 }
 
 /**
- * 一次发送 / 重试的 SSE 事件消费合同；与后端 RunStreamListener 顺序一致：
+ * 一次发送 / 重试 / 继续生成的 SSE 事件消费合同；与后端 RunStreamListener 顺序一致：
  * run_started → 可选 compaction_completed → 可交错的 reasoning/tool/assistant delta →
  * 成功时 assistant_completed → 可选 title_updated → 唯一 run_completed / run_failed。
  * 终态事件之后不再有业务事件；run_started 之前的前置错误以 ApiError 抛出（JSON 错误体）。
@@ -301,7 +307,7 @@ export async function fetchConversation(id: string): Promise<ConversationDetail>
 // ---- POST SSE：fetch + ReadableStream 解析标准 SSE 帧，不支持原生 EventSource ----
 
 /**
- * 消费一次 send / retry 的 SSE Run 流。
+ * 消费一次 send / retry / continue 的 SSE Run 流。
  * 事件按 {@link RunStreamListener} 顺序回调；run_started 之前的前置错误抛 ApiError。
  * 传输中断或流结束仍未收到终态事件时抛 ApiError，由调用方重新读取权威状态，不自动重发。
  */
@@ -404,6 +410,7 @@ type RunEventSequence = {
   conversationId: string | null
   runId: string | null
   assistantCompleted: boolean
+  assistantCompletionStatus: RunResultStatus | null
   titleUpdated: boolean
   terminal: boolean
 }
@@ -414,6 +421,7 @@ export function createRunEventDispatcher(listener: RunStreamListener) {
     conversationId: null,
     runId: null,
     assistantCompleted: false,
+    assistantCompletionStatus: null,
     titleUpdated: false,
     terminal: false,
   }
@@ -632,6 +640,7 @@ function validateRunEventSequence(
         run.id !== sequence.runId ||
         run.conversationId !== sequence.conversationId ||
         run.status !== 'SUCCEEDED' ||
+        run.resultStatus !== sequence.assistantCompletionStatus ||
         conversation.id !== sequence.conversationId
       ) {
         throwSequenceError('run_completed 未携带当前 SUCCEEDED Run')
@@ -668,6 +677,10 @@ function advanceRunEventSequence(
     sequence.runId = run.id as string
   } else if (eventName === 'assistant_completed') {
     sequence.assistantCompleted = true
+    const entry = objectValue(value.assistantEntry)
+    const payload = objectValue(entry.payload)
+    sequence.assistantCompletionStatus =
+      payload.completionStatus === 'INCOMPLETE_LENGTH' ? 'INCOMPLETE_LENGTH' : 'COMPLETE'
   } else if (eventName === 'title_updated') {
     sequence.titleUpdated = true
   } else if (eventName === 'run_completed' || eventName === 'run_failed') {
@@ -734,6 +747,11 @@ function requireRun(value: Record<string, unknown>, field: string): void {
   requireNullableString(run, 'errorCode')
   requireString(run, 'startedAt')
   requireNullableString(run, 'endedAt')
+  if (run.status === 'SUCCEEDED') {
+    requireEnum(run, 'resultStatus', ['COMPLETE', 'INCOMPLETE_LENGTH'])
+  } else if (run.resultStatus !== undefined && run.resultStatus !== null) {
+    throw new ApiError('BAD_SSE_FRAME', '非成功 Run 不能携带 resultStatus', 0)
+  }
 }
 
 function requireConversation(value: Record<string, unknown>, field: string): void {
@@ -774,6 +792,20 @@ function requireEntry(
   }
   if (expectedType === 'ASSISTANT_MESSAGE' && payload.trace !== undefined) {
     requireTrace(payload.trace)
+  }
+  if (expectedType === 'ASSISTANT_MESSAGE' && payload.completionStatus !== undefined) {
+    requireEnum(payload, 'completionStatus', ['COMPLETE', 'INCOMPLETE_LENGTH'])
+    if (payload.completionDetailCode !== undefined) {
+      requireNullableString(payload, 'completionDetailCode')
+    }
+  }
+  if (expectedType === 'USER_MESSAGE' && payload.action !== undefined) {
+    requireEnum(payload, 'action', ['MESSAGE', 'CONTINUE_GENERATION'])
+    if (payload.action === 'CONTINUE_GENERATION') {
+      requireString(payload, 'sourceAssistantEntryId')
+    } else if (payload.sourceAssistantEntryId !== undefined && payload.sourceAssistantEntryId !== null) {
+      throw new ApiError('BAD_SSE_FRAME', '普通 User Entry 不能携带继续生成来源', 0)
+    }
   }
   if (expectedType === 'ASSISTANT_MESSAGE') {
     if (payload.citations !== undefined) requireCitations(payload.citations)
@@ -879,4 +911,16 @@ export function streamRetry(
   listener: RunStreamListener,
 ): Promise<void> {
   return streamRun(`/api/conversations/${conversationId}/runs/${runId}/retry`, { method: 'POST' }, listener)
+}
+
+export function streamContinue(
+  conversationId: string,
+  assistantEntryId: string,
+  listener: RunStreamListener,
+): Promise<void> {
+  return streamRun(
+    `/api/conversations/${conversationId}/entries/${assistantEntryId}/continue`,
+    { method: 'POST' },
+    listener,
+  )
 }

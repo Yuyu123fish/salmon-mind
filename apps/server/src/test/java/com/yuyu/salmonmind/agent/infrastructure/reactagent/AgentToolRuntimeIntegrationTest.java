@@ -6,7 +6,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.time.Duration;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import com.yuyu.salmonmind.agent.api.AgentExecutionException;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
@@ -377,7 +380,103 @@ class AgentToolRuntimeIntegrationTest {
         assertThat(reusedCall).anyMatch(ToolResponseMessage.class::isInstance);
     }
 
-    private ReactAgentSessionAdapter newAdapter(ToolCallingChatModel model, List<ToolCallback> tools, int maxResultChars) {
+    @Test
+    void parallelReadOnlyToolsUseReverseCompletionButOriginalModelResultOrder() throws Exception {
+        var tool = new ParallelGateTool();
+        var model = new ParallelCallingChatModel();
+        var adapter = newAdapter(model, List.of(tool.left, tool.right), 200_000);
+        var events = new RecordingListener();
+
+        AgentResult[] result = new AgentResult[1];
+        Thread run = new Thread(() -> result[0] = completeSync(adapter, events, new AgentRequest(
+                "parallel-gate-thread", null, UUID.randomUUID(), userList("并行查询"),
+                CheckpointPolicy.REUSE_IF_MATCH)));
+        run.start();
+
+        assertThat(tool.entered.await(5, TimeUnit.SECONDS)).isTrue();
+        // 两个工具都已进入后，先放行 right，再放行 left，形成确定的反向完成顺序。
+        tool.allowRight.countDown();
+        // 必须等生命周期拦截器已经观察到 right 返回，才能放行 left；
+        // 工具函数内部的记录先于函数真正返回，单独等待它会留下线程调度竞态。
+        assertThat(events.parallelRightCompleted.await(5, TimeUnit.SECONDS)).isTrue();
+        tool.allowLeft.countDown();
+        run.join(5_000);
+
+        assertThat(run.isAlive()).isFalse();
+        assertThat(result[0].text()).isEqualTo("并行结果已按调用顺序收集。");
+        assertThat(events.completed).extracting(AgentToolCompleted::toolName)
+                .containsExactly("parallel_right", "parallel_left");
+        // 生命周期回调的先后以实际观察到的完成顺序为准；模型收到的 ToolResponse 仍按原调用列表。
+        assertThat(tool.completionOrder).containsExactly("parallel_right", "parallel_left");
+        ToolResponseMessage responses = toolResponseOf(model.calls.get(1));
+        assertThat(responses.getResponses()).extracting(ToolResponseMessage.ToolResponse::name)
+                .containsExactly("parallel_left", "parallel_right");
+    }
+
+    @Test
+    void frameworkToolTimeoutProducesOneStableFailureAndSuppressesLateCompletion() throws Exception {
+        var tool = new BlockingTool();
+        var model = new SingleBlockingToolModel();
+        var adapter = newAdapter(model, List.of(tool), 200_000, 32_768, 32, Duration.ofSeconds(1));
+        var events = new RecordingListener();
+
+        Thread run = new Thread(() -> completeSync(adapter, events, new AgentRequest(
+                "timeout-gate-thread", null, UUID.randomUUID(), userList("执行慢工具"),
+                CheckpointPolicy.REUSE_IF_MATCH)));
+        run.start();
+        assertThat(tool.entered.await(5, TimeUnit.SECONDS)).isTrue();
+        run.join(8_000);
+        assertThat(run.isAlive()).isFalse();
+        assertThat(events.failed).singleElement()
+                .extracting(AgentToolFailed::stableErrorCode)
+                .isEqualTo(ToolLifecycleInterceptor.TOOL_EXECUTION_TIMEOUT);
+        assertThat(events.completed).isEmpty();
+        assertThat(events.result()).isNotNull();
+
+        // 让底层同步回调迟到返回；终态 fence 不允许再追加 completed 或新的 Agent 终态。
+        tool.release.countDown();
+        assertThat(tool.returned.await(5, TimeUnit.SECONDS)).isTrue();
+        assertThat(events.failed).hasSize(1);
+        assertThat(events.completed).isEmpty();
+    }
+
+    @Test
+    void timeoutDoesNotCancelIndependentParallelTool() throws Exception {
+        var tools = new ParallelTimeoutTools();
+        var model = new ParallelTimeoutCallingChatModel();
+        var adapter = newAdapter(model, List.of(tools.blocking, tools.fast), 200_000,
+                32_768, 32, Duration.ofSeconds(1));
+        var events = new RecordingListener();
+        AgentResult[] result = new AgentResult[1];
+
+        Thread run = new Thread(() -> result[0] = completeSync(adapter, events, new AgentRequest(
+                "parallel-timeout-gate-thread", null, UUID.randomUUID(), userList("并行执行慢工具"),
+                CheckpointPolicy.REUSE_IF_MATCH)));
+        run.start();
+        assertThat(tools.blocking.entered.await(5, TimeUnit.SECONDS)).isTrue();
+        assertThat(tools.fast.entered.await(5, TimeUnit.SECONDS)).isTrue();
+        assertThat(tools.fast.returned.await(5, TimeUnit.SECONDS)).isTrue();
+        run.join(8_000);
+
+        assertThat(run.isAlive()).isFalse();
+        assertThat(result[0]).isNotNull();
+        assertThat(events.failed).singleElement()
+                .extracting(AgentToolFailed::stableErrorCode)
+                .isEqualTo(ToolLifecycleInterceptor.TOOL_EXECUTION_TIMEOUT);
+        assertThat(events.completed).singleElement()
+                .extracting(AgentToolCompleted::toolName)
+                .isEqualTo("fast_tool");
+        assertThat(toolResponseOf(model.calls.get(1)).getResponses())
+                .extracting(ToolResponseMessage.ToolResponse::name)
+                .containsExactly("blocking_tool", "fast_tool");
+
+        tools.blocking.release.countDown();
+        assertThat(tools.blocking.returned.await(5, TimeUnit.SECONDS)).isTrue();
+        assertThat(events.failed).hasSize(1);
+        assertThat(events.completed).hasSize(1);
+    }
+
+    private ReactAgentSessionAdapter newAdapter(ChatModel model, List<ToolCallback> tools, int maxResultChars) {
         return newAdapter(model, tools, maxResultChars, 32_768, 32);
     }
 
@@ -389,6 +488,18 @@ class AgentToolRuntimeIntegrationTest {
                 (ChatModelProvider) () -> new ChatModelHandle(model, "test-provider", "test-model"),
                 redisUrl, "", 65_432, 32_768, 0.1, maxResultChars, tools,
                 maxResultTokens, maxSteps);
+        adapters.add(adapter);
+        return adapter;
+    }
+
+    private ReactAgentSessionAdapter newAdapter(
+            ChatModel model, List<ToolCallback> tools, int maxResultChars,
+            int maxResultTokens, int maxSteps, java.time.Duration toolExecutionTimeout
+    ) {
+        var adapter = new ReactAgentSessionAdapter(
+                (ChatModelProvider) () -> new ChatModelHandle(model, "test-provider", "test-model"),
+                redisUrl, "", 65_432, 32_768, 0.1, maxResultChars, tools,
+                maxResultTokens, maxSteps, toolExecutionTimeout);
         adapters.add(adapter);
         return adapter;
     }
@@ -440,6 +551,198 @@ class AgentToolRuntimeIntegrationTest {
         return UserMessage.builder().text(text).build();
     }
 
+    /** 两个显式只读工具：用闸门控制真实并行调用和可重复的反向完成顺序。 */
+    private static final class ParallelGateTool {
+        final CountDownLatch entered = new CountDownLatch(2);
+        final CountDownLatch allowLeft = new CountDownLatch(1);
+        final CountDownLatch allowRight = new CountDownLatch(1);
+        final List<String> completionOrder = new CopyOnWriteArrayList<>();
+        final GateTool left = new GateTool("parallel_left", allowLeft);
+        final GateTool right = new GateTool("parallel_right", allowRight);
+
+        private final class GateTool implements ParallelSafeToolCallback {
+            private final String name;
+            private final CountDownLatch permit;
+
+            private GateTool(String name, CountDownLatch permit) {
+                this.name = name;
+                this.permit = permit;
+            }
+
+            @Override
+            public ToolDefinition getToolDefinition() {
+                return ToolDefinition.builder()
+                        .name(name).description("Gate 只读工具")
+                        .inputSchema("{\"type\":\"object\"}").build();
+            }
+
+            @Override
+            public String call(String input) {
+                entered.countDown();
+                try {
+                    if (!permit.await(5, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("并行 Gate 未收到放行信号");
+                    }
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("并行 Gate 被中断", ex);
+                }
+                completionOrder.add(name);
+                return name + " result";
+            }
+        }
+    }
+
+    /** 阻塞工具：框架超时返回错误 ToolResponse，真实同步回调稍后才释放。 */
+    private static final class BlockingTool implements ParallelSafeToolCallback {
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        final CountDownLatch returned = new CountDownLatch(1);
+
+        @Override
+        public ToolDefinition getToolDefinition() {
+            return ToolDefinition.builder().name("blocking_tool")
+                    .description("Gate 阻塞工具").inputSchema("{\"type\":\"object\"}").build();
+        }
+
+        @Override
+        public String call(String input) {
+            entered.countDown();
+            try {
+                release.await(5, TimeUnit.SECONDS);
+                return "迟到结果";
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                return "被中断";
+            } finally {
+                returned.countDown();
+            }
+        }
+    }
+
+    private static final class FastTool implements ParallelSafeToolCallback {
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch returned = new CountDownLatch(1);
+
+        @Override
+        public ToolDefinition getToolDefinition() {
+            return ToolDefinition.builder().name("fast_tool")
+                    .description("Gate 快速只读工具").inputSchema("{\"type\":\"object\"}").build();
+        }
+
+        @Override
+        public String call(String input) {
+            entered.countDown();
+            try {
+                return "快速结果";
+            } finally {
+                returned.countDown();
+            }
+        }
+    }
+
+    private static final class ParallelTimeoutTools {
+        final BlockingTool blocking = new BlockingTool();
+        final FastTool fast = new FastTool();
+    }
+
+    private static final class ParallelCallingChatModel implements ChatModel {
+        final List<List<Message>> calls = new CopyOnWriteArrayList<>();
+
+        @Override
+        public ChatResponse call(Prompt prompt) {
+            List<Message> instructions = new ArrayList<>(prompt.getInstructions());
+            calls.add(instructions);
+            boolean hasResults = instructions.stream().anyMatch(ToolResponseMessage.class::isInstance);
+            if (!hasResults) {
+                AssistantMessage toolCalls = AssistantMessage.builder()
+                        .toolCalls(List.of(
+                                new AssistantMessage.ToolCall("parallel-call-left", "function",
+                                        "parallel_left", "{}"),
+                                new AssistantMessage.ToolCall("parallel-call-right", "function",
+                                        "parallel_right", "{}")))
+                        .build();
+                return new ChatResponse(List.of(new Generation(toolCalls)));
+            }
+            var metadata = ChatResponseMetadata.builder().usage(new DefaultUsage(4, 5, 9)).build();
+            return new ChatResponse(List.of(new Generation(
+                    AssistantMessage.builder().content("并行结果已按调用顺序收集。").build())), metadata);
+        }
+
+        @Override
+        public org.springframework.ai.chat.prompt.ChatOptions getDefaultOptions() {
+            return OpenAiChatOptions.builder().build();
+        }
+
+        @Override
+        public reactor.core.publisher.Flux<ChatResponse> stream(Prompt prompt) {
+            return reactor.core.publisher.Flux.just(call(prompt));
+        }
+    }
+
+    private static final class SingleBlockingToolModel implements ChatModel {
+        final List<List<Message>> calls = new CopyOnWriteArrayList<>();
+
+        @Override
+        public ChatResponse call(Prompt prompt) {
+            List<Message> instructions = new ArrayList<>(prompt.getInstructions());
+            calls.add(instructions);
+            boolean hasResults = instructions.stream().anyMatch(ToolResponseMessage.class::isInstance);
+            if (!hasResults) {
+                AssistantMessage toolCall = AssistantMessage.builder()
+                        .toolCalls(List.of(new AssistantMessage.ToolCall(
+                                "blocking-call", "function", "blocking_tool", "{}")))
+                        .build();
+                return new ChatResponse(List.of(new Generation(toolCall)));
+            }
+            return new ChatResponse(List.of(new Generation(
+                    AssistantMessage.builder().content("慢工具已收束为安全结果。").build())));
+        }
+
+        @Override
+        public org.springframework.ai.chat.prompt.ChatOptions getDefaultOptions() {
+            return OpenAiChatOptions.builder().build();
+        }
+
+        @Override
+        public reactor.core.publisher.Flux<ChatResponse> stream(Prompt prompt) {
+            return reactor.core.publisher.Flux.just(call(prompt));
+        }
+    }
+
+    private static final class ParallelTimeoutCallingChatModel implements ChatModel {
+        final List<List<Message>> calls = new CopyOnWriteArrayList<>();
+
+        @Override
+        public ChatResponse call(Prompt prompt) {
+            List<Message> instructions = new ArrayList<>(prompt.getInstructions());
+            calls.add(instructions);
+            boolean hasResults = instructions.stream().anyMatch(ToolResponseMessage.class::isInstance);
+            if (!hasResults) {
+                AssistantMessage toolCalls = AssistantMessage.builder()
+                        .toolCalls(List.of(
+                                new AssistantMessage.ToolCall("parallel-timeout-call", "function",
+                                        "blocking_tool", "{}"),
+                                new AssistantMessage.ToolCall("parallel-fast-call", "function",
+                                        "fast_tool", "{}")))
+                        .build();
+                return new ChatResponse(List.of(new Generation(toolCalls)));
+            }
+            return new ChatResponse(List.of(new Generation(
+                    AssistantMessage.builder().content("并行工具均已安全收束。").build())));
+        }
+
+        @Override
+        public org.springframework.ai.chat.prompt.ChatOptions getDefaultOptions() {
+            return OpenAiChatOptions.builder().build();
+        }
+
+        @Override
+        public reactor.core.publisher.Flux<ChatResponse> stream(Prompt prompt) {
+            return reactor.core.publisher.Flux.just(call(prompt));
+        }
+    }
+
     /** 记录工具生命周期事件与模型终态；失败抛出由调用方决定。 */
     private static final class RecordingListener implements AgentStreamListener {
 
@@ -448,6 +751,7 @@ class AgentToolRuntimeIntegrationTest {
         private final List<AgentToolStarted> started = new CopyOnWriteArrayList<>();
         private final List<AgentToolCompleted> completed = new CopyOnWriteArrayList<>();
         private final List<AgentToolFailed> failed = new CopyOnWriteArrayList<>();
+        private final CountDownLatch parallelRightCompleted = new CountDownLatch(1);
         private volatile AgentResult result;
         private volatile AgentExecutionException error;
 
@@ -479,6 +783,9 @@ class AgentToolRuntimeIntegrationTest {
         @Override
         public void onToolCompleted(AgentToolCompleted event) {
             completed.add(event);
+            if ("parallel_right".equals(event.toolName())) {
+                parallelRightCompleted.countDown();
+            }
         }
 
         @Override

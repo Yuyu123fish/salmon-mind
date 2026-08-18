@@ -39,6 +39,14 @@ public interface KnowledgeMetadataPort {
      */
     void markQueued(UUID jobId, String messageId);
 
+    /**
+     * 记录自动重试产生的新 Stream 消息，并把仍处于待投递或旧消息已登记状态的 Job 置为 QUEUED。
+     * 它与首条上传消息的 {@link #markQueued(UUID, String)} 分开，是因为首条消息可能在上传线程
+     * 回写前已被 Worker 消费；自动重试必须能够原子覆盖该竞态留下的旧消息身份，但不能覆盖
+     * 已经进入 PARSING 或终态的并发处理结果。
+     */
+    void markAutomaticRetryQueued(UUID jobId, String messageId);
+
     /** 返回当前 Workspace 的文档摘要，按 Source 创建时间倒序排列。 */
     List<StoredDocument> list(UUID workspaceId);
 

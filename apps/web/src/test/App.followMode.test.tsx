@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   ConversationDetail,
   ConversationSummary,
+  Run,
   RunStreamListener,
 } from '../conversationApi.ts'
 
@@ -12,6 +13,7 @@ const api = vi.hoisted(() => ({
   fetchConversation: vi.fn(),
   streamSend: vi.fn(),
   streamRetry: vi.fn(),
+  streamContinue: vi.fn(),
 }))
 
 vi.mock('../workspaceApi.ts', () => ({ fetchCurrentWorkspace: api.fetchCurrentWorkspace }))
@@ -21,6 +23,7 @@ vi.mock('../conversationApi.ts', async (importOriginal) => ({
   fetchConversation: api.fetchConversation,
   streamSend: api.streamSend,
   streamRetry: api.streamRetry,
+  streamContinue: api.streamContinue,
 }))
 vi.mock('../KnowledgeView.tsx', () => ({ default: () => null }))
 
@@ -69,6 +72,12 @@ describe('App follow mode', () => {
     api.fetchConversation.mockResolvedValue(detail)
     api.streamSend.mockImplementation(
       (_conversationId: string, _text: string, received: RunStreamListener) => {
+        listener = received
+        return new Promise<void>(() => undefined)
+      },
+    )
+    api.streamContinue.mockImplementation(
+      (_conversationId: string, _assistantEntryId: string, received: RunStreamListener) => {
         listener = received
         return new Promise<void>(() => undefined)
       },
@@ -288,6 +297,107 @@ describe('App follow mode', () => {
     expect(screen.getByText('本地证据摘录')).toBeVisible()
     expect(view.container.querySelector('#source-card-assistant-1-L1')).toHaveFocus()
   })
+
+  it('shows continue only for the active incomplete Assistant and sends its entry id', async () => {
+    const userEntry = {
+      formatVersion: 1 as const,
+      conversationId: summary.id,
+      id: 'user-1',
+      seq: 1,
+      parentId: null,
+      type: 'USER_MESSAGE' as const,
+      createdAt: summary.createdAt,
+      payload: { text: '写一篇长文', runId: 'run-1' },
+    }
+    const assistantEntry = {
+      formatVersion: 1 as const,
+      conversationId: summary.id,
+      id: 'assistant-incomplete',
+      seq: 2,
+      parentId: userEntry.id,
+      type: 'ASSISTANT_MESSAGE' as const,
+      createdAt: summary.updatedAt,
+      payload: {
+        text: '已输出前半段',
+        runId: 'run-1',
+        trace: [],
+        completionStatus: 'INCOMPLETE_LENGTH' as const,
+        completionDetailCode: null,
+      },
+    }
+    api.fetchConversation.mockResolvedValueOnce({
+      ...detail,
+      conversation: { ...detail.conversation, activeLeafEntryId: assistantEntry.id, lastConfirmedSeq: 2 },
+      activePath: [userEntry, assistantEntry],
+    })
+
+    render(<App />)
+    expect(await screen.findByText('回答未完成')).toBeVisible()
+    const continueButton = screen.getByRole('button', { name: '继续生成' })
+    fireEvent.click(continueButton)
+
+    await waitFor(() =>
+      expect(api.streamContinue).toHaveBeenCalledWith(
+        summary.id,
+        assistantEntry.id,
+        expect.any(Object),
+      ),
+    )
+    expect(continueButton).toBeDisabled()
+    fireEvent.click(continueButton)
+    expect(api.streamContinue).toHaveBeenCalledTimes(1)
+
+    const started = runStartedEvent('继续生成')
+    act(() => {
+      listener!.onRunStarted({
+        ...started,
+        run: { ...started.run, id: 'run-2', triggerEntryId: 'action-1' },
+        userEntry: {
+          ...started.userEntry,
+          id: 'action-1',
+          parentId: assistantEntry.id,
+          payload: {
+            text: '继续生成',
+            runId: 'run-2',
+            action: 'CONTINUE_GENERATION',
+            sourceAssistantEntryId: assistantEntry.id,
+          },
+        },
+      })
+      listener!.onAssistantDelta({ runId: 'run-2', delta: '追加正文' })
+      listener!.onAssistantCompleted({
+        conversationId: summary.id,
+        assistantEntry: {
+          formatVersion: 1,
+          conversationId: summary.id,
+          id: 'assistant-2',
+          seq: 4,
+          parentId: 'action-1',
+          type: 'ASSISTANT_MESSAGE',
+          createdAt: summary.updatedAt,
+          payload: {
+            text: '追加正文',
+            runId: 'run-2',
+            trace: [],
+            completionStatus: 'COMPLETE',
+            completionDetailCode: null,
+          },
+        },
+      })
+      listener!.onRunCompleted({
+        conversationId: summary.id,
+        run: {
+          ...completedRun('SUCCEEDED'),
+          id: 'run-2',
+          triggerEntryId: 'action-1',
+          resultStatus: 'COMPLETE',
+        },
+        conversation: { ...detail.conversation, activeLeafEntryId: 'assistant-2', lastConfirmedSeq: 4 },
+      })
+    })
+    expect(screen.getAllByText('已输出前半段')).toHaveLength(1)
+    expect(screen.getByText('追加正文')).toBeVisible()
+  })
 })
 
 function runStartedEvent(text: string) {
@@ -316,7 +426,7 @@ function runStartedEvent(text: string) {
   }
 }
 
-function completedRun(status: 'SUCCEEDED' | 'FAILED') {
+function completedRun(status: 'SUCCEEDED' | 'FAILED'): Run {
   return {
     id: 'run-1',
     conversationId: summary.id,
@@ -325,5 +435,6 @@ function completedRun(status: 'SUCCEEDED' | 'FAILED') {
     errorCode: status === 'FAILED' ? 'CHAT_MODEL_FAILED' : null,
     startedAt: summary.createdAt,
     endedAt: '2026-08-18T00:00:02Z',
+    resultStatus: status === 'SUCCEEDED' ? 'COMPLETE' : null,
   }
 }

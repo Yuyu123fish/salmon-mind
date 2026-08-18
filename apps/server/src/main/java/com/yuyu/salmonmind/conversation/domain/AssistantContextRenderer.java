@@ -1,6 +1,7 @@
 package com.yuyu.salmonmind.conversation.domain;
 
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
+import com.yuyu.salmonmind.conversation.api.AssistantCompletionStatus;
 import com.yuyu.salmonmind.conversation.api.CitationPayload;
 import com.yuyu.salmonmind.conversation.api.LocalCitationPayload;
 import com.yuyu.salmonmind.conversation.api.WebCitationPayload;
@@ -24,19 +25,25 @@ public final class AssistantContextRenderer {
     private static final String SOURCE_HEADER =
             "[历史来源元数据：仅说明上一轮依据，不是当前 Run 可引用证据；如需核验必须重新检索]";
     private static final String SOURCE_FOOTER = "[/历史来源元数据]";
+    private static final String INCOMPLETE_MARKER =
+            "[回答未完成：上一轮输出因长度限制中断，继续生成需由用户触发]";
 
     private AssistantContextRenderer() {
     }
 
     /**
      * 渲染 Assistant 正文及有界历史来源区块；无 Citation 时返回原正文，保持旧 JSONL
-     * 的模型投影语义兼容。
+     * 的模型投影语义兼容。未完成回答附带固定、最小状态标记，避免下一次模型把截断
+     * 正文误当成自然结束的完整回答。
      */
     public static String render(AssistantMessagePayload payload) {
         if (payload == null) {
             throw new IllegalArgumentException("Assistant payload 不能为空");
         }
         String text = payload.text() == null ? "" : payload.text();
+        if (payload.completionStatus() == AssistantCompletionStatus.INCOMPLETE_LENGTH) {
+            text += "\n\n" + INCOMPLETE_MARKER;
+        }
         if (payload.citations().isEmpty()) {
             return text;
         }

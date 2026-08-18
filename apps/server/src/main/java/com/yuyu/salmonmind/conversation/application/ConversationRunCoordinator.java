@@ -4,6 +4,7 @@ import com.yuyu.salmonmind.agent.api.AgentExecutionException;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException.AgentErrorCode;
 import com.yuyu.salmonmind.agent.api.AgentCitation;
 import com.yuyu.salmonmind.agent.api.AgentContextBudget;
+import com.yuyu.salmonmind.agent.api.AgentCompletionStatus;
 import com.yuyu.salmonmind.agent.api.AgentLocalCitation;
 import com.yuyu.salmonmind.agent.api.AgentLocalRetrievedSource;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
@@ -24,6 +25,7 @@ import com.yuyu.salmonmind.agent.api.AgentWebCitation;
 import com.yuyu.salmonmind.agent.api.AgentWebRetrievedSource;
 import com.yuyu.salmonmind.agent.api.CheckpointPolicy;
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
+import com.yuyu.salmonmind.conversation.api.AssistantCompletionStatus;
 import com.yuyu.salmonmind.conversation.api.CompactionPayload;
 import com.yuyu.salmonmind.conversation.api.Conversation;
 import com.yuyu.salmonmind.conversation.api.ConversationException;
@@ -35,7 +37,19 @@ import com.yuyu.salmonmind.conversation.api.LocalCitationPayload;
 import com.yuyu.salmonmind.conversation.api.LocalRetrievedSourcePayload;
 import com.yuyu.salmonmind.conversation.api.Run;
 import com.yuyu.salmonmind.conversation.api.Run.RunStatus;
+import com.yuyu.salmonmind.conversation.api.RunResultStatus;
 import com.yuyu.salmonmind.conversation.api.RunStreamListener;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.AssistantCompleted;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.AssistantDelta;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.CompactionCompleted;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.ReasoningDelta;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.RunCompleted;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.RunFailed;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.RunStarted;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.TitleUpdated;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.ToolCompleted;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.ToolFailed;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.ToolStarted;
 import com.yuyu.salmonmind.conversation.api.RunTraceItemPayload;
 import com.yuyu.salmonmind.conversation.api.TitlePayload;
 import com.yuyu.salmonmind.conversation.api.TokenUsage;
@@ -62,6 +76,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 发送 / 重试的完整 Run 协调器，被 {@link ConversationExecutionQueue} 按 Conversation 串行调用。
@@ -74,8 +89,8 @@ import java.util.UUID;
  *    完整计量；兼容路径可使用有效 usage 锚点。达到 196,712 阈值时生成摘要、追加
  *    Compaction、推进叶子与压缩三元组并使旧 Checkpoint 失效，随后主调用从
  *    「Summary + Retained Tail + Compaction 后消息」的新投影重建；
- * 5. 流式主回答：delta 只在内存/SSE 中累积，只有模型成功且文本非空才追加一个完整
- *    Assistant Entry；模型成功前失败不写 Assistant；
+ * 5. 流式主回答：delta 先在内存/SSE 中累积；模型返回完整或长度中断且文本非空时
+ *    追加一个 Assistant Entry，模型成功前失败不写 Assistant；
  * 6. 成功提交点：Assistant JSONL 刷盘后，在同一数据库事务把 Run 更新为 SUCCEEDED
  *    并推进活动叶子，随后独立尝试标题持久化。事务提交后业务成功不可降级；
  * 7. 传输阶段：按序尽力发送 assistant_completed → 可选 title_updated → run_completed，
@@ -96,6 +111,9 @@ class ConversationRunCoordinator {
 
     /** Summary 进入模型上下文的前缀消息；摘要是历史事实整理，不是用户新指令。 */
     private static final String SUMMARY_PREFIX = "以下为此前对话的结构化摘要，请基于它继续对话：\n";
+    /** 手动继续动作的模型投影；Entry 展示文本与模型控制指令故意分离。 */
+    private static final String CONTINUATION_INSTRUCTION =
+            "请从上一次输出中断的位置继续生成。不要复述已经输出的内容，只输出新增正文。";
 
     private final WorkspaceRegistry workspaceRegistry;
     private final ConversationRecoveryService recoveryService;
@@ -192,8 +210,9 @@ class ConversationRunCoordinator {
         });
 
         // durable 状态成立后才能开始流；之前的前置错误以异常抛出（HTTP 层映射 JSON）
-        listener.onRunStarted(new RunStreamListener.RunStarted(conversationId, running, userEntry, false));
-        execute(listener, conversationId, advanced, running, userEntry, answerEntryId);
+        RunStreamListener delivery = resilientListener(listener, conversationId);
+        delivery.onRunStarted(new RunStreamListener.RunStarted(conversationId, running, userEntry, false));
+        execute(delivery, conversationId, advanced, running, userEntry, answerEntryId, null);
     }
 
     /**
@@ -253,8 +272,58 @@ class ConversationRunCoordinator {
         Run running = new Run(newRunId, conversationId, trigger.id(), RunStatus.RUNNING, null, now, null);
         transactionTemplate.executeWithoutResult(status -> metadataRepository.insertRun(running));
 
-        listener.onRunStarted(new RunStreamListener.RunStarted(conversationId, running, trigger, true));
-        execute(listener, conversationId, conversation, running, trigger, answerEntryId);
+        RunStreamListener delivery = resilientListener(listener, conversationId);
+        delivery.onRunStarted(new RunStreamListener.RunStarted(conversationId, running, trigger, true));
+        Entry continuationSource = trigger.payload() instanceof UserMessagePayload payload
+                && payload.action() == UserMessagePayload.Action.CONTINUE_GENERATION
+                ? findEntry(history, payload.sourceAssistantEntryId()) : null;
+        execute(delivery, conversationId, conversation, running, trigger, answerEntryId, continuationSource);
+    }
+
+    /**
+     * 从当前 Active Path 的未完成 Assistant 继续生成。先追加一个只表达用户动作的
+     * User Entry，再创建新 Run；旧回答保持不可变，新 Assistant 只保存新增正文。
+     */
+    void continueGeneration(UUID conversationId, UUID assistantEntryId, RunStreamListener listener) {
+        RecoveryState state = recover(conversationId);
+        Conversation conversation = state.conversation();
+        ConversationHistory history = state.history();
+        List<Entry> path = conversation.activeLeafEntryId() == null
+                ? List.of() : history.activePath(conversation.activeLeafEntryId());
+        if (path.isEmpty() || !conversation.activeLeafEntryId().equals(assistantEntryId)) {
+            throw new ConversationException(
+                    ConversationErrorCode.CONTINUE_GENERATION_NOT_ALLOWED,
+                    "只有当前 Active Path 叶子的未完成回答可以继续生成");
+        }
+        Entry source = path.get(path.size() - 1);
+        if (source.type() != EntryType.ASSISTANT_MESSAGE
+                || ((AssistantMessagePayload) source.payload()).completionStatus()
+                != AssistantCompletionStatus.INCOMPLETE_LENGTH) {
+            throw new ConversationException(
+                    ConversationErrorCode.CONTINUE_GENERATION_NOT_ALLOWED,
+                    "当前回答已经完成，不能继续生成");
+        }
+
+        UUID runId = UUID.randomUUID();
+        UUID actionEntryId = UUID.randomUUID();
+        UUID answerEntryId = UUID.randomUUID();
+        long actionSeq = conversation.lastConfirmedSeq() + 1;
+        Instant now = Instant.now();
+        Entry action = new Entry(
+                ConversationHistory.FORMAT_VERSION, conversationId, actionEntryId, actionSeq,
+                source.id(), EntryType.USER_MESSAGE, now,
+                new UserMessagePayload("继续生成", runId,
+                        UserMessagePayload.Action.CONTINUE_GENERATION, source.id()));
+        historyRepository.append(conversationId, action);
+        Conversation advanced = advance(conversation, action.id(), actionSeq, conversation.title(), now);
+        Run running = new Run(runId, conversationId, action.id(), RunStatus.RUNNING, null, now, null);
+        transactionTemplate.executeWithoutResult(status -> {
+            metadataRepository.insertRun(running);
+            metadataRepository.update(advanced);
+        });
+        RunStreamListener delivery = resilientListener(listener, conversationId);
+        delivery.onRunStarted(new RunStreamListener.RunStarted(conversationId, running, action, false));
+        execute(delivery, conversationId, advanced, running, action, answerEntryId, source);
     }
 
     /**
@@ -265,11 +334,12 @@ class ConversationRunCoordinator {
      * HTTP 层抛异常。压缩会推进活动叶子，因此局部 {@code current} 必须跟着更新，失败时
      * {@link #failRun} 才能报告正确叶子（User 或本 Run 的 Compaction）。成功路径由
      * {@link #finishSuccess} 先写完整 Assistant JSONL，再同事务完成 Run 与推进叶子；
-     * 任何 Conversation / Agent / 运行时失败都收束为 {@code run_failed}，不追加 Assistant。
+     * 没有 durable Assistant 的 Conversation / Agent / 运行时失败收束为 {@code run_failed}；
+     * Assistant 已刷盘但索引事务失败时按 JSONL 权威恢复成功终态。
      */
     private void execute(
             RunStreamListener listener, UUID conversationId, Conversation conversation,
-            Run running, Entry triggerEntry, UUID answerEntryId
+            Run running, Entry triggerEntry, UUID answerEntryId, Entry continuationSource
     ) {
         Conversation current = conversation;
         try {
@@ -281,14 +351,76 @@ class ConversationRunCoordinator {
             }
             MainOutcome outcome = streamMain(
                     listener, conversationId, current, history, running, answerEntryId, compaction.compacted());
-            finishSuccess(listener, conversationId, outcome, running, answerEntryId);
+            finishSuccess(listener, conversationId, outcome, running, answerEntryId, continuationSource);
         } catch (ConversationException ex) {
-            failRun(listener, current, running, ex.code().name(), ex.getMessage());
+            if (!reconcileDurableAssistant(listener, conversationId, current, running, answerEntryId)) {
+                failRun(listener, current, running, ex.code().name(), ex.getMessage());
+            }
         } catch (AgentExecutionException ex) {
-            failRun(listener, current, running, ex.code().name(), ex.getMessage());
+            if (!reconcileDurableAssistant(listener, conversationId, current, running, answerEntryId)) {
+                failRun(listener, current, running, ex.code().name(), ex.getMessage());
+            }
         } catch (RuntimeException ex) {
-            failRun(listener, current, running, "INTERNAL_ERROR", "服务器内部错误");
+            if (!reconcileDurableAssistant(listener, conversationId, current, running, answerEntryId)) {
+                failRun(listener, current, running, "INTERNAL_ERROR", "服务器内部错误");
+            }
         }
+    }
+
+    /**
+     * JSONL Assistant 已刷盘但 PostgreSQL 成功事务报告失败时，立即按 JSONL 权威重做 reconcile。
+     * 数据库可用时发送已修复的成功终态；数据库暂时不可用时仍依据已刷盘 Assistant 发送成功
+     * 终态，禁止把权威正文收束为失败，后续打开时再修复数据库索引。
+     */
+    private boolean reconcileDurableAssistant(
+            RunStreamListener listener, UUID conversationId, Conversation current,
+            Run running, UUID answerEntryId
+    ) {
+        try {
+            Conversation databaseConversation = metadataRepository.findById(conversationId);
+            ConversationRecoveryService.Reconciliation reconciliation = databaseConversation == null
+                    ? null : recoveryService.reconcile(conversationId, databaseConversation);
+            Run repairedRun = metadataRepository.findRunById(running.id());
+            if (reconciliation != null) {
+                Entry assistant = findEntry(reconciliation.history(), answerEntryId);
+                if (repairedRun != null && repairedRun.status() == RunStatus.SUCCEEDED
+                        && assistant != null && assistant.type() == EntryType.ASSISTANT_MESSAGE) {
+                    sendSuccessEvents(listener, conversationId, repairedRun,
+                            reconciliation.conversation(), assistant, null);
+                    return true;
+                }
+            }
+        } catch (RuntimeException recoveryFailure) {
+            // 数据库暂时不可用时仍继续读取 JSONL；Assistant 已刷盘即代表业务正文已成立。
+        }
+        try {
+            ConversationHistory persistedHistory = historyRepository.read(conversationId);
+            Entry assistant = findEntry(persistedHistory, answerEntryId);
+            if (assistant == null || assistant.type() != EntryType.ASSISTANT_MESSAGE) {
+                return false;
+            }
+            AssistantMessagePayload payload = (AssistantMessagePayload) assistant.payload();
+            Run recoveredRun = new Run(
+                    running.id(), conversationId, running.triggerEntryId(), RunStatus.SUCCEEDED,
+                    resultErrorCode(payload), running.startedAt(), assistant.createdAt(),
+                    resultStatus(payload));
+            Conversation recoveredConversation = advance(
+                    current, assistant.id(), assistant.seq(), current.title(), assistant.createdAt());
+            sendSuccessEvents(listener, conversationId, recoveredRun, recoveredConversation, assistant, null);
+            return true;
+        } catch (RuntimeException recoveryFailure) {
+            return false;
+        }
+    }
+
+    private static RunResultStatus resultStatus(AssistantMessagePayload payload) {
+        return payload.completionStatus() == AssistantCompletionStatus.INCOMPLETE_LENGTH
+                ? RunResultStatus.INCOMPLETE_LENGTH : RunResultStatus.COMPLETE;
+    }
+
+    private static String resultErrorCode(AssistantMessagePayload payload) {
+        return "OUTPUT_CONTINUATION_FAILED".equals(payload.completionDetailCode())
+                ? "OUTPUT_CONTINUATION_FAILED" : null;
     }
 
     /**
@@ -536,8 +668,9 @@ class ConversationRunCoordinator {
     }
 
     /**
-     * 成功路径：先把完整 Assistant Entry 刷入 JSONL，再在同一数据库事务完成 SUCCEEDED Run
-     * 并推进活动叶子。delta 不形成历史，只有最终完整文本落盘一次。
+     * 成功路径：先把最终 Assistant Entry 刷入 JSONL，再在同一数据库事务完成 SUCCEEDED
+     * Run 并推进活动叶子。delta 不形成历史，只有最终文本落盘一次；文本可能标记为
+     * INCOMPLETE_LENGTH，供后续继续生成。
      *
      * <p>Assistant Entry 必须使用预分配的 {@code answerEntryId}：Adapter 成功后会把它写回
      * Checkpoint 叶子标记，下一轮 {@link #expectedCheckpointLeaf}（活动叶子的 parent）
@@ -549,13 +682,20 @@ class ConversationRunCoordinator {
      * 传输失败绝不回头调用 {@link #failRun}。
      */
     private void finishSuccess(
-            RunStreamListener listener, UUID conversationId, MainOutcome outcome, Run running, UUID answerEntryId
+            RunStreamListener listener, UUID conversationId, MainOutcome outcome, Run running,
+            UUID answerEntryId, Entry continuationSource
     ) {
         AgentResult result = outcome.result();
         if (result.text() == null || result.text().isBlank()) {
             // 空回答视为模型失败：不追加空 Assistant Entry，由调用方完成 FAILED Run 后可重试
             throw new AgentExecutionException(
                     AgentErrorCode.CHAT_MODEL_FAILED, "模型返回了空回答");
+        }
+        String answerText = continuationSource == null
+                ? result.text()
+                : appendOnlySuffix(((AssistantMessagePayload) continuationSource.payload()).text(), result.text());
+        if (answerText.isBlank()) {
+            throw new AgentExecutionException(AgentErrorCode.CHAT_MODEL_FAILED, "续写没有产生新增正文");
         }
         long answerSeq = outcome.conversation().lastConfirmedSeq() + 1;
         Instant answeredAt = Instant.now();
@@ -564,14 +704,20 @@ class ConversationRunCoordinator {
                 ConversationHistory.FORMAT_VERSION, conversationId, answerEntryId, answerSeq,
                 outcome.conversation().activeLeafEntryId(), EntryType.ASSISTANT_MESSAGE, answeredAt,
                 new AssistantMessagePayload(
-                        result.text(), running.id(), result.provider(), result.model(), mapUsage(result.usage()),
+                        answerText, running.id(), result.provider(), result.model(), mapUsage(result.usage()),
                         mapCitations(result.citations()), mapRetrievedSources(result.retrievedSources()),
-                        mapTrace(result.trace())));
+                        mapTrace(result.trace()), mapCompletionStatus(result.completionStatus()),
+                        result.completionDetailCode()));
         historyRepository.append(conversationId, assistantEntry);
 
+        String resultErrorCode = result.completionStatus() == AgentCompletionStatus.INCOMPLETE_LENGTH
+                && "OUTPUT_CONTINUATION_FAILED".equals(result.completionDetailCode())
+                ? result.completionDetailCode() : null;
+        RunResultStatus resultStatus = result.completionStatus() == AgentCompletionStatus.INCOMPLETE_LENGTH
+                ? RunResultStatus.INCOMPLETE_LENGTH : RunResultStatus.COMPLETE;
         Run finished = new Run(
-                running.id(), conversationId, running.triggerEntryId(), RunStatus.SUCCEEDED, null,
-                running.startedAt(), answeredAt);
+                running.id(), conversationId, running.triggerEntryId(), RunStatus.SUCCEEDED, resultErrorCode,
+                running.startedAt(), answeredAt, resultStatus);
         Conversation finalConversation = advance(outcome.conversation(), assistantEntry.id(), answerSeq,
                 outcome.conversation().title(), answeredAt);
         transactionTemplate.executeWithoutResult(status -> {
@@ -609,8 +755,8 @@ class ConversationRunCoordinator {
                     conversationId, finished, finalConversation));
         } catch (RuntimeException ex) {
             // 已越过成功提交点：只记录传输中断，业务状态保持 SUCCEEDED
-            log.warn("成功事件传输中断（conversation={}）：只结束当前连接，业务状态保持 SUCCEEDED",
-                    conversationId, ex);
+            log.warn("成功事件传输中断（conversation={}）：只结束当前连接，业务状态保持 SUCCEEDED，exceptionType={}",
+                    conversationId, ex.getClass().getSimpleName());
         }
     }
 
@@ -704,6 +850,95 @@ class ConversationRunCoordinator {
     }
 
     /**
+     * SSE 是传输边界，不应决定 Agent 是否继续执行或 durable Run 的最终状态。
+     * 第一次回调异常视为客户端断线，后续事件直接丢弃；数据库成功/失败收束仍由协调器完成。
+     */
+    private static RunStreamListener resilientListener(RunStreamListener delegate, UUID conversationId) {
+        return new ResilientRunStreamListener(delegate, conversationId);
+    }
+
+    private static final class ResilientRunStreamListener implements RunStreamListener {
+
+        private final RunStreamListener delegate;
+        private final UUID conversationId;
+        private final AtomicBoolean open = new AtomicBoolean(true);
+
+        private ResilientRunStreamListener(RunStreamListener delegate, UUID conversationId) {
+            this.delegate = delegate;
+            this.conversationId = conversationId;
+        }
+
+        @Override
+        public void onRunStarted(RunStarted event) {
+            forward("run_started", () -> delegate.onRunStarted(event));
+        }
+
+        @Override
+        public void onCompactionCompleted(CompactionCompleted event) {
+            forward("compaction_completed", () -> delegate.onCompactionCompleted(event));
+        }
+
+        @Override
+        public void onAssistantDelta(AssistantDelta event) {
+            forward("assistant_delta", () -> delegate.onAssistantDelta(event));
+        }
+
+        @Override
+        public void onReasoningDelta(ReasoningDelta event) {
+            forward("reasoning_delta", () -> delegate.onReasoningDelta(event));
+        }
+
+        @Override
+        public void onToolStarted(ToolStarted event) {
+            forward("tool_started", () -> delegate.onToolStarted(event));
+        }
+
+        @Override
+        public void onToolCompleted(ToolCompleted event) {
+            forward("tool_completed", () -> delegate.onToolCompleted(event));
+        }
+
+        @Override
+        public void onToolFailed(ToolFailed event) {
+            forward("tool_failed", () -> delegate.onToolFailed(event));
+        }
+
+        @Override
+        public void onAssistantCompleted(AssistantCompleted event) {
+            forward("assistant_completed", () -> delegate.onAssistantCompleted(event));
+        }
+
+        @Override
+        public void onTitleUpdated(TitleUpdated event) {
+            forward("title_updated", () -> delegate.onTitleUpdated(event));
+        }
+
+        @Override
+        public void onRunCompleted(RunCompleted event) {
+            forward("run_completed", () -> delegate.onRunCompleted(event));
+        }
+
+        @Override
+        public void onRunFailed(RunFailed event) {
+            forward("run_failed", () -> delegate.onRunFailed(event));
+        }
+
+        private void forward(String eventType, Runnable callback) {
+            if (!open.get()) {
+                return;
+            }
+            try {
+                callback.run();
+            } catch (RuntimeException ex) {
+                if (open.compareAndSet(true, false)) {
+                    log.warn("Run SSE 传输中断（event={}，conversation={}），继续完成 durable 生命周期，exceptionType={}",
+                            eventType, conversationId, ex.getClass().getSimpleName());
+                }
+            }
+        }
+    }
+
+    /**
      * 从 Active Path 投影模型可见消息：只展开路径上最后一个 Compaction 的
      * Summary（前缀消息）与 Retained Tail 原文，再加其后的新消息；
      * 被摘要覆盖的历史不再出现。
@@ -752,8 +987,12 @@ class ConversationRunCoordinator {
 
     private static AgentMessage messageOf(Entry entry) {
         return switch (entry.type()) {
-            case USER_MESSAGE -> new AgentMessage(
-                    AgentMessage.Role.USER, ((UserMessagePayload) entry.payload()).text());
+            case USER_MESSAGE -> {
+                UserMessagePayload payload = (UserMessagePayload) entry.payload();
+                String text = payload.action() == UserMessagePayload.Action.CONTINUE_GENERATION
+                        ? CONTINUATION_INSTRUCTION : payload.text();
+                yield new AgentMessage(AgentMessage.Role.USER, text);
+            }
             case ASSISTANT_MESSAGE -> new AgentMessage(
                     AgentMessage.Role.ASSISTANT,
                     AssistantContextRenderer.render((AssistantMessagePayload) entry.payload()));
@@ -829,6 +1068,11 @@ class ConversationRunCoordinator {
         }).map(CitationPayload.class::cast).toList();
     }
 
+    private static AssistantCompletionStatus mapCompletionStatus(AgentCompletionStatus status) {
+        return status == AgentCompletionStatus.INCOMPLETE_LENGTH
+                ? AssistantCompletionStatus.INCOMPLETE_LENGTH : AssistantCompletionStatus.COMPLETE;
+    }
+
     /** Conversation 只接收 Agent 已完成预算与身份核对的 Retrieved Source。 */
     private static List<RetrievedSourcePayload> mapRetrievedSources(List<AgentRetrievedSource> sources) {
         if (sources == null || sources.isEmpty()) {
@@ -861,6 +1105,23 @@ class ConversationRunCoordinator {
                     },
                     item.safeSummary(), item.stableErrorCode(), item.truncated());
         }).toList();
+    }
+
+    /** 手动继续时只保留新模型结果相对旧 Assistant 的新增后缀。 */
+    private static String appendOnlySuffix(String existing, String next) {
+        if (next == null || next.isEmpty()) {
+            return "";
+        }
+        if (existing == null || existing.isEmpty() || existing.endsWith(next)) {
+            return existing != null && existing.endsWith(next) ? "" : next;
+        }
+        int maximum = Math.min(existing.length(), next.length());
+        for (int length = maximum; length >= 8; length--) {
+            if (existing.regionMatches(existing.length() - length, next, 0, length)) {
+                return next.substring(length);
+            }
+        }
+        return next;
     }
 
     private static Entry findEntry(ConversationHistory history, UUID entryId) {

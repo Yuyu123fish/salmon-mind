@@ -3,6 +3,7 @@ package com.yuyu.salmonmind.conversation.domain;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
+import com.yuyu.salmonmind.conversation.api.AssistantCompletionStatus;
 import com.yuyu.salmonmind.conversation.api.CitationPayload;
 import com.yuyu.salmonmind.conversation.api.LocalCitationPayload;
 import com.yuyu.salmonmind.conversation.api.LocalRetrievedSourcePayload;
@@ -71,5 +72,18 @@ class AssistantContextRendererTest {
                 .contains("如需核验必须重新检索");
         assertThat(rendered).doesNotContain("C:\\private").doesNotContain("objects/secret");
         assertThat(rendered.length()).isLessThanOrEqualTo(4_200);
+    }
+
+    @Test
+    void marksLengthIncompleteAssistantInFutureModelContext() {
+        AssistantMessagePayload payload = new AssistantMessagePayload(
+                "截断的正文", UUID.randomUUID(), "provider", "model", null,
+                List.of(), List.of(), List.of(),
+                AssistantCompletionStatus.INCOMPLETE_LENGTH, null);
+
+        assertThat(AssistantContextRenderer.render(payload))
+                .contains("截断的正文")
+                .contains("回答未完成")
+                .contains("继续生成需由用户触发");
     }
 }

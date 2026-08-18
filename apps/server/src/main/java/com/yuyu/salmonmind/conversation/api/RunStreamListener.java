@@ -8,7 +8,7 @@ import java.util.UUID;
  *
  * <p>顺序合同：恰好一次 {@link #onRunStarted}；随后零或一次
  * {@link #onCompactionCompleted}，以及零到多次 reasoning、工具状态和回答事件；
- * 成功时恰好一次 {@link #onAssistantCompleted}；零或一次 {@link #onTitleUpdated}；
+ * 成功（包括 INCOMPLETE_LENGTH）时恰好一次 {@link #onAssistantCompleted}；零或一次 {@link #onTitleUpdated}；
  * 最后以 {@link #onRunCompleted} 或 {@link #onRunFailed} 恰好一次结束，
  * 终态事件之后不得再有业务事件。
  *
@@ -56,7 +56,7 @@ public interface RunStreamListener {
     ) {
     }
 
-    /** assistant_completed：完整且已持久化的 Assistant Entry。 */
+    /** assistant_completed：已持久化的 Assistant Entry，正文可以是自然完成或长度中断。 */
     record AssistantCompleted(UUID conversationId, Entry assistantEntry) {
     }
 

@@ -4,6 +4,7 @@ import com.alibaba.cloud.ai.graph.agent.interceptor.ToolCallHandler;
 import com.alibaba.cloud.ai.graph.agent.interceptor.ToolCallRequest;
 import com.alibaba.cloud.ai.graph.agent.interceptor.ToolCallResponse;
 import com.alibaba.cloud.ai.graph.agent.interceptor.ToolInterceptor;
+import com.alibaba.cloud.ai.graph.agent.tool.ToolCancelledException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yuyu.salmonmind.agent.api.AgentStreamListener;
@@ -45,10 +46,13 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
     /** 每次 Agent stream 独立的工具预算 metadata 键。 */
     static final String INVOCATION_BUDGET_METADATA_KEY = "salmon:agent:tool-budget";
     static final String RESULT_BUDGET_METADATA_KEY = "salmon:agent:tool-result-budget";
+    static final String GOVERNOR_METADATA_KEY = "salmon:agent:tool-governor";
     static final String LOCAL_SEARCH_ALLOWED_METADATA_KEY = "salmon:agent:local-search-allowed";
     static final String WEB_SEARCH_ALLOWED_METADATA_KEY = "salmon:agent:web-search-allowed";
     static final String TOOL_CALL_BUDGET_EXCEEDED = "TOOL_CALL_BUDGET_EXCEEDED";
     static final String TOOL_CONTEXT_BUDGET_EXCEEDED = "TOOL_CONTEXT_BUDGET_EXCEEDED";
+    static final String TOOL_CONCURRENCY_LIMIT_REACHED = "TOOL_CONCURRENCY_LIMIT_REACHED";
+    static final String TOOL_EXECUTION_TIMEOUT = "TOOL_EXECUTION_TIMEOUT";
     /** 保留旧包内命名，调用次数预算的稳定语义已单独命名。 */
     static final String TOOL_BUDGET_EXCEEDED = TOOL_CALL_BUDGET_EXCEEDED;
     private static final long MIN_TOOL_RESULT_TOKENS = 64L;
@@ -81,6 +85,10 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
     public ToolCallResponse interceptToolCall(ToolCallRequest request, ToolCallHandler handler) {
         AgentStreamListener listener = listenerOf(request);
         long startedNanos = System.nanoTime();
+        if (!runOpen(request)) {
+            return ToolCallResponse.error(
+                    request.getToolCallId(), request.getToolName(), "TOOL_EXECUTION_AFTER_RUN_TERMINAL");
+        }
         if (listener != null) {
             listener.onToolStarted(new AgentToolStarted(
                     request.getToolCallId(), request.getToolName(),
@@ -89,7 +97,7 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
         InvocationBudget budget = budgetOf(request);
         if (budget != null && !budget.tryAcquire()) {
             if (listener != null) {
-                listener.onToolFailed(new AgentToolFailed(
+                emitToolFailed(listener, new AgentToolFailed(
                         request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
                         TOOL_CALL_BUDGET_EXCEEDED, "已达到本轮工具调用上限"));
             }
@@ -98,7 +106,7 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
         }
         if (isLocalTool(request.getToolName()) && !localSearchAllowed(request)) {
             if (listener != null) {
-                listener.onToolFailed(new AgentToolFailed(
+                emitToolFailed(listener, new AgentToolFailed(
                         request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
                         "LOCAL_SEARCH_DISABLED", "用户已禁止本地检索"));
             }
@@ -107,7 +115,7 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
         }
         if (isWebTool(request.getToolName()) && !webSearchAllowed(request)) {
             if (listener != null) {
-                listener.onToolFailed(new AgentToolFailed(
+                emitToolFailed(listener, new AgentToolFailed(
                         request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
                         "WEB_SEARCH_DISABLED", "用户已禁止联网"));
             }
@@ -118,7 +126,7 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
         ToolResultBudget.Reservation reservation = resultBudget == null ? null : resultBudget.reserve();
         if (resultBudget != null && reservation == null) {
             if (listener != null) {
-                listener.onToolFailed(new AgentToolFailed(
+                emitToolFailed(listener, new AgentToolFailed(
                         request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
                         TOOL_CONTEXT_BUDGET_EXCEEDED, "已达到本轮工具结果上下文预算"));
             }
@@ -126,14 +134,38 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             return ToolCallResponse.error(request.getToolCallId(), request.getToolName(),
                     TOOL_CONTEXT_BUDGET_RESULT);
         }
+        ToolExecutionGovernor governor = governorOf(request);
+        ToolExecutionGovernor.Permit permit = governor == null ? null : governor.tryAcquire(request.getToolName());
+        if (governor != null && permit == null) {
+            if (resultBudget != null) {
+                resultBudget.cancel(reservation);
+            }
+            if (listener != null) {
+                emitToolFailed(listener, new AgentToolFailed(
+                        request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
+                        TOOL_CONCURRENCY_LIMIT_REACHED, "当前工具并发已达到上限"));
+            }
+            return ToolCallResponse.error(request.getToolCallId(), request.getToolName(),
+                    "TOOL_CONCURRENCY_LIMIT_REACHED");
+        }
         try {
-            BoundResult bounded = boundResultSize(handler.call(request), request, resultBudget, reservation);
+            ToolCallResponse raw = handler.call(request);
+            // ReactAgent 正式 timeout 可能让框架先收束，而同步 Tool 线程稍后才返回；
+            // 终态 Fence 关闭后不再触碰 Source Registry、预算或 SSE。
+            if (!runOpen(request)) {
+                if (resultBudget != null) {
+                    resultBudget.cancel(reservation);
+                }
+                return ToolCallResponse.error(
+                        request.getToolCallId(), request.getToolName(), "TOOL_EXECUTION_AFTER_RUN_TERMINAL");
+            }
+            BoundResult bounded = boundResultSize(raw, request, resultBudget, reservation);
             if (bounded.budgetExceeded()) {
                 if (resultBudget != null) {
                     resultBudget.cancel(reservation);
                 }
                 if (listener != null) {
-                    listener.onToolFailed(new AgentToolFailed(
+                    emitToolFailed(listener, new AgentToolFailed(
                             request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
                             TOOL_CONTEXT_BUDGET_EXCEEDED, "工具结果超过本轮上下文预算"));
                 }
@@ -142,7 +174,7 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             }
             if (resultBudget != null && !resultBudget.commit(reservation, bounded.estimatedTokens())) {
                 if (listener != null) {
-                    listener.onToolFailed(new AgentToolFailed(
+                    emitToolFailed(listener, new AgentToolFailed(
                             request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
                             TOOL_CONTEXT_BUDGET_EXCEEDED, "工具结果超过本轮上下文预算"));
                 }
@@ -154,12 +186,13 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             long durationMillis = elapsedMillis(startedNanos);
             if (listener != null) {
                 if (response.isError() || isStructuredUnavailable(response.getResult())) {
-                    String errorCode = stableErrorCode(response);
-                    listener.onToolFailed(new AgentToolFailed(
+                    String errorCode = isTimeoutResponse(response)
+                            ? TOOL_EXECUTION_TIMEOUT : stableErrorCode(response);
+                    emitToolFailed(listener, new AgentToolFailed(
                             response.getToolCallId(), response.getToolName(), durationMillis,
                             errorCode, safeFailureSummary(errorCode)));
                 } else {
-                    listener.onToolCompleted(new AgentToolCompleted(
+                    emitToolCompleted(listener, new AgentToolCompleted(
                             response.getToolCallId(), response.getToolName(), durationMillis,
                             source == null ? null : source.provider(), source == null ? 0 : source.sourceCount(),
                             source != null && source.truncated(), source != null && source.degraded()));
@@ -172,15 +205,37 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             }
             // 与框架 ToolErrorInterceptor 同款模式：异常转错误结果，保持循环单终态
             if (listener != null) {
-                listener.onToolFailed(new AgentToolFailed(
+                String errorCode = isTimeout(ex) ? TOOL_EXECUTION_TIMEOUT : ERROR_CODE_TOOL_EXECUTION_FAILED;
+                emitToolFailed(listener, new AgentToolFailed(
                         request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
-                        ERROR_CODE_TOOL_EXECUTION_FAILED, safeFailureSummary(ERROR_CODE_TOOL_EXECUTION_FAILED)));
+                        errorCode, safeFailureSummary(errorCode)));
             }
-            return ToolCallResponse.error(request.getToolCallId(), request.getToolName(), ex);
+            String errorCode = isTimeout(ex) ? TOOL_EXECUTION_TIMEOUT : ERROR_CODE_TOOL_EXECUTION_FAILED;
+            return ToolCallResponse.error(request.getToolCallId(), request.getToolName(), errorCode);
+        } finally {
+            if (permit != null) {
+                permit.close();
+            }
         }
     }
 
     /** 从当前 ToolCallRequest 的执行上下文 config 中取回挂载的监听器；未挂载返回 null。 */
+    private static void emitToolCompleted(AgentStreamListener listener, AgentToolCompleted event) {
+        if (listener instanceof RunTraceCollector trace) {
+            trace.onToolCompletedOrdered(event, trace.reserveTerminalSequence(event.toolCallId()));
+        } else {
+            listener.onToolCompleted(event);
+        }
+    }
+
+    private static void emitToolFailed(AgentStreamListener listener, AgentToolFailed event) {
+        if (listener instanceof RunTraceCollector trace) {
+            trace.onToolFailedOrdered(event, trace.reserveTerminalSequence(event.toolCallId()));
+        } else {
+            listener.onToolFailed(event);
+        }
+    }
+
     private static AgentStreamListener listenerOf(ToolCallRequest request) {
         return request.getExecutionContext()
                 .flatMap(context -> context.config().metadata(LISTENER_METADATA_KEY))
@@ -330,6 +385,12 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                 : status;
     }
 
+    /** 框架超时会被转换成 error response，不能只依赖拦截器捕获的异常。 */
+    private static boolean isTimeoutResponse(ToolCallResponse response) {
+        return containsTimeoutMarker(response.getResult())
+                || containsTimeoutMarker(response.getStatus());
+    }
+
     /** 本地 Knowledge Tool 以结构化内容返回可理解失败，不能被误报成成功工具调用。 */
     private static boolean isStructuredUnavailable(String result) {
         return result != null && result.stripLeading().startsWith("{\"status\":\"UNAVAILABLE\"");
@@ -377,6 +438,46 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                 .orElse(null);
     }
 
+    private static ToolExecutionGovernor governorOf(ToolCallRequest request) {
+        return request.getExecutionContext()
+                .flatMap(context -> context.config().metadata(GOVERNOR_METADATA_KEY))
+                .filter(ToolExecutionGovernor.class::isInstance)
+                .map(ToolExecutionGovernor.class::cast)
+                .orElse(null);
+    }
+
+    private static boolean runOpen(ToolCallRequest request) {
+        return request.getExecutionContext()
+                .flatMap(context -> context.config().metadata(LISTENER_METADATA_KEY))
+                .filter(RunTraceCollector.class::isInstance)
+                .map(RunTraceCollector.class::cast)
+                .map(trace -> trace.isOpen() && !trace.isToolTerminal(request.getToolCallId()))
+                .orElse(true);
+    }
+
+    private static boolean isTimeout(Throwable error) {
+        Throwable current = error;
+        while (current != null) {
+            if (current instanceof java.util.concurrent.TimeoutException
+                    || current instanceof java.util.concurrent.CancellationException
+                    || current instanceof InterruptedException
+                    || current instanceof ToolCancelledException
+                    || containsTimeoutMarker(current.getMessage())) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private static boolean containsTimeoutMarker(String message) {
+        if (message == null || message.isBlank()) {
+            return false;
+        }
+        String normalized = message.toLowerCase(java.util.Locale.ROOT);
+        return normalized.contains("timed out") || normalized.contains("timeout");
+    }
+
 
     private record BoundResult(
             ToolCallResponse response,
@@ -418,6 +519,8 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             case "WEB_SEARCH_FAILED", "WEB_SEARCH_PROVIDER_FAILED", "RETRIEVAL_UNAVAILABLE" -> "检索服务暂不可用";
             case TOOL_CALL_BUDGET_EXCEEDED -> "已达到本轮工具调用上限";
             case TOOL_CONTEXT_BUDGET_EXCEEDED -> "已达到本轮工具结果上下文预算";
+            case TOOL_CONCURRENCY_LIMIT_REACHED -> "当前工具并发已达到上限";
+            case TOOL_EXECUTION_TIMEOUT -> "工具执行超时";
             default -> "工具执行失败";
         };
     }

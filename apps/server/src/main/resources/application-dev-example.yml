@@ -32,6 +32,18 @@ salmon:
       hl: zh-cn
       safe: active
   agent:
+    # 可选：Checkpoint 四类 Key 的滑动 Lease，默认 24h，修改后重启后端生效
+    checkpoint:
+      ttl: 24h
+      cleanup-max-attempts: 3
+    continuation:
+      max-auto-attempts: 2
+      max-cumulative-output-tokens: 131072
+      timeout: 120s
+    parallel:
+      max-concurrent-tools: 2
+      max-concurrent-per-web-provider: 1
+      tool-execution-timeout: 60s
     # 可选：一次主调用内所有工具结果的累计 token 上限；默认 32768，修改后重启后端生效
     max-tool-result-tokens-per-run: 32768
     # 可选：一次 Agent Loop 的模型调用硬上限；默认 32，修改后重启后端生效
@@ -45,6 +57,10 @@ salmon:
       endpoint: http://127.0.0.1:9000
       access-key: salmonmind
       secret-key: salmonmind-local-change-me
+    worker:
+      cleanup-max-attempts: 3
+      cleanup-interval: 30s
+      cleanup-batch-size: 64
       bucket: salmon-knowledge
       region: us-east-1
     search:

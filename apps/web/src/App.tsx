@@ -17,6 +17,7 @@ import {
   fetchConversation,
   fetchConversations,
   streamRetry,
+  streamContinue,
   streamSend,
   type CitationPayload,
   type ConversationDetail,
@@ -569,6 +570,23 @@ function App() {
     await startRun(id, drafts[id] ?? '', (listener) => streamRetry(id, pending.id, listener))
   }, [selectedId, runStates, caches, drafts, startRun, restoreFollow])
 
+  const handleContinue = useCallback(async () => {
+    const id = selectedId
+    const detail = id === null ? undefined : caches[id]
+    const leaf = detail?.activePath.at(-1)
+    if (
+      id === null ||
+      leaf === undefined ||
+      leaf.type !== 'ASSISTANT_MESSAGE' ||
+      leaf.payload.completionStatus !== 'INCOMPLETE_LENGTH' ||
+      isActiveRun(runStates[id])
+    ) {
+      return
+    }
+    restoreFollow('auto')
+    await startRun(id, '', (listener) => streamContinue(id, leaf.id, listener))
+  }, [selectedId, caches, runStates, startRun, restoreFollow])
+
   // Enter 发送、Shift+Enter 换行；输入法组合中不触发发送
   const handleKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -762,6 +780,9 @@ function App() {
                       <MessageEntry
                         key={entry.id}
                         entry={entry}
+                        isCurrentLeaf={entry.id === selectedDetail!.conversation.activeLeafEntryId}
+                        continueDisabled={running}
+                        onContinue={handleContinue}
                         traceExpanded={controlsCurrentRun ? selectedRun.traceExpanded : undefined}
                         traceRunning={controlsCurrentRun && running}
                         onTraceToggle={controlsCurrentRun ? toggleSelectedTrace : undefined}
@@ -852,12 +873,18 @@ function App() {
 
 function MessageEntry({
   entry,
+  isCurrentLeaf,
+  continueDisabled,
+  onContinue,
   traceExpanded,
   traceRunning = false,
   onTraceToggle,
   onTraceLayoutChange,
 }: {
   entry: Entry
+  isCurrentLeaf: boolean
+  continueDisabled: boolean
+  onContinue: () => void
   traceExpanded?: boolean
   traceRunning?: boolean
   onTraceToggle?: () => void
@@ -867,7 +894,9 @@ function MessageEntry({
     return (
       <div className="msg-row user">
         <div className="bubble user-bubble">
-          <p className="bubble-text">{entry.payload.text}</p>
+          <p className="bubble-text">
+            {entry.payload.action === 'CONTINUE_GENERATION' ? '继续生成' : entry.payload.text}
+          </p>
           <time>{formatTimeShort(entry.createdAt)}</time>
         </div>
       </div>
@@ -898,6 +927,16 @@ function MessageEntry({
               />
             )}
           </AssistantEvidenceView>
+          {entry.payload.completionStatus === 'INCOMPLETE_LENGTH' && (
+            <div className="incomplete-answer" role="status">
+              <span>回答未完成</span>
+              {isCurrentLeaf && (
+                <button type="button" onClick={onContinue} disabled={continueDisabled}>
+                  继续生成
+                </button>
+              )}
+            </div>
+          )}
           <p className="model-line">
             {entry.payload.model ?? '模型'} · {formatTimeShort(entry.createdAt)}
           </p>

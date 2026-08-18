@@ -19,7 +19,7 @@ import java.util.List;
  * 生产 Agent 的唯一 Knowledge Tool Adapter。它只解析一个 query 参数并把有界结果
  * 序列化给模型；正文是外部资料，不能改变系统策略或获得额外权限。
  */
-final class LocalKnowledgeToolCallback implements ToolCallback {
+final class LocalKnowledgeToolCallback implements ParallelSafeToolCallback {
 
     static final String NAME = "search_local_knowledge";
     private static final int MAX_EVIDENCES = 5;

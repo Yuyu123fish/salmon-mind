@@ -23,6 +23,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException.AgentErrorCode;
 import com.yuyu.salmonmind.agent.api.AgentCitation;
+import com.yuyu.salmonmind.agent.api.AgentCompletionStatus;
 import com.yuyu.salmonmind.agent.api.AgentLocalCitation;
 import com.yuyu.salmonmind.agent.api.AgentLocalRetrievedSource;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
@@ -399,6 +400,67 @@ class ConversationModuleIntegrationTest {
     }
 
     @Test
+    void continuesIncompleteAssistantAsTraceableAppendOnlyRun() throws Exception {
+        UUID conv = createId();
+        AGENT.scriptResults(List.of(
+                new AgentResult("首段正文内容已输出。", "test-provider", "test-model", null,
+                        List.of(), List.of(), List.of(), AgentCompletionStatus.INCOMPLETE_LENGTH, null),
+                new AgentResult("后续正文", "test-provider", "test-model", null,
+                        List.of(), List.of(), List.of(), AgentCompletionStatus.COMPLETE, null)));
+
+        List<SseEvent> first = postSse(
+                "/api/conversations/" + conv + "/messages", Map.of("text", "请写长文"));
+        assertThat(first).extracting(SseEvent::event)
+                .contains("assistant_completed", "run_completed")
+                .doesNotContain("run_failed");
+        Map<String, Object> firstAssistant = entryOf(first.stream()
+                .filter(event -> event.event.equals("assistant_completed"))
+                .findFirst().orElseThrow().data.get("assistantEntry"));
+        assertThat(payloadOf(firstAssistant))
+                .containsEntry("text", "首段正文内容已输出。")
+                .containsEntry("completionStatus", "INCOMPLETE_LENGTH");
+        Map<String, Object> firstRun = (Map<String, Object>) first.stream()
+                .filter(event -> event.event.equals("run_completed"))
+                .findFirst().orElseThrow().data.get("run");
+        assertThat(firstRun).containsEntry("status", "SUCCEEDED")
+                .containsEntry("resultStatus", "INCOMPLETE_LENGTH")
+                .containsEntry("errorCode", null);
+
+        List<SseEvent> continued = postSse(
+                "/api/conversations/" + conv + "/entries/" + firstAssistant.get("id") + "/continue", null);
+        assertThat(continued).extracting(SseEvent::event)
+                .containsExactly("run_started", "assistant_delta", "assistant_completed", "run_completed");
+        Map<String, Object> action = entryOf(continued.get(0).data.get("userEntry"));
+        assertThat(action).containsEntry("parentId", firstAssistant.get("id"));
+        assertThat(payloadOf(action)).containsEntry("action", "CONTINUE_GENERATION")
+                .containsEntry("sourceAssistantEntryId", firstAssistant.get("id"));
+        assertThat(messagesOf(agentRequest(1)).get(2).text())
+                .isEqualTo("请从上一次输出中断的位置继续生成。不要复述已经输出的内容，只输出新增正文。");
+
+        Map<String, Object> appendedAssistant = entryOf(continued.stream()
+                .filter(event -> event.event.equals("assistant_completed"))
+                .findFirst().orElseThrow().data.get("assistantEntry"));
+        assertThat(payloadOf(appendedAssistant)).containsEntry("text", "后续正文")
+                .containsEntry("completionStatus", "COMPLETE");
+        assertThat(appendedAssistant.get("parentId")).isEqualTo(action.get("id"));
+        Map<String, Object> finalRun = (Map<String, Object>) continued.stream()
+                .filter(event -> event.event.equals("run_completed"))
+                .findFirst().orElseThrow().data.get("run");
+        assertThat(finalRun).containsEntry("status", "SUCCEEDED")
+                .containsEntry("resultStatus", "COMPLETE");
+
+        Map<String, Object> detail = open(conv.toString());
+        List<?> path = (List<?>) detail.get("activePath");
+        assertThat(path).hasSize(4);
+        assertThat(path.stream().map(this::entryOf)
+                .filter(entry -> "USER_MESSAGE".equals(entry.get("type")))
+                .map(entry -> payloadOf(entry).get("action"))
+                .toList()).containsExactly("MESSAGE", "CONTINUE_GENERATION");
+        assertThat(payloadOf(entryOf(path.get(1))).get("text"))
+                .isEqualTo("首段正文内容已输出。");
+    }
+
+    @Test
     void compactsAtThresholdBoundaryWithCurrentUserAndReestimates() throws Exception {
         UUID conv = createId();
         postSse("/api/conversations/" + conv + "/messages", Map.of("text", "你好"));
@@ -666,6 +728,23 @@ class ConversationModuleIntegrationTest {
         assertThat((List<?>) detail.get("activePath")).hasSize(2);
     }
 
+    /** run_started 写出失败也不能阻止 Agent 执行，否则 durable RUNNING 会悬挂。 */
+    @Test
+    void transportFailureInRunStartedDoesNotLeaveRunningRun() {
+        UUID conv = conversationService.create().id();
+        TransportFailureListener listener = new TransportFailureListener(
+                jdbcTemplate, conv, true, false, false);
+
+        conversationService.send(conv, "你好", listener);
+
+        assertThat(listener.threwInCallback).isTrue();
+        assertThat(listener.failedEventSeen).isFalse();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM conversation_runs WHERE conversation_id = ?",
+                String.class, conv)).isEqualTo("SUCCEEDED");
+        assertThat(open(conv.toString()).get("pendingRun")).isNull();
+    }
+
     /**
      * 模拟成功事件写出失败的监听器：在指定回调中查询数据库（证明 SSE 发生在事务提交后），
      * 然后抛 RuntimeException 模拟传输中断；不实现任何断言逻辑，只记录事实。
@@ -674,6 +753,7 @@ class ConversationModuleIntegrationTest {
 
         private final JdbcTemplate jdbc;
         private final UUID conversationId;
+        private final boolean failAtRunStarted;
         private final boolean failAtAssistantCompleted;
         private final boolean failAtRunCompleted;
 
@@ -686,14 +766,26 @@ class ConversationModuleIntegrationTest {
                 JdbcTemplate jdbc, UUID conversationId,
                 boolean failAtAssistantCompleted, boolean failAtRunCompleted
         ) {
+            this(jdbc, conversationId, false, failAtAssistantCompleted, failAtRunCompleted);
+        }
+
+        TransportFailureListener(
+                JdbcTemplate jdbc, UUID conversationId,
+                boolean failAtRunStarted, boolean failAtAssistantCompleted, boolean failAtRunCompleted
+        ) {
             this.jdbc = jdbc;
             this.conversationId = conversationId;
+            this.failAtRunStarted = failAtRunStarted;
             this.failAtAssistantCompleted = failAtAssistantCompleted;
             this.failAtRunCompleted = failAtRunCompleted;
         }
 
         @Override
         public void onRunStarted(RunStarted event) {
+            if (failAtRunStarted) {
+                threwInCallback = true;
+                throw new RuntimeException("模拟 run_started 写出失败");
+            }
         }
 
         @Override
@@ -974,6 +1066,7 @@ class ConversationModuleIntegrationTest {
         private volatile List<AgentCitation> citations = List.of();
         private volatile List<AgentRetrievedSource> retrievedSources = List.of();
         private volatile List<AgentRunTraceItem> trace = List.of();
+        private volatile List<AgentResult> scriptedResults = List.of();
 
         @Override
         public void stream(AgentRequest request, AgentStreamListener listener) {
@@ -1028,10 +1121,17 @@ class ConversationModuleIntegrationTest {
                             "TEST", 2, item.truncated(), false));
                 }
             }
-            listener.onDelta("测试");
-            listener.onDelta("回答");
-            listener.onComplete(new AgentResult(
-                    "测试回答", "test-provider", "test-model", usage, citations, retrievedSources, trace));
+            List<AgentResult> scripted = scriptedResults;
+            if (index < scripted.size()) {
+                AgentResult result = scripted.get(index);
+                listener.onDelta(result.text());
+                listener.onComplete(result);
+            } else {
+                listener.onDelta("测试");
+                listener.onDelta("回答");
+                listener.onComplete(new AgentResult(
+                        "测试回答", "test-provider", "test-model", usage, citations, retrievedSources, trace));
+            }
         }
 
         @Override
@@ -1102,6 +1202,10 @@ class ConversationModuleIntegrationTest {
             trace = nextTrace == null ? List.of() : List.copyOf(nextTrace);
         }
 
+        void scriptResults(List<AgentResult> nextResults) {
+            scriptedResults = nextResults == null ? List.of() : List.copyOf(nextResults);
+        }
+
         void reset() {
             requests.clear();
             summaryRequests.clear();
@@ -1116,6 +1220,7 @@ class ConversationModuleIntegrationTest {
             citations = List.of();
             retrievedSources = List.of();
             trace = List.of();
+            scriptedResults = List.of();
         }
     }
 }

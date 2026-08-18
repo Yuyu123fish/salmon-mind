@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
+import com.yuyu.salmonmind.conversation.api.AssistantCompletionStatus;
 import com.yuyu.salmonmind.conversation.api.CitationPayload;
 import com.yuyu.salmonmind.conversation.api.CompactionPayload;
 import com.yuyu.salmonmind.conversation.api.Entry;
@@ -99,6 +100,10 @@ class JsonlCodec {
                 ObjectNode node = mapper.createObjectNode();
                 node.put("text", p.text());
                 node.put("runId", p.runId().toString());
+                if (p.action() != UserMessagePayload.Action.MESSAGE) {
+                    node.put("action", p.action().name());
+                    node.put("sourceAssistantEntryId", p.sourceAssistantEntryId().toString());
+                }
                 yield node;
             }
             case AssistantMessagePayload p -> {
@@ -107,6 +112,12 @@ class JsonlCodec {
                 node.put("runId", p.runId().toString());
                 node.put("provider", p.provider());
                 node.put("model", p.model());
+                if (p.completionStatus() != AssistantCompletionStatus.COMPLETE) {
+                    node.put("completionStatus", p.completionStatus().name());
+                }
+                if (p.completionDetailCode() != null && !p.completionDetailCode().isBlank()) {
+                    node.put("completionDetailCode", p.completionDetailCode());
+                }
                 if (p.usage() != null) {
                     node.set("usage", encodeUsage(p.usage()));
                 }
@@ -194,15 +205,17 @@ class JsonlCodec {
 
     private EntryPayload decodePayload(Entry.EntryType type, JsonNode node) {
         return switch (type) {
-            case USER_MESSAGE -> new UserMessagePayload(text(node, "text"), uuid(node, "runId"));
+            case USER_MESSAGE -> decodeUserPayload(node);
             case ASSISTANT_MESSAGE -> {
                 TokenUsage usage = node.hasNonNull("usage") ? decodeUsage(node.get("usage")) : null;
                 List<CitationPayload> citations = decodeCitations(node.get("citations"));
                 List<RetrievedSourcePayload> retrievedSources = decodeRetrievedSources(node.get("retrievedSources"));
                 List<RunTraceItemPayload> trace = decodeTrace(node.get("trace"));
+                AssistantCompletionStatus completionStatus = completionStatus(node);
                 yield new AssistantMessagePayload(
                         text(node, "text"), uuid(node, "runId"), text(node, "provider"), text(node, "model"),
-                        usage, citations, retrievedSources, trace);
+                        usage, citations, retrievedSources, trace, completionStatus,
+                        node.hasNonNull("completionDetailCode") ? text(node, "completionDetailCode") : null);
             }
             case COMPACTION -> {
                 TokenUsage usage = node.hasNonNull("usage") ? decodeUsage(node.get("usage")) : null;
@@ -264,6 +277,35 @@ class JsonlCodec {
             }
         }
         return node;
+    }
+
+    private UserMessagePayload decodeUserPayload(JsonNode node) {
+        UserMessagePayload.Action action;
+        try {
+            action = node.hasNonNull("action")
+                    ? UserMessagePayload.Action.valueOf(text(node, "action"))
+                    : UserMessagePayload.Action.MESSAGE;
+        } catch (IllegalArgumentException ex) {
+            throw corrupted("user payload 的 action 无效");
+        }
+        UUID source = node.hasNonNull("sourceAssistantEntryId")
+                ? uuid(node, "sourceAssistantEntryId") : null;
+        try {
+            return new UserMessagePayload(text(node, "text"), uuid(node, "runId"), action, source);
+        } catch (IllegalArgumentException ex) {
+            throw corrupted("user payload 的 action/source 组合无效");
+        }
+    }
+
+    private AssistantCompletionStatus completionStatus(JsonNode node) {
+        if (!node.hasNonNull("completionStatus")) {
+            return AssistantCompletionStatus.COMPLETE;
+        }
+        try {
+            return AssistantCompletionStatus.valueOf(text(node, "completionStatus"));
+        } catch (IllegalArgumentException ex) {
+            throw corrupted("assistant payload 的 completionStatus 无效");
+        }
     }
 
     private ObjectNode encodeTraceItem(RunTraceItemPayload item) {

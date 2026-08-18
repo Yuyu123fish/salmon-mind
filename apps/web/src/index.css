@@ -822,6 +822,24 @@ button {
   background: rgba(143, 58, 50, 0.06);
 }
 
+.incomplete-answer {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin-top: 0.8rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.incomplete-answer button {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.3rem 0.7rem;
+  background: var(--paper);
+  color: var(--ink);
+  cursor: pointer;
+}
+
 .retry-text {
   margin: 0;
   color: var(--bad);

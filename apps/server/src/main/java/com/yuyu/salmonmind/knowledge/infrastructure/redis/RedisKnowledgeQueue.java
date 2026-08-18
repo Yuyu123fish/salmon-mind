@@ -6,6 +6,7 @@ import com.yuyu.salmonmind.persistence.redis.RedisClientProvider;
 import com.yuyu.salmonmind.persistence.redis.RedisClientUnavailableException;
 import org.redisson.api.AutoClaimResult;
 import org.redisson.api.PendingEntry;
+import org.redisson.api.RSet;
 import org.redisson.api.RStream;
 import org.redisson.api.StreamMessageId;
 import org.redisson.api.stream.StreamAddArgs;
@@ -16,9 +17,14 @@ import org.springframework.stereotype.Component;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -30,22 +36,31 @@ class RedisKnowledgeQueue implements KnowledgeQueuePort {
 
     static final String STREAM_KEY = "salmon:knowledge:ingestion";
     static final String GROUP = "salmon-knowledge-workers";
+    private static final String CLEANUP_PENDING_SUFFIX = ":cleanup-pending";
 
     private final RedisClientProvider redisClientProvider;
     private final String configuredStream;
     private final String configuredGroup;
+    private final int cleanupMaxAttempts;
+    private final ConcurrentLinkedQueue<String> cleanupPending = new ConcurrentLinkedQueue<>();
 
     private volatile RStream<String, String> stream;
+    private volatile RSet<String> cleanupPendingSet;
     private volatile boolean groupReady;
 
     RedisKnowledgeQueue(
             RedisClientProvider redisClientProvider,
             @Value("${salmon.knowledge.queue.stream:" + STREAM_KEY + "}") String configuredStream,
-            @Value("${salmon.knowledge.queue.group:" + GROUP + "}") String configuredGroup
+            @Value("${salmon.knowledge.queue.group:" + GROUP + "}") String configuredGroup,
+            @Value("${salmon.knowledge.worker.cleanup-max-attempts:3}") int cleanupMaxAttempts
     ) {
         this.redisClientProvider = redisClientProvider;
         this.configuredStream = configuredStream;
         this.configuredGroup = configuredGroup;
+        if (cleanupMaxAttempts < 1 || cleanupMaxAttempts > 5) {
+            throw new IllegalArgumentException("Knowledge 消息清理重试次数必须在 1 到 5 之间");
+        }
+        this.cleanupMaxAttempts = cleanupMaxAttempts;
     }
 
     @Override
@@ -106,6 +121,153 @@ class RedisKnowledgeQueue implements KnowledgeQueuePort {
         }
     }
 
+    @Override
+    public Settlement settle(String messageId) {
+        // 先把清理意图写入 Redis 持久集合，覆盖 XACK 成功后进程在 XDEL 前崩溃的窗口。
+        // 标记写不进去时不执行 XACK，让消息继续保持 Pending 并由下一轮恢复。
+        if (!rememberCleanup(messageId)) {
+            throw unavailable(new IllegalStateException("无法持久化 Knowledge 清理标记"));
+        }
+        // XACK 是业务提交点之后的第一步；失败时必须保留 Pending，不能继续 XDEL。
+        acknowledge(messageId);
+        boolean deleted = false;
+        for (int attempt = 0; attempt < cleanupMaxAttempts; attempt++) {
+            try {
+                stream().remove(parseMessageId(messageId));
+                deleted = true;
+                break;
+            } catch (RedisClientUnavailableException | RedisException ex) {
+                resetConnectionState();
+            }
+        }
+        if (!deleted) {
+            // XACK 已完成，不能把消息重新当作业务失败；持久标记供后续 janitor 重试 XDEL。
+        } else {
+            forgetCleanup(messageId);
+        }
+        return new Settlement(true, deleted);
+    }
+
+    @Override
+    public List<CleanupCandidate> cleanupCandidates(int limit) {
+        int maximum = Math.max(1, Math.min(limit, 256));
+        Set<String> candidates = new LinkedHashSet<>();
+        for (int i = 0; i < maximum; i++) {
+            String messageId = cleanupPending.poll();
+            if (messageId == null) {
+                break;
+            }
+            candidates.add(messageId);
+        }
+        if (candidates.size() < maximum) {
+            try {
+                Iterator<String> iterator = cleanupPendingSet().iterator(maximum - candidates.size());
+                while (iterator.hasNext() && candidates.size() < maximum) {
+                    candidates.add(iterator.next());
+                }
+            } catch (RuntimeException ex) {
+                // Redis 暂时不可用时仍先处理本地兜底队列；持久集合会在下一轮重试。
+                resetConnectionState();
+            }
+        }
+        List<CleanupCandidate> result = new ArrayList<>();
+        for (String messageId : candidates) {
+            result.add(readCleanupCandidate(messageId));
+        }
+        return List.copyOf(result);
+    }
+
+    @Override
+    public List<String> cleanupAcked(Collection<String> messageIds) {
+        Set<String> candidates = new LinkedHashSet<>(messageIds);
+        if (candidates.size() > 256) {
+            candidates = new LinkedHashSet<>(candidates.stream().limit(256).toList());
+        }
+        List<String> remaining = new ArrayList<>();
+        for (String messageId : candidates) {
+            boolean deleted = false;
+            boolean pending = false;
+            for (int attempt = 0; attempt < cleanupMaxAttempts; attempt++) {
+                try {
+                    if (!stream().listPending(configuredGroup, parseMessageId(messageId),
+                            parseMessageId(messageId), 1).isEmpty()) {
+                        pending = true;
+                        break;
+                    }
+                    stream().remove(parseMessageId(messageId));
+                    deleted = true;
+                    break;
+                } catch (RedisClientUnavailableException | RedisException ex) {
+                    resetConnectionState();
+                }
+            }
+            if (pending || !deleted) {
+                remaining.add(messageId);
+            } else {
+                forgetCleanup(messageId);
+            }
+        }
+        remaining.forEach(cleanupPending::offer);
+        return List.copyOf(remaining);
+    }
+
+    @Override
+    public List<String> cleanupAcked(int limit) {
+        return cleanupAcked(cleanupCandidates(limit).stream()
+                .map(CleanupCandidate::messageId)
+                .toList());
+    }
+
+    /**
+     * 在 XACK 前登记清理意图。持久集合是进程重启后的权威候选来源，本地队列只用于减少当前
+     * 进程的等待；因此 Redis 集合写失败时返回 false，调用方不得继续 XACK。
+     */
+    private boolean rememberCleanup(String messageId) {
+        try {
+            cleanupPendingSet().add(messageId);
+            cleanupPending.offer(messageId);
+            return true;
+        } catch (RuntimeException ex) {
+            resetConnectionState();
+            return false;
+        }
+    }
+
+    /** 删除已经完成的清理标记；删除失败只留下可再次处理的幂等候选。 */
+    private void forgetCleanup(String messageId) {
+        cleanupPending.remove(messageId);
+        try {
+            cleanupPendingSet().remove(messageId);
+        } catch (RuntimeException ex) {
+            resetConnectionState();
+        }
+    }
+
+    private CleanupCandidate readCleanupCandidate(String messageId) {
+        Map<StreamMessageId, Map<String, String>> entries = stream().range(
+                parseMessageId(messageId), parseMessageId(messageId));
+        if (entries.isEmpty()) {
+            return new CleanupCandidate(messageId, null, -1);
+        }
+        Map<String, String> values = entries.values().iterator().next();
+        try {
+            return new CleanupCandidate(messageId,
+                    UUID.fromString(values.get("jobId")),
+                    Integer.parseInt(values.get("attempt")));
+        } catch (RuntimeException ex) {
+            // 只能由已登记过的坏消息进入这里；没有可验证的 Job 身份时按不存在 Job 处理，
+            // 但仍需先通过 Pending 检查，避免误删尚未 ACK 的消息。
+            return new CleanupCandidate(messageId, null, -1);
+        }
+    }
+
+    private RSet<String> cleanupPendingSet() {
+        if (cleanupPendingSet == null) {
+            cleanupPendingSet = redisClientProvider.client().getSet(configuredStream + CLEANUP_PENDING_SUFFIX);
+        }
+        return cleanupPendingSet;
+    }
+
     private synchronized void ensureGroup() {
         if (groupReady) {
             return;
@@ -142,6 +304,7 @@ class RedisKnowledgeQueue implements KnowledgeQueuePort {
     private synchronized void resetConnectionState() {
         groupReady = false;
         stream = null;
+        cleanupPendingSet = null;
     }
 
     private List<QueueMessage> convert(Map<StreamMessageId, Map<String, String>> messages, boolean reclaimed) {

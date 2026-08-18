@@ -7,6 +7,7 @@ import com.yuyu.salmonmind.knowledge.application.port.DocumentParserPort;
 import com.yuyu.salmonmind.knowledge.application.port.EvidenceIndexPort;
 import com.yuyu.salmonmind.knowledge.application.port.KnowledgeQueuePort;
 import com.yuyu.salmonmind.persistence.redis.RedissonClientProvider;
+import org.redisson.api.StreamMessageId;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -63,6 +64,9 @@ class KnowledgeInfrastructureGateIntegrationTest {
     @Autowired
     private KnowledgeQueuePort queue;
 
+    @Autowired
+    private RedissonClientProvider redisClientProvider;
+
     @DynamicPropertySource
     static void infrastructureProperties(DynamicPropertyRegistry registry) {
         registry.add("salmon.redis.url", () -> "redis://" + REDIS.getHost() + ":" + REDIS.getMappedPort(6379));
@@ -86,6 +90,25 @@ class KnowledgeInfrastructureGateIntegrationTest {
         assertThat(reclaimed).singleElement().extracting(KnowledgeQueuePort.QueueMessage::messageId)
                 .isEqualTo(messageId);
         queue.acknowledge(messageId);
+    }
+
+    @Test
+    void settleAcksAndDeletesOnlyTheCompletedStreamMessage() {
+        UUID jobId = UUID.randomUUID();
+        String messageId = queue.dispatch(jobId, 1);
+        assertThat(queue.read("settle-consumer", 1, Duration.ofSeconds(2)))
+                .singleElement()
+                .extracting(KnowledgeQueuePort.QueueMessage::messageId)
+                .isEqualTo(messageId);
+
+        KnowledgeQueuePort.Settlement settlement = queue.settle(messageId);
+
+        assertThat(settlement.acknowledged()).isTrue();
+        assertThat(settlement.deleted()).isTrue();
+        StreamMessageId parsed = parseMessageId(messageId);
+        var stream = redisClientProvider.client().<String, String>getStream("salmon:knowledge:ingestion");
+        assertThat(stream.range(parsed, parsed)).isEmpty();
+        assertThat(stream.listPending("salmon-knowledge-workers", parsed, parsed, 10)).isEmpty();
     }
 
     @Test
@@ -177,6 +200,11 @@ class KnowledgeInfrastructureGateIntegrationTest {
         zip.putNextEntry(new ZipEntry(name));
         zip.write(value.getBytes(StandardCharsets.UTF_8));
         zip.closeEntry();
+    }
+
+    private static StreamMessageId parseMessageId(String messageId) {
+        String[] parts = messageId.split("-", 2);
+        return new StreamMessageId(Long.parseLong(parts[0]), Long.parseLong(parts[1]));
     }
 
     private static void deleteTree(Path root) throws IOException {

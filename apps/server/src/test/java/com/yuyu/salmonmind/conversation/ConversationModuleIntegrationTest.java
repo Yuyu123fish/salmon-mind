@@ -22,6 +22,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException.AgentErrorCode;
+import com.yuyu.salmonmind.agent.api.AgentCitation;
+import com.yuyu.salmonmind.agent.api.AgentLocalCitation;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
 import com.yuyu.salmonmind.agent.api.AgentRequest;
 import com.yuyu.salmonmind.agent.api.AgentResult;
@@ -34,6 +36,16 @@ import com.yuyu.salmonmind.agent.api.AgentTitleRequest;
 import com.yuyu.salmonmind.agent.api.AgentTitleResult;
 import com.yuyu.salmonmind.agent.api.AgentTitleService;
 import com.yuyu.salmonmind.agent.api.AgentUsage;
+import com.yuyu.salmonmind.agent.api.AgentWebCitation;
+import com.yuyu.salmonmind.conversation.api.ConversationService;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.RunStarted;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.CompactionCompleted;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.AssistantDelta;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.AssistantCompleted;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.TitleUpdated;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.RunCompleted;
+import com.yuyu.salmonmind.conversation.api.RunStreamListener.RunFailed;
 import com.yuyu.salmonmind.conversation.domain.SummaryTemplate;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -95,6 +107,8 @@ class ConversationModuleIntegrationTest {
     private ObjectMapper objectMapper;
     @Autowired
     private JdbcTemplate jdbcTemplate;
+    @Autowired
+    private ConversationService conversationService;
 
     @DynamicPropertySource
     static void dataDir(DynamicPropertyRegistry registry) {
@@ -239,6 +253,35 @@ class ConversationModuleIntegrationTest {
         // 数据库不允许遗留 RUNNING Run
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM conversation_runs WHERE status = 'RUNNING'", Integer.class)).isZero();
+    }
+
+    @Test
+    void projectsPersistedCitationsAsHistoricalMetadataWithoutReusingThem() throws Exception {
+        UUID conv = createId();
+        UUID evidenceId = UUID.randomUUID();
+        UUID revisionId = UUID.randomUUID();
+        AGENT.completeWithCitations(List.of(
+                new AgentLocalCitation("L1", evidenceId, revisionId, "manual.md", "chapter-1"),
+                new AgentWebCitation("W1", "BOCHA", "网页标题", "https://example.com/a",
+                        "example.com", "2026-08-17", Instant.parse("2026-08-17T00:00:00Z"))));
+
+        postSse("/api/conversations/" + conv + "/messages", Map.of("text", "请查资料"));
+        Map<String, Object> first = open(conv.toString());
+        Map<String, Object> firstAssistant = entryOf(((List<?>) first.get("activePath")).get(1));
+        assertThat((List<?>) payloadOf(firstAssistant).get("citations")).hasSize(2);
+
+        // 第二轮的测试 Agent 不返回 Citation；历史摘要只能进入模型输入，不能被复制到新 Entry。
+        AGENT.completeWithCitations(List.of());
+        postSse("/api/conversations/" + conv + "/messages", Map.of("text", "继续说明"));
+        String historical = messagesOf(agentRequest(1)).get(1).text();
+        assertThat(historical).contains(
+                "[历史来源元数据：仅说明上一轮依据，不是当前 Run 可引用证据",
+                "runId:", "[L1] source=LOCAL document=manual.md location=chapter-1",
+                "[W1] source=WEB provider=BOCHA", "url=https://example.com/a",
+                "如需核验必须重新检索");
+        Map<String, Object> second = open(conv.toString());
+        Map<String, Object> secondAssistant = entryOf(((List<?>) second.get("activePath")).get(3));
+        assertThat((List<?>) payloadOf(secondAssistant).get("citations")).isEmpty();
     }
 
     @Test
@@ -504,6 +547,141 @@ class ConversationModuleIntegrationTest {
                 .count()).isEqualTo(1);
     }
 
+    // ---------- S1-02：成功持久化与 SSE 传输分离 ----------
+
+    /**
+     * 成功提交点之后（assistant_completed 写出时）Listener 抛异常：传输中断只结束连接，
+     * Run 保持 SUCCEEDED，JSONL 仍只有一个完整 Assistant，open 不返回 pending retry。
+     */
+    @Test
+    void transportFailureInAssistantCompletedKeepsSucceededRun() throws IOException {
+        UUID conv = conversationService.create().id();
+        TransportFailureListener listener = new TransportFailureListener(
+                jdbcTemplate, conv, true, false);
+
+        conversationService.send(conv, "你好", listener);
+
+        // 回调确实抛出了传输异常，但 send 正常返回：业务状态不被降级
+        assertThat(listener.threwInCallback).isTrue();
+        assertThat(listener.succeededVisibleInCallback).isTrue();
+        assertThat(listener.leafAdvancedInCallback).isTrue();
+        assertThat(listener.failedEventSeen).isFalse();
+        // 事务提交后才发出成功事件：回调时数据库已能观察到 SUCCEEDED Run 与推进后的叶子
+
+        Map<String, Object> detail = open(conv.toString());
+        assertThat(detail.get("pendingRun")).isNull();
+        List<?> path = (List<?>) detail.get("activePath");
+        assertThat(path).hasSize(2);
+        assertThat(path.get(1)).extracting("type").isEqualTo("ASSISTANT_MESSAGE");
+        assertThat(Files.readAllLines(fileOf(conv))).hasSize(4);
+    }
+
+    /**
+     * run_completed 写出失败同样保持权威状态：失败更新不会被调用，
+     * 数据库 Run 仍是 SUCCEEDED 且叶子指向 Assistant。
+     */
+    @Test
+    void transportFailureInRunCompletedKeepsSucceededRun() {
+        UUID conv = conversationService.create().id();
+        TransportFailureListener listener = new TransportFailureListener(
+                jdbcTemplate, conv, false, true);
+
+        conversationService.send(conv, "你好", listener);
+
+        assertThat(listener.threwInCallback).isTrue();
+        assertThat(listener.succeededVisibleInCallback).isTrue();
+        assertThat(listener.leafAdvancedInCallback).isTrue();
+        assertThat(listener.failedEventSeen).isFalse();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM conversation_runs WHERE conversation_id = ?",
+                String.class, conv)).isEqualTo("SUCCEEDED");
+
+        Map<String, Object> detail = open(conv.toString());
+        assertThat(detail.get("pendingRun")).isNull();
+        assertThat((List<?>) detail.get("activePath")).hasSize(2);
+    }
+
+    /**
+     * 模拟成功事件写出失败的监听器：在指定回调中查询数据库（证明 SSE 发生在事务提交后），
+     * 然后抛 RuntimeException 模拟传输中断；不实现任何断言逻辑，只记录事实。
+     */
+    private static final class TransportFailureListener implements RunStreamListener {
+
+        private final JdbcTemplate jdbc;
+        private final UUID conversationId;
+        private final boolean failAtAssistantCompleted;
+        private final boolean failAtRunCompleted;
+
+        volatile boolean threwInCallback;
+        volatile boolean succeededVisibleInCallback;
+        volatile boolean leafAdvancedInCallback;
+        volatile boolean failedEventSeen;
+
+        TransportFailureListener(
+                JdbcTemplate jdbc, UUID conversationId,
+                boolean failAtAssistantCompleted, boolean failAtRunCompleted
+        ) {
+            this.jdbc = jdbc;
+            this.conversationId = conversationId;
+            this.failAtAssistantCompleted = failAtAssistantCompleted;
+            this.failAtRunCompleted = failAtRunCompleted;
+        }
+
+        @Override
+        public void onRunStarted(RunStarted event) {
+        }
+
+        @Override
+        public void onCompactionCompleted(CompactionCompleted event) {
+        }
+
+        @Override
+        public void onAssistantDelta(AssistantDelta event) {
+        }
+
+        @Override
+        public void onAssistantCompleted(AssistantCompleted event) {
+            probeDb(event.assistantEntry().id());
+            if (failAtAssistantCompleted) {
+                threwInCallback = true;
+                throw new RuntimeException("模拟 assistant_completed 写出失败");
+            }
+        }
+
+        @Override
+        public void onTitleUpdated(TitleUpdated event) {
+        }
+
+        @Override
+        public void onRunCompleted(RunCompleted event) {
+            probeDb(event.conversation().activeLeafEntryId());
+            if (failAtRunCompleted) {
+                threwInCallback = true;
+                throw new RuntimeException("模拟 run_completed 写出失败");
+            }
+        }
+
+        @Override
+        public void onRunFailed(RunFailed event) {
+            failedEventSeen = true;
+        }
+
+        // 成功事件回调时数据库必须已可见 SUCCEEDED Run 与推进后的叶子，证明 SSE 不在事务内
+        private void probeDb(UUID expectedLeafId) {
+            Integer succeeded = jdbc.queryForObject(
+                    "SELECT count(*) FROM conversation_runs"
+                            + " WHERE conversation_id = ? AND status = 'SUCCEEDED'",
+                    Integer.class, conversationId);
+            succeededVisibleInCallback = succeeded != null && succeeded > 0;
+            UUID leaf = jdbc.queryForObject(
+                    "SELECT active_leaf_entry_id FROM conversations WHERE id = ?",
+                    UUID.class, conversationId);
+            leafAdvancedInCallback = expectedLeafId.equals(leaf);
+        }
+    }
+
+    // ---------- 错误与边界 ----------
+
     @Test
     void mapsPreStreamErrorsToJsonAndKeepsTerminalExclusive() {
         UUID conv = createId();
@@ -728,6 +906,7 @@ class ConversationModuleIntegrationTest {
         private volatile boolean failAfterDelta;
         /** 主调用固定用量：totalTokens 作为压缩检测的 usage 锚点。 */
         private volatile AgentUsage usage = new AgentUsage(1000L, 200L, 1200L);
+        private volatile List<AgentCitation> citations = List.of();
 
         @Override
         public void stream(AgentRequest request, AgentStreamListener listener) {
@@ -767,7 +946,7 @@ class ConversationModuleIntegrationTest {
             }
             listener.onDelta("测试");
             listener.onDelta("回答");
-            listener.onComplete(new AgentResult("测试回答", "test-provider", "test-model", usage));
+            listener.onComplete(new AgentResult("测试回答", "test-provider", "test-model", usage, citations));
         }
 
         @Override
@@ -826,6 +1005,10 @@ class ConversationModuleIntegrationTest {
             failure = null;
         }
 
+        void completeWithCitations(List<AgentCitation> nextCitations) {
+            citations = nextCitations == null ? List.of() : List.copyOf(nextCitations);
+        }
+
         void reset() {
             requests.clear();
             summaryRequests.clear();
@@ -837,6 +1020,7 @@ class ConversationModuleIntegrationTest {
             failMainAfterCompaction = false;
             failAfterDelta = false;
             usage = new AgentUsage(1000L, 200L, 1200L);
+            citations = List.of();
         }
     }
 }

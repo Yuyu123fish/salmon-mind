@@ -7,7 +7,8 @@ import java.util.UUID;
  * 标准 SSE 帧；application 只按下列顺序回调，不直接接触 HTTP 或序列化。
  *
  * <p>顺序合同：恰好一次 {@link #onRunStarted}；随后零或一次
- * {@link #onCompactionCompleted}；零到多次 {@link #onAssistantDelta}；
+ * {@link #onCompactionCompleted}，以及零到多次工具状态事件和
+ * {@link #onAssistantDelta}；
  * 成功时恰好一次 {@link #onAssistantCompleted}；零或一次 {@link #onTitleUpdated}；
  * 最后以 {@link #onRunCompleted} 或 {@link #onRunFailed} 恰好一次结束，
  * 终态事件之后不得再有业务事件。
@@ -31,6 +32,24 @@ public interface RunStreamListener {
     record AssistantDelta(UUID runId, String delta) {
     }
 
+    /** 工具开始事件；不携带 query、正文或原始参数。 */
+    record ToolStarted(UUID runId, String toolCallId, String toolName) {
+    }
+
+    /** 工具成功结束事件；来源状态只保留 Provider、数量和边界标记。 */
+    record ToolCompleted(
+            UUID runId, String toolCallId, String toolName, long durationMillis,
+            String provider, int sourceCount, boolean truncated, boolean degraded
+    ) {
+        public ToolCompleted(UUID runId, String toolCallId, String toolName, long durationMillis) {
+            this(runId, toolCallId, toolName, durationMillis, null, 0, false, false);
+        }
+    }
+
+    /** 工具失败事件；错误码稳定且不携带内部堆栈或工具结果。 */
+    record ToolFailed(UUID runId, String toolCallId, String toolName, long durationMillis, String stableErrorCode) {
+    }
+
     /** assistant_completed：完整且已持久化的 Assistant Entry。 */
     record AssistantCompleted(UUID conversationId, Entry assistantEntry) {
     }
@@ -52,6 +71,15 @@ public interface RunStreamListener {
     void onCompactionCompleted(CompactionCompleted event);
 
     void onAssistantDelta(AssistantDelta event);
+
+    default void onToolStarted(ToolStarted event) {
+    }
+
+    default void onToolCompleted(ToolCompleted event) {
+    }
+
+    default void onToolFailed(ToolFailed event) {
+    }
 
     void onAssistantCompleted(AssistantCompleted event);
 

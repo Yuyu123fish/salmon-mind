@@ -8,9 +8,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
+import com.yuyu.salmonmind.conversation.api.CitationPayload;
 import com.yuyu.salmonmind.conversation.api.CompactionPayload;
 import com.yuyu.salmonmind.conversation.api.Entry;
 import com.yuyu.salmonmind.conversation.api.EntryPayload;
+import com.yuyu.salmonmind.conversation.api.LocalCitationPayload;
+import com.yuyu.salmonmind.conversation.api.WebCitationPayload;
 import com.yuyu.salmonmind.conversation.api.TokenUsage;
 import com.yuyu.salmonmind.conversation.api.TitlePayload;
 import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
@@ -103,6 +106,12 @@ class JsonlCodec {
                 if (p.usage() != null) {
                     node.set("usage", encodeUsage(p.usage()));
                 }
+                if (!p.citations().isEmpty()) {
+                    ArrayNode citations = node.putArray("citations");
+                    for (CitationPayload citation : p.citations()) {
+                        citations.add(encodeCitation(citation));
+                    }
+                }
                 yield node;
             }
             case CompactionPayload p -> {
@@ -172,8 +181,10 @@ class JsonlCodec {
             case USER_MESSAGE -> new UserMessagePayload(text(node, "text"), uuid(node, "runId"));
             case ASSISTANT_MESSAGE -> {
                 TokenUsage usage = node.hasNonNull("usage") ? decodeUsage(node.get("usage")) : null;
+                List<CitationPayload> citations = decodeCitations(node.get("citations"));
                 yield new AssistantMessagePayload(
-                        text(node, "text"), uuid(node, "runId"), text(node, "provider"), text(node, "model"), usage);
+                        text(node, "text"), uuid(node, "runId"), text(node, "provider"), text(node, "model"),
+                        usage, citations);
             }
             case COMPACTION -> {
                 TokenUsage usage = node.hasNonNull("usage") ? decodeUsage(node.get("usage")) : null;
@@ -206,6 +217,57 @@ class JsonlCodec {
                 node.hasNonNull("promptTokens") ? node.get("promptTokens").asLong() : null,
                 node.hasNonNull("completionTokens") ? node.get("completionTokens").asLong() : null,
                 node.hasNonNull("totalTokens") ? node.get("totalTokens").asLong() : null);
+    }
+
+    private ObjectNode encodeCitation(CitationPayload citation) {
+        ObjectNode node = mapper.createObjectNode();
+        node.put("referenceId", citation.referenceId());
+        switch (citation) {
+            case LocalCitationPayload local -> {
+                node.put("kind", "local");
+                node.put("evidenceId", local.evidenceId().toString());
+                node.put("revisionId", local.revisionId().toString());
+                node.put("documentName", local.documentName());
+                node.put("location", local.location());
+            }
+            case WebCitationPayload web -> {
+                node.put("kind", "web");
+                node.put("provider", web.provider());
+                node.put("title", web.title());
+                node.put("url", web.url());
+                node.put("site", web.site());
+                if (web.dateLabel() != null) {
+                    node.put("dateLabel", web.dateLabel());
+                }
+                node.put("retrievedAt", web.retrievedAt().toString());
+            }
+        }
+        return node;
+    }
+
+    private List<CitationPayload> decodeCitations(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return List.of();
+        }
+        if (!node.isArray()) {
+            throw corrupted("assistant citations 不是数组");
+        }
+        List<CitationPayload> citations = new ArrayList<>();
+        for (JsonNode item : node) {
+            String kind = text(item, "kind");
+            String referenceId = text(item, "referenceId");
+            if ("local".equals(kind)) {
+                citations.add(new LocalCitationPayload(referenceId, uuid(item, "evidenceId"),
+                        uuid(item, "revisionId"), text(item, "documentName"), text(item, "location")));
+            } else if ("web".equals(kind)) {
+                citations.add(new WebCitationPayload(referenceId, text(item, "provider"), text(item, "title"),
+                        text(item, "url"), text(item, "site"), optionalText(item, "dateLabel"),
+                        instant(item, "retrievedAt")));
+            } else {
+                throw corrupted("未知 Citation kind: " + kind);
+            }
+        }
+        return List.copyOf(citations);
     }
 
     // 解析整行：JSON 语法截断（EOF 未闭合）抛 TornTailException，其余解析错误视为损坏
@@ -256,6 +318,17 @@ class JsonlCodec {
         JsonNode value = node.get(field);
         if (value == null || !value.isTextual()) {
             throw corrupted("缺少文本字段: " + field);
+        }
+        return value.asText();
+    }
+
+    private static String optionalText(JsonNode node, String field) {
+        JsonNode value = node.get(field);
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        if (!value.isTextual()) {
+            throw corrupted("字段不是文本: " + field);
         }
         return value.asText();
     }

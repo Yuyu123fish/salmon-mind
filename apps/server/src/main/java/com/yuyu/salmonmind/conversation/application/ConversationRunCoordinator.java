@@ -2,6 +2,9 @@ package com.yuyu.salmonmind.conversation.application;
 
 import com.yuyu.salmonmind.agent.api.AgentExecutionException;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException.AgentErrorCode;
+import com.yuyu.salmonmind.agent.api.AgentCitation;
+import com.yuyu.salmonmind.agent.api.AgentContextBudget;
+import com.yuyu.salmonmind.agent.api.AgentLocalCitation;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
 import com.yuyu.salmonmind.agent.api.AgentRequest;
 import com.yuyu.salmonmind.agent.api.AgentResult;
@@ -14,6 +17,8 @@ import com.yuyu.salmonmind.agent.api.AgentTitleRequest;
 import com.yuyu.salmonmind.agent.api.AgentTitleResult;
 import com.yuyu.salmonmind.agent.api.AgentTitleService;
 import com.yuyu.salmonmind.agent.api.AgentUsage;
+import com.yuyu.salmonmind.agent.api.AgentWebCitation;
+import com.yuyu.salmonmind.agent.api.CheckpointPolicy;
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
 import com.yuyu.salmonmind.conversation.api.CompactionPayload;
 import com.yuyu.salmonmind.conversation.api.Conversation;
@@ -21,19 +26,25 @@ import com.yuyu.salmonmind.conversation.api.ConversationException;
 import com.yuyu.salmonmind.conversation.api.ConversationException.ConversationErrorCode;
 import com.yuyu.salmonmind.conversation.api.Entry;
 import com.yuyu.salmonmind.conversation.api.Entry.EntryType;
+import com.yuyu.salmonmind.conversation.api.CitationPayload;
+import com.yuyu.salmonmind.conversation.api.LocalCitationPayload;
 import com.yuyu.salmonmind.conversation.api.Run;
 import com.yuyu.salmonmind.conversation.api.Run.RunStatus;
 import com.yuyu.salmonmind.conversation.api.RunStreamListener;
 import com.yuyu.salmonmind.conversation.api.TitlePayload;
 import com.yuyu.salmonmind.conversation.api.TokenUsage;
 import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
+import com.yuyu.salmonmind.conversation.api.WebCitationPayload;
 import com.yuyu.salmonmind.conversation.application.port.ConversationHistoryRepository;
 import com.yuyu.salmonmind.conversation.application.port.ConversationMetadataRepository;
 import com.yuyu.salmonmind.conversation.domain.ConversationCompactionPolicy;
 import com.yuyu.salmonmind.conversation.domain.ConversationHistory;
 import com.yuyu.salmonmind.conversation.domain.ConversationTitle;
+import com.yuyu.salmonmind.conversation.domain.AssistantContextRenderer;
 import com.yuyu.salmonmind.conversation.domain.TitleTemplate;
 import com.yuyu.salmonmind.workspace.api.WorkspaceRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -51,22 +62,29 @@ import java.util.UUID;
  * 1. 以 JSONL 为权威恢复并校验 Conversation，再追加用户 Entry 并强制刷盘；
  * 2. 数据库事务创建 RUNNING Run 并推进活动叶子（Agent 调用绝不在事务内）；
  * 3. durable 状态成立后发出 run_started；
- * 4. 主 LLM 前压缩检测：usage 锚点 + 本次 User 参与计量，达到 196,712 阈值时生成
- *    摘要、追加 Compaction、推进叶子与压缩三元组并使旧 Checkpoint 失效，随后主调用
- *    从「Summary + Retained Tail + Compaction 后消息」的新投影重建；
+ * 4. 主 LLM 前压缩检测：生产工具路径按 Agent 报告的静态/动态预算与当前 JSONL 投影
+ *    完整计量；兼容路径可使用有效 usage 锚点。达到 196,712 阈值时生成摘要、追加
+ *    Compaction、推进叶子与压缩三元组并使旧 Checkpoint 失效，随后主调用从
+ *    「Summary + Retained Tail + Compaction 后消息」的新投影重建；
  * 5. 流式主回答：delta 只在内存/SSE 中累积，只有模型成功且文本非空才追加一个完整
  *    Assistant Entry；模型成功前失败不写 Assistant；
- * 6. 成功落盘后在同一事务完成 Run 并推进叶子；无 Title Entry 时基于第一次成功交互
- *    尝试生成标题（失败不影响成功 Run）；
- * 7. run_started 之后的一切失败通过 run_failed 收束为唯一终态。
+ * 6. 成功提交点：Assistant JSONL 刷盘后，在同一数据库事务把 Run 更新为 SUCCEEDED
+ *    并推进活动叶子，随后独立尝试标题持久化。事务提交后业务成功不可降级；
+ * 7. 传输阶段：按序尽力发送 assistant_completed → 可选 title_updated → run_completed，
+ *    写出失败只结束当前连接，绝不把 SUCCEEDED 降级为 FAILED；客户端刷新后从
+ *    JSONL / 数据库读取权威成功状态；
+ * 8. run_started 之后、成功提交点之前的一切失败通过 run_failed 收束为唯一终态。
  *
  * <p>上下文投影规则：路径上最后一个 Compaction 之前的内容全部被摘要或 Tail 覆盖；
- * 投影只展开最新 Compaction 的 Summary 与 Retained Tail 原文，再加其后的新消息。
+ * 投影只展开最新 Compaction 的 Summary 与 Retained Tail 原文，再加其后的新消息，
+ * Assistant 的历史 Citation 由统一渲染器转换为有界元数据。
  * 每次主调用前期望 Checkpoint 叶子 = 活动叶子（Compaction 时强制重建，否则复用
  * 到叶子之前的上下文节点），使压缩后的旧 Checkpoint 在结构上失效。
  */
 @Component
 class ConversationRunCoordinator {
+
+    private static final Logger log = LoggerFactory.getLogger(ConversationRunCoordinator.class);
 
     /** Summary 进入模型上下文的前缀消息；摘要是历史事实整理，不是用户新指令。 */
     private static final String SUMMARY_PREFIX = "以下为此前对话的结构化摘要，请基于它继续对话：\n";
@@ -122,11 +140,23 @@ class ConversationRunCoordinator {
         this.systemPromptTokens = systemPromptTokens;
     }
 
+    /**
+     * 发送一条新用户消息并启动 Run。调用方必须已持有本 Conversation 的执行队列锁。
+     *
+     * <p>顺序：先以 JSONL 为权威恢复并校验 Workspace 归属，确认活动叶子不在待重试状态；
+     * 预分配 Run / 用户 Entry / 回答 Entry ID 后，先把 User Entry 强制刷入 JSONL，再在同一
+     * 数据库事务中创建 RUNNING Run 并推进活动叶子。JSONL 先写而数据库未写时，下次打开会按
+     * JSONL 修复索引；Run 与叶子必须同事务提交，避免数据库出现 Run 领先叶子或反向。
+     *
+     * <p>durable 状态成立后才发出 {@code run_started} 并进入 {@link #execute}。此前的前置
+     * 错误（Conversation 不存在、历史损坏、消息为空、待重试）以异常抛出，由 HTTP 层映射
+     * JSON；此后失败由 {@link #execute} 收束为 {@code run_failed}。
+     */
     void send(UUID conversationId, String text, RunStreamListener listener) {
         if (text == null || text.isBlank()) {
             throw new IllegalArgumentException("消息不能为空");
         }
-        RecoveryState state = recover(conversationId);// 确认 Conversation 属于当前 Workspace，并以 JSONL 修复数据库索引
+        RecoveryState state = recover(conversationId);
         Conversation conversation = state.conversation();
         ConversationHistory history = state.history();
 
@@ -158,6 +188,19 @@ class ConversationRunCoordinator {
         execute(listener, conversationId, advanced, running, userEntry, answerEntryId);
     }
 
+    /**
+     * 重试一条失败或中断的 Run。调用方必须已持有本 Conversation 的执行队列锁。
+     *
+     * <p>复用原用户 Entry，不追加重复用户消息，也不推进活动叶子；只为同一触发 Entry
+     * 插入一条新的 RUNNING Run。旧 Run 不存在或不属于本 Conversation、仍为 RUNNING、
+     * 或已 SUCCEEDED 时拒绝。可重试时触发 User 必须仍在当前 Active Path 上，且活动叶子
+     * 还不是 Assistant——叶子可以是该 User（未压缩）或旧 Run 已追加的 Compaction（已压缩
+     * 但无成功回答），不得因叶子不再是 User 而拒绝。
+     *
+     * <p>数据库只写入新 Run，叶子权威仍是上次 send / 压缩留下的状态。durable 之后发出
+     * {@code run_started}（{@code isRetry=true}）并进入 {@link #execute}；此前错误以异常
+     * 抛出，此后失败同样收束为 {@code run_failed}。
+     */
     void retry(UUID conversationId, UUID runId, RunStreamListener listener) {
         RecoveryState state = recover(conversationId);
         Conversation conversation = state.conversation();
@@ -206,8 +249,16 @@ class ConversationRunCoordinator {
         execute(listener, conversationId, conversation, running, trigger, answerEntryId);
     }
 
-    // 一次 Run 的完整执行：预压缩 → 流式主调用（overflow 可强制压缩重试一次）→ 成功落盘；
-    // run_started 之后的任何失败都收束为 onRunFailed，不再向 HTTP 层抛异常
+    /**
+     * 一次 Run 在 {@code run_started} 之后的执行体：预压缩 → 流式主调用（提供方 overflow
+     * 且尚未输出 delta 时可强制压缩并重试一次）→ 成功落盘。
+     *
+     * <p>{@link #send} / {@link #retry} 已把 RUNNING Run 写成 durable 状态，本方法不再向
+     * HTTP 层抛异常。压缩会推进活动叶子，因此局部 {@code current} 必须跟着更新，失败时
+     * {@link #failRun} 才能报告正确叶子（User 或本 Run 的 Compaction）。成功路径由
+     * {@link #finishSuccess} 先写完整 Assistant JSONL，再同事务完成 Run 与推进叶子；
+     * 任何 Conversation / Agent / 运行时失败都收束为 {@code run_failed}，不追加 Assistant。
+     */
     private void execute(
             RunStreamListener listener, UUID conversationId, Conversation conversation,
             Run running, Entry triggerEntry, UUID answerEntryId
@@ -222,7 +273,7 @@ class ConversationRunCoordinator {
             }
             MainOutcome outcome = streamMain(
                     listener, conversationId, current, history, running, answerEntryId, compaction.compacted());
-            finishSuccess(listener, conversationId, outcome, running);
+            finishSuccess(listener, conversationId, outcome, running, answerEntryId);
         } catch (ConversationException ex) {
             failRun(listener, current, running, ex.code().name(), ex.getMessage());
         } catch (AgentExecutionException ex) {
@@ -257,18 +308,27 @@ class ConversationRunCoordinator {
         String previousSummary = lastCompactionIndex >= 0
                 ? ((CompactionPayload) path.get(lastCompactionIndex).payload()).summary() : null;
 
-        // usage 锚点：最新 Compaction 之后的最近 Assistant，且 totalTokens 非空；
-        // 锚点已包含 system prompt 与既有输入，后续内容用保守估算补足
+        AgentContextBudget agentBudget = agentStream.contextBudget();
+        if (agentBudget == null) {
+            agentBudget = AgentContextBudget.ZERO;
+        }
+        long effectiveStaticInputTokens = Math.max(systemPromptTokens, agentBudget.staticInputTokens());
+        long dynamicToolInputTokens = agentBudget.dynamicInputTokens();
+
+        // 生产工具结果不会写入 JSONL，上一轮 usage 可能包含不可恢复的 tool message；
+        // 这条路径必须以当前 Active Path 加历史 Citation 摘要为唯一计量基础。
         Long anchorTokens = null;
         int anchorIndex = -1;
-        for (int i = path.size() - 1; i > lastCompactionIndex; i--) {
-            Entry entry = path.get(i);
-            if (entry.type() == EntryType.ASSISTANT_MESSAGE) {
-                TokenUsage usage = ((AssistantMessagePayload) entry.payload()).usage();
-                if (usage != null && usage.totalTokens() != null) {
-                    anchorTokens = usage.totalTokens();
-                    anchorIndex = i;
-                    break;
+        if (!agentStream.requiresProjectionRebuild()) {
+            for (int i = path.size() - 1; i > lastCompactionIndex; i--) {
+                Entry entry = path.get(i);
+                if (entry.type() == EntryType.ASSISTANT_MESSAGE) {
+                    TokenUsage usage = ((AssistantMessagePayload) entry.payload()).usage();
+                    if (usage != null && usage.totalTokens() != null) {
+                        anchorTokens = usage.totalTokens();
+                        anchorIndex = i;
+                        break;
+                    }
                 }
             }
         }
@@ -285,7 +345,8 @@ class ConversationRunCoordinator {
                 }
             }
             estimated = compactionPolicy.estimateNextInputTokens(
-                    budgets, estimator, systemPromptTokens, previousSummary, List.of(), anchorTokens, afterAnchor);
+                    budgets, estimator, effectiveStaticInputTokens, previousSummary, List.of(), anchorTokens, afterAnchor)
+                    + dynamicToolInputTokens;
         } else {
             List<Entry> projected = new ArrayList<>();
             for (Entry entry : path) {
@@ -294,7 +355,8 @@ class ConversationRunCoordinator {
                 }
             }
             estimated = compactionPolicy.estimateNextInputTokens(
-                    budgets, estimator, systemPromptTokens, previousSummary, projected, null, List.of());
+                    budgets, estimator, effectiveStaticInputTokens + dynamicToolInputTokens,
+                    previousSummary, projected, null, List.of());
         }
 
         if (!force && !compactionPolicy.shouldCompact(estimated, budgets)) {
@@ -363,7 +425,8 @@ class ConversationRunCoordinator {
 
         // 压缩后重计量：Summary + Retained Tail + Compaction 后消息；仍超限则明确失败
         long reestimated = compactionPolicy.reestimateAfterCompaction(
-                budgets, estimator, systemPromptTokens, summary, plan.retainedTail(), List.of());
+                budgets, estimator, effectiveStaticInputTokens + dynamicToolInputTokens,
+                summary, plan.retainedTail(), List.of());
         if (compactionPolicy.shouldCompact(reestimated, budgets)) {
             throw new ConversationException(
                     ConversationErrorCode.CONTEXT_LIMIT_REACHED, "压缩后仍超过工作输入预算，请创建新的 Conversation");
@@ -384,10 +447,12 @@ class ConversationRunCoordinator {
             ConversationHistory history, Run running, UUID answerEntryId, boolean alreadyCompacted
     ) {
         List<Entry> path = history.activePath(conversation.activeLeafEntryId());
-        // 获取需要被压缩的全部对话
         List<AgentMessage> projection = project(path);
+        CheckpointPolicy checkpointPolicy = agentStream.requiresProjectionRebuild()
+                ? CheckpointPolicy.REBUILD_FROM_PROJECTION : CheckpointPolicy.REUSE_IF_MATCH;
         AgentRequest request = new AgentRequest(
-                conversationId.toString(), expectedCheckpointLeaf(path), answerEntryId, projection);
+                conversationId.toString(), expectedCheckpointLeaf(path), answerEntryId, projection,
+                checkpointPolicy);
 
         boolean[] deltaSeen = {false};
         AgentResult[] success = {null};
@@ -408,6 +473,26 @@ class ConversationRunCoordinator {
             @Override
             public void onError(AgentExecutionException error) {
                 failure[0] = error;
+            }
+
+            @Override
+            public void onToolStarted(com.yuyu.salmonmind.agent.api.AgentToolStarted event) {
+                listener.onToolStarted(new RunStreamListener.ToolStarted(
+                        running.id(), event.toolCallId(), event.toolName()));
+            }
+
+            @Override
+            public void onToolCompleted(com.yuyu.salmonmind.agent.api.AgentToolCompleted event) {
+                listener.onToolCompleted(new RunStreamListener.ToolCompleted(
+                        running.id(), event.toolCallId(), event.toolName(), event.durationMillis(),
+                        event.provider(), event.sourceCount(), event.truncated(), event.degraded()));
+            }
+
+            @Override
+            public void onToolFailed(com.yuyu.salmonmind.agent.api.AgentToolFailed event) {
+                listener.onToolFailed(new RunStreamListener.ToolFailed(
+                        running.id(), event.toolCallId(), event.toolName(), event.durationMillis(),
+                        event.stableErrorCode()));
             }
         });
 
@@ -436,10 +521,21 @@ class ConversationRunCoordinator {
         return new MainOutcome(result, conversation);
     }
 
-    // 成功路径：先追加完整 Assistant Entry，再在同一数据库事务完成 Run 与推进叶子；
-    // delta 不形成历史，只有最终完整文本落盘一次
+    /**
+     * 成功路径：先把完整 Assistant Entry 刷入 JSONL，再在同一数据库事务完成 SUCCEEDED Run
+     * 并推进活动叶子。delta 不形成历史，只有最终完整文本落盘一次。
+     *
+     * <p>Assistant Entry 必须使用预分配的 {@code answerEntryId}：Adapter 成功后会把它写回
+     * Checkpoint 叶子标记，下一轮 {@link #expectedCheckpointLeaf}（活动叶子的 parent）
+     * 与之相等才能复用；换成随机 ID 会导致复用永不成立。空回答视为模型失败，不追加空
+     * Assistant，由 {@link #execute} 走失败路径后可重试。
+     *
+     * <p>本方法只负责「业务完成」：成功提交点就是下面的数据库事务提交。事务提交后
+     * Run 已是不可降级的 SUCCEEDED，成功事件写出交给 {@link #sendSuccessEvents}，
+     * 传输失败绝不回头调用 {@link #failRun}。
+     */
     private void finishSuccess(
-            RunStreamListener listener, UUID conversationId, MainOutcome outcome, Run running
+            RunStreamListener listener, UUID conversationId, MainOutcome outcome, Run running, UUID answerEntryId
     ) {
         AgentResult result = outcome.result();
         if (result.text() == null || result.text().isBlank()) {
@@ -451,10 +547,11 @@ class ConversationRunCoordinator {
         Instant answeredAt = Instant.now();
         // parent 是本 Run 最新上下文叶子（User 或 Compaction），Run trigger 仍是原 User
         Entry assistantEntry = new Entry(
-                ConversationHistory.FORMAT_VERSION, conversationId, UUID.randomUUID(), answerSeq,
+                ConversationHistory.FORMAT_VERSION, conversationId, answerEntryId, answerSeq,
                 outcome.conversation().activeLeafEntryId(), EntryType.ASSISTANT_MESSAGE, answeredAt,
                 new AssistantMessagePayload(
-                        result.text(), running.id(), result.provider(), result.model(), mapUsage(result.usage())));
+                        result.text(), running.id(), result.provider(), result.model(), mapUsage(result.usage()),
+                        mapCitations(result.citations())));
         historyRepository.append(conversationId, assistantEntry);
 
         Run finished = new Run(
@@ -466,25 +563,59 @@ class ConversationRunCoordinator {
             metadataRepository.updateRun(finished);
             metadataRepository.update(finalConversation);
         });
-        listener.onAssistantCompleted(new RunStreamListener.AssistantCompleted(conversationId, assistantEntry));
-        // 首次标题在成功终态事件之前：失败不影响已成功的主 Run
-        maybeGenerateTitle(listener, conversationId, finalConversation, assistantEntry, running);
-        listener.onRunCompleted(new RunStreamListener.RunCompleted(
-                conversationId, finished, finalConversation));
+
+        // 标题持久化也属于业务侧（失败不影响已成功的主 Run），成功则产出待发送事件
+        RunStreamListener.TitleUpdated titleEvent = maybeGenerateTitle(
+                conversationId, finalConversation, assistantEntry, running);
+        sendSuccessEvents(listener, conversationId, finished, finalConversation, assistantEntry, titleEvent);
     }
 
-    // 首次标题：无 Title Entry 时基于第一次成功的 User/Assistant 交互生成；模型调用
-    // 独立于 ReactAgent Checkpoint，标题失败保留默认标题且不影响成功 Run
-    private void maybeGenerateTitle(
-            RunStreamListener listener, UUID conversationId, Conversation conversation,
-            Entry assistantEntry, Run running
+    /**
+     * 传输阶段：成功提交点之后，按对外顺序尽力写出成功事件
+     * {@code assistant_completed → 可选 title_updated → run_completed}。
+     *
+     * <p>这里的任何异常都只可能是 Listener/SSE 写出失败：Run 与 Conversation 已在该点
+     * 之前提交为 SUCCEEDED，传输中断只是结束当前连接，绝不调用 {@link #failRun} 降级。
+     * 客户端重新打开 Conversation 会读取 JSONL 与数据库的权威成功状态；某次写出失败后
+     * 停止继续发送后续事件，但不回滚任何业务状态。此 catch 不得覆盖成功提交点之前的
+     * 业务异常——那些异常仍由 {@link #execute} 走失败路径。
+     */
+    private void sendSuccessEvents(
+            RunStreamListener listener, UUID conversationId, Run finished, Conversation finalConversation,
+            Entry assistantEntry, RunStreamListener.TitleUpdated titleEvent
+    ) {
+        try {
+            listener.onAssistantCompleted(new RunStreamListener.AssistantCompleted(conversationId, assistantEntry));
+            if (titleEvent != null) {
+                listener.onTitleUpdated(titleEvent);
+            }
+            listener.onRunCompleted(new RunStreamListener.RunCompleted(
+                    conversationId, finished, finalConversation));
+        } catch (RuntimeException ex) {
+            // 已越过成功提交点：只记录传输中断，业务状态保持 SUCCEEDED
+            log.warn("成功事件传输中断（conversation={}）：只结束当前连接，业务状态保持 SUCCEEDED",
+                    conversationId, ex);
+        }
+    }
+
+    /**
+     * 首次成功交互后尝试生成标题并落盘，成功时返回待发送的 TitleUpdated 事件，否则返回
+     * {@code null}。路径上已有 Title Entry 时直接返回 null；模型调用独立于 ReactAgent
+     * Checkpoint，失败保留默认标题且不回滚已成功的 Assistant 或 Run。
+     *
+     * <p>Title 只推进确认序号与 Conversation 标题，不推进活动叶子，因此模型上下文与
+     * Checkpoint 仍停在 Assistant。Title Entry 已写入 JSONL 而数据库未更新时，由下次
+     * 打开的恢复流程修复。事件发送由调用方在传输阶段统一执行，本方法不做传输。
+     */
+    private RunStreamListener.TitleUpdated maybeGenerateTitle(
+            UUID conversationId, Conversation conversation, Entry assistantEntry, Run running
     ) {
         Entry titleEntry = null;
         String normalized = null;
         try {
             List<Entry> path = historyRepository.read(conversationId).activePath(conversation.activeLeafEntryId());
             if (path.stream().anyMatch(e -> e.type() == EntryType.TITLE)) {
-                return;
+                return null;
             }
             Entry firstUser = null;
             Entry firstAssistant = null;
@@ -498,18 +629,18 @@ class ConversationRunCoordinator {
                 }
             }
             if (firstUser == null || firstAssistant == null) {
-                return;
+                return null;
             }
             AgentTitleResult result = titleService.generateTitle(new AgentTitleRequest(List.of(
                     new AgentMessage(AgentMessage.Role.USER, TitleTemplate.render(
                             ((UserMessagePayload) firstUser.payload()).text(),
                             ((AssistantMessagePayload) firstAssistant.payload()).text())))));
             if (result.title() == null || result.title().isBlank()) {
-                return;
+                return null;
             }
             normalized = ConversationTitle.normalize(result.title());
             if (normalized.isBlank()) {
-                return;
+                return null;
             }
             long seq = conversation.lastConfirmedSeq() + 1;
             titleEntry = new Entry(
@@ -528,15 +659,18 @@ class ConversationRunCoordinator {
         } catch (RuntimeException ex) {
             // 标题失败或标题落盘异常不回滚已成功的 Assistant 或 Run：保留默认标题，
             // 下一次成功 Run 再尝试；Title Entry 已写而数据库未更新时由恢复流程修复
-            return;
+            return null;
         }
-        if (titleEntry != null) {
-            listener.onTitleUpdated(new RunStreamListener.TitleUpdated(
-                    conversationId, titleEntry, normalized));
-        }
+        return titleEntry == null ? null : new RunStreamListener.TitleUpdated(conversationId, titleEntry, normalized);
     }
 
-    // 失败路径：不追加 Assistant Entry，只完成失败 Run；活动叶子保持 User 或本 Run 的 Compaction
+    /**
+     * 失败路径：不追加 Assistant Entry，只把 Run 标为 FAILED；活动叶子保持 User 或本 Run
+     * 已追加的 Compaction，因此用户只能重试而不能发送新消息。
+     *
+     * <p>数据库更新失败不向外抛：JSONL 未变，下次打开会把残留 RUNNING 转为 INTERRUPTED。
+     * 无论数据库是否更新成功，都发出 {@code run_failed} 作为本流的唯一终态。
+     */
     private void failRun(
             RunStreamListener listener, Conversation conversation, Run running, String code, String message
     ) {
@@ -589,8 +723,11 @@ class ConversationRunCoordinator {
         return messages;
     }
 
-    // 期望 Checkpoint 叶子：活动叶子是 Compaction 时期望从新投影重建（旧标记必然不匹配）；
-    // 否则期望复用覆盖到追加前叶子（即叶子 parent）的既有 Checkpoint
+    /**
+     * 计算本次主调用期望的 Checkpoint 叶子。活动叶子是 Compaction 时返回该 Compaction
+     * 自身，迫使旧标记不匹配并从新投影重建；否则返回叶子 parent，期望复用覆盖到
+     * 「追加当前叶子之前」的既有 Checkpoint。
+     */
     private static UUID expectedCheckpointLeaf(List<Entry> path) {
         Entry leaf = path.get(path.size() - 1);
         return leaf.type() == EntryType.COMPACTION ? leaf.id() : leaf.parentId();
@@ -601,12 +738,17 @@ class ConversationRunCoordinator {
             case USER_MESSAGE -> new AgentMessage(
                     AgentMessage.Role.USER, ((UserMessagePayload) entry.payload()).text());
             case ASSISTANT_MESSAGE -> new AgentMessage(
-                    AgentMessage.Role.ASSISTANT, ((AssistantMessagePayload) entry.payload()).text());
+                    AgentMessage.Role.ASSISTANT,
+                    AssistantContextRenderer.render((AssistantMessagePayload) entry.payload()));
             default -> throw new IllegalArgumentException("投影只能包含用户与助手消息: " + entry.id());
         };
     }
 
-    // 打开 / 发送 / 重试的统一前置：确认 Conversation 属于当前 Workspace，并以 JSONL 修复数据库索引
+    /**
+     * 发送 / 重试的统一前置：确认 Conversation 属于当前 Workspace，再以 JSONL 为权威
+     * 修复数据库索引。打开路径由 {@link ConversationApplicationService} 自行调用同一套
+     * 恢复，不经过本协调器。
+     */
     private RecoveryState recover(UUID conversationId) {
         UUID workspaceId = workspaceRegistry.current().id();
         Conversation conversation = metadataRepository.findById(conversationId);
@@ -617,7 +759,10 @@ class ConversationRunCoordinator {
         return new RecoveryState(reconciliation.conversation(), reconciliation.history());
     }
 
-    // 活动叶子是待回答用户 Entry 且其 Run 未成功时，新消息只能走重试
+    /**
+     * 活动叶子仍是待回答的用户 Entry、且该 Entry 存在未成功 Run 时，禁止发送新消息，
+     * 调用方只能重试。叶子为空或已不是 User 时放行（后者由 {@link #retry} 自行校验）。
+     */
     private void ensureNotAwaitingRetry(Conversation conversation, ConversationHistory history) {
         if (conversation.activeLeafEntryId() == null) {
             return;
@@ -630,7 +775,10 @@ class ConversationRunCoordinator {
         }
     }
 
-    // 推进叶子 / 序号 / 标题并刷新更新时间；压缩索引字段原样保留
+    /**
+     * 推进活动叶子、确认序号与标题并刷新更新时间；压缩三元组字段原样保留，避免普通
+     * 发送 / 成功落盘误清压缩索引。
+     */
     private static Conversation advance(
             Conversation conversation, UUID leafEntryId, long seq, String title, Instant updatedAt
     ) {
@@ -641,9 +789,27 @@ class ConversationRunCoordinator {
                 conversation.createdAt(), updatedAt);
     }
 
-    // 持久化历史使用 conversation 自己的 TokenUsage，在 Agent 结果边界显式映射
+    /**
+     * 在 Agent 结果边界把 {@link AgentUsage} 显式映射为 Conversation 持久化使用的
+     * {@link TokenUsage}；两类不得混用。
+     */
     private static TokenUsage mapUsage(AgentUsage usage) {
         return usage == null ? null : new TokenUsage(usage.promptTokens(), usage.completionTokens(), usage.totalTokens());
+    }
+
+    /** Conversation 只接收 Agent 已核对的 Citation，不重新访问检索模块或解析回答正文。 */
+    private static List<CitationPayload> mapCitations(List<AgentCitation> citations) {
+        if (citations == null || citations.isEmpty()) {
+            return List.of();
+        }
+        return citations.stream().map(citation -> switch (citation) {
+            case AgentLocalCitation local -> new LocalCitationPayload(
+                    local.referenceId(), local.evidenceId(), local.revisionId(),
+                    local.documentName(), local.location());
+            case AgentWebCitation web -> new WebCitationPayload(
+                    web.referenceId(), web.provider(), web.title(), web.url(), web.site(),
+                    web.dateLabel(), web.retrievedAt());
+        }).map(CitationPayload.class::cast).toList();
     }
 
     private static Entry findEntry(ConversationHistory history, UUID entryId) {
@@ -655,12 +821,21 @@ class ConversationRunCoordinator {
         return null;
     }
 
+    /** 恢复后的 Conversation 元数据与 JSONL 历史快照。 */
     private record RecoveryState(Conversation conversation, ConversationHistory history) {
     }
 
+    /**
+     * 主调用前压缩结果。{@code compacted=false} 时 {@code conversation} 仍是入参原件；
+     * {@code compacted=true} 时已推进到新 Compaction 叶子。
+     */
     private record CompactionOutcome(boolean compacted, Conversation conversation, long estimatedTokens) {
     }
 
+    /**
+     * 流式主调用成功结果。{@code conversation} 可能已被 overflow 强制压缩推进，
+     * 成功落盘必须以它为叶子权威，而不是 {@link #execute} 入口时的快照。
+     */
     private record MainOutcome(AgentResult result, Conversation conversation) {
     }
 }

@@ -9,6 +9,7 @@ import java.util.UUID;
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
 import com.yuyu.salmonmind.conversation.api.CompactionPayload;
 import com.yuyu.salmonmind.conversation.api.Entry;
+import com.yuyu.salmonmind.conversation.api.LocalCitationPayload;
 import com.yuyu.salmonmind.conversation.api.TokenUsage;
 import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
 import org.junit.jupiter.api.Test;
@@ -177,6 +178,26 @@ class ConversationCompactionPolicyTest {
         assertThat(policy.isValidSummary(complete.replace("## 下一步", ""))).isFalse();
         assertThat(policy.isValidSummary("   ")).isFalse();
         assertThat(policy.isValidSummary(null)).isFalse();
+    }
+
+    @Test
+    void citationProjectionIsUsedBySummaryAndTokenEstimation() {
+        Entry assistant = new Entry(1, CONVERSATION, UUID.randomUUID(), 2, null,
+                Entry.EntryType.ASSISTANT_MESSAGE, Instant.parse("2026-08-01T00:00:00Z"),
+                new AssistantMessagePayload("回答", UUID.randomUUID(), "provider", "model", null,
+                        List.of(new LocalCitationPayload("L1", UUID.randomUUID(), UUID.randomUUID(),
+                                "manual.md", "p1"))));
+        Entry laterUser = user(3, assistant.id(), "后续问题");
+        Entry laterAssistant = assistant(4, laterUser.id(), "后续回答");
+
+        long estimated = policy.estimateNextInputTokens(
+                budgets, String::length, 0, null, List.of(assistant), null, List.of());
+        ConversationCompactionPolicy.CompactionPlan plan = policy.planCompaction(
+                new ConversationCompactionPolicy.Budgets(100_000, 2000, 500, 20, 800, 0.1),
+                String::length, null, List.of(user(1, null, "首问"), assistant, laterUser, laterAssistant));
+
+        assertThat(estimated).isGreaterThan("回答".length() + 8L);
+        assertThat(plan.summarizeInput()).contains("source=LOCAL").contains("L1");
     }
 
     @Test

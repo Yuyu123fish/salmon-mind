@@ -30,6 +30,7 @@ import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.ai.openai.OpenAiChatOptions;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -242,6 +243,19 @@ class AgentCheckpointIntegrationTest {
         public ChatResponse call(Prompt prompt) {
             calls.add(new ArrayList<>(prompt.getInstructions()));
             return new ChatResponse(List.of(new Generation(new AssistantMessage(answer))));
+        }
+
+        @Override
+        public org.springframework.ai.chat.prompt.ChatOptions getDefaultOptions() {
+            // 锁定框架要求 ChatModel 默认选项与 Agent chatOptions 同类型，
+            // 否则 build 时 Jackson merge 对 DefaultChatOptions（无 @JsonProperty）抛错
+            return OpenAiChatOptions.builder().build();
+        }
+
+        @Override
+        public reactor.core.publisher.Flux<ChatResponse> stream(Prompt prompt) {
+            // 锁定框架的 LLM 节点经 ChatClient 走 stream 通道，确定性模型以单响应 Flux 实现
+            return reactor.core.publisher.Flux.just(call(prompt));
         }
     }
 }

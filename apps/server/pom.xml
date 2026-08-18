@@ -35,6 +35,10 @@
 
         <!-- Redis（RedisSaver 编译目标版本，graph-core 1.1.2.2 依赖 redisson 3.22.0） -->
         <redisson.version>3.22.0</redisson.version>
+
+        <!-- Knowledge 文档解析与向量索引 -->
+        <tika.version>3.3.2</tika.version>
+        <elasticsearch.version>8.13.0</elasticsearch.version>
     </properties>
 
     <dependencyManagement>
@@ -147,6 +151,25 @@
             <groupId>org.redisson</groupId>
             <artifactId>redisson</artifactId>
             <version>${redisson.version}</version>
+        </dependency>
+
+        <!-- Knowledge 文档解析 -->
+        <dependency>
+            <groupId>org.apache.tika</groupId>
+            <artifactId>tika-core</artifactId>
+            <version>${tika.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.tika</groupId>
+            <artifactId>tika-parsers-standard-package</artifactId>
+            <version>${tika.version}</version>
+        </dependency>
+
+        <!-- Elasticsearch Java API Client；版本与 compose 中的 ES 8.13 镜像保持一致 -->
+        <dependency>
+            <groupId>co.elastic.clients</groupId>
+            <artifactId>elasticsearch-java</artifactId>
+            <version>${elasticsearch.version}</version>
         </dependency>
 
         <!-- 测试 -->

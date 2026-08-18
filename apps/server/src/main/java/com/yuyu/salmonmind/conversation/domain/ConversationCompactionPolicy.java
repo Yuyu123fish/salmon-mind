@@ -1,6 +1,7 @@
 package com.yuyu.salmonmind.conversation.domain;
 
 import com.yuyu.salmonmind.conversation.api.Entry;
+import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -14,9 +15,8 @@ import java.util.UUID;
  * <p>Spec 关键合同（本类为唯一实现处）：
  * <ul>
  *   <li>触发阈值 = 工作窗口 − 输出预留（当前 262,144 − 65,432 = 196,712）；达到或超过即压缩。</li>
- *   <li>计量基线优先取最近一次有效、同模型 Assistant 响应的 usage.totalTokens，再加该 usage
- *       未覆盖的模型可见内容（含本次 User Entry）；usage 锚点必须晚于当前 Active Path 上的
- *       最近 Compaction，压缩后旧锚点立即失效。</li>
+ *   <li>兼容路径可优先取最近一次有效 Assistant usage 锚点；生产工具路径由调用方禁用锚点，
+ *       直接按当前 JSONL 投影、Citation 历史摘要和 Agent 动态工具预算完整计量。</li>
  *   <li>Retained Tail 从候选区末尾反向累计，达到目标后把切点移动到 User Entry 边界，
  *       保证不拆开一组 user/assistant 交互；本次 User Entry 永远保留。</li>
  *   <li>第二次及以后压缩以 previousSummary 增量吸收新退出原文区的消息，不重新摘要全部原始历史。</li>
@@ -217,7 +217,7 @@ public final class ConversationCompactionPolicy {
     private static String textOf(Entry entry) {
         return switch (entry.payload()) {
             case com.yuyu.salmonmind.conversation.api.UserMessagePayload p -> p.text();
-            case com.yuyu.salmonmind.conversation.api.AssistantMessagePayload p -> p.text();
+            case AssistantMessagePayload p -> AssistantContextRenderer.render(p);
             case com.yuyu.salmonmind.conversation.api.CompactionPayload p ->
                     throw new IllegalArgumentException("Compaction Entry 没有可计量文本: " + entry.id());
             case com.yuyu.salmonmind.conversation.api.TitlePayload p ->

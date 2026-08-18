@@ -11,12 +11,15 @@ import java.util.UUID;
  *                                 首轮无父节点时为 {@code null}，表示不能复用
  * @param answerLeafId          预分配的回答叶子 Entry ID，成功后写回 Checkpoint 标记
  * @param modelVisibleMessages  从 JSONL Active Path 投影出的完整模型可见消息
+ * @param checkpointPolicy      Checkpoint 复用策略；默认 {@link CheckpointPolicy#REUSE_IF_MATCH}，
+ *                              工具启用后的轮次应显式传 {@link CheckpointPolicy#REBUILD_FROM_PROJECTION}
  */
 public record AgentRequest(
         String threadId,
         UUID expectedCheckpointLeafId,
         UUID answerLeafId,
-        List<AgentMessage> modelVisibleMessages
+        List<AgentMessage> modelVisibleMessages,
+        CheckpointPolicy checkpointPolicy
 ) {
 
     public AgentRequest {
@@ -30,5 +33,17 @@ public record AgentRequest(
             throw new IllegalArgumentException("modelVisibleMessages 不能为空");
         }
         modelVisibleMessages = List.copyOf(modelVisibleMessages);
+        // 缺省保持 Feature 002 的叶子匹配复用语义；未来工具轮次显式选择强制重建
+        checkpointPolicy = checkpointPolicy == null ? CheckpointPolicy.REUSE_IF_MATCH : checkpointPolicy;
+    }
+
+    /** 兼容构造：显式保持叶子匹配的默认复用语义。 */
+    public AgentRequest(
+            String threadId,
+            UUID expectedCheckpointLeafId,
+            UUID answerLeafId,
+            List<AgentMessage> modelVisibleMessages
+    ) {
+        this(threadId, expectedCheckpointLeafId, answerLeafId, modelVisibleMessages, CheckpointPolicy.REUSE_IF_MATCH);
     }
 }

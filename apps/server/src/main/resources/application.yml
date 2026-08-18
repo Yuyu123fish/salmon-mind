@@ -14,6 +14,10 @@ spring:
     # 账号密码属于敏感配置：本地开发由 config/application-dev.yml 提供，容器由环境变量提供
     username: ${DATABASE_USERNAME:}
     password: ${DATABASE_PASSWORD:}
+  servlet:
+    multipart:
+      max-file-size: ${KNOWLEDGE_MAX_FILE_SIZE:52428800}
+      max-request-size: ${KNOWLEDGE_MAX_REQUEST_SIZE:53477376}
   flyway:
     locations: classpath:db/migration/workspace,classpath:db/migration/knowledge,classpath:db/migration/conversation
   modulith:
@@ -52,13 +56,32 @@ salmon:
     embedding:
       base-url: ${MODEL_EMBEDDING_BASE_URL:}
       api-key: ${MODEL_EMBEDDING_API_KEY:}
-      model-name: ${MODEL_EMBEDDING_NAME:}
+      # Stage 02 固定模型与维数；未配置 base-url/key 时仍只在 Worker 使用时失败
+      model-name: ${MODEL_EMBEDDING_NAME:Qwen/Qwen3-Embedding-4B}
+    rerank:
+      base-url: ${MODEL_RERANK_BASE_URL:}
+      api-key: ${MODEL_RERANK_API_KEY:}
+      model-name: ${MODEL_RERANK_NAME:Qwen/Qwen3-Reranker-4B}
+      instruction: ${MODEL_RERANK_INSTRUCTION:rerank-v1}
   agent:
+    # ReactAgent 公开的 ModelCallLimitHook 硬步数上限；不是模型自觉停止的提示。
     max-steps: ${AGENT_MAX_STEPS:32}
     max-tool-result-chars: ${AGENT_MAX_TOOL_RESULT_CHARS:200000}
-    max-prompt-chars: ${AGENT_MAX_PROMPT_CHARS:262144}
-    max-model-response-chars: ${AGENT_MAX_MODEL_RESPONSE_CHARS:65536}
-    max-tools: ${AGENT_MAX_TOOLS:64}
+    max-tool-calls-per-run: ${AGENT_MAX_TOOL_CALLS_PER_RUN:4}
+    # 一次主调用内所有工具消息的总 token 预算；工具结果在返回模型前按完整 item/文本边界裁剪。
+    max-tool-result-tokens-per-run: ${AGENT_MAX_TOOL_RESULT_TOKENS_PER_RUN:32768}
+  websearch:
+    connect-timeout: ${WEB_SEARCH_CONNECT_TIMEOUT:5s}
+    read-timeout: ${WEB_SEARCH_READ_TIMEOUT:15s}
+    bocha:
+      base-url: ${BOCHA_SEARCH_BASE_URL:https://api.bochaai.com}
+      api-key: ${BOCHA_SEARCH_API_KEY:}
+    search-api:
+      base-url: ${SEARCH_API_BASE_URL:https://www.searchapi.io}
+      api-key: ${SEARCH_API_API_KEY:}
+      gl: ${SEARCH_API_GL:cn}
+      hl: ${SEARCH_API_HL:zh-cn}
+      safe: ${SEARCH_API_SAFE:active}
   redis:
     # ReactAgent Checkpoint 的短期状态存储；未配置时应用仍可启动，进入对话调用才报错
     url: ${REDIS_URL:redis://127.0.0.1:6379}
@@ -72,7 +95,7 @@ salmon:
     retained-tail-target: ${COMPACTION_RETAINED_TAIL_TARGET:65536}
     summary-max-output-tokens: ${COMPACTION_SUMMARY_MAX_OUTPUT_TOKENS:32768}
     summary-temperature: ${COMPACTION_SUMMARY_TEMPERATURE:0.1}
-    # 无 usage 锚点时参与首次计量的 system prompt 保守估算（覆盖 Agent 提示与框架注入开销）
+    # Agent 报告的实际 system/tool schema 开销下限；256 不是完整 system/tool token 数
     system-prompt-tokens: ${COMPACTION_SYSTEM_PROMPT_TOKENS:256}
   conversation:
     # 权威会话历史目录，Server 容器必须显式挂载；不与 infra/data/ 混用
@@ -83,6 +106,15 @@ salmon:
     max-object-bytes: ${KNOWLEDGE_MAX_OBJECT_BYTES:52428800}
     default-top-k: ${KNOWLEDGE_DEFAULT_TOP_K:5}
     max-top-k: ${KNOWLEDGE_MAX_TOP_K:20}
+    queue:
+      stream: ${KNOWLEDGE_QUEUE_STREAM:salmon:knowledge:ingestion}
+      group: ${KNOWLEDGE_QUEUE_GROUP:salmon-knowledge-workers}
+    worker:
+      enabled: ${KNOWLEDGE_WORKER_ENABLED:true}
+      batch-size: ${KNOWLEDGE_WORKER_BATCH_SIZE:4}
+      max-auto-retries: ${KNOWLEDGE_WORKER_MAX_AUTO_RETRIES:2}
+      reclaim-idle: ${KNOWLEDGE_WORKER_RECLAIM_IDLE:30s}
+      repair-interval: ${KNOWLEDGE_WORKER_REPAIR_INTERVAL:10s}
     content-store:
       endpoint: ${RUSTFS_ENDPOINT:}
       access-key: ${RUSTFS_ACCESS_KEY:}
@@ -96,3 +128,7 @@ salmon:
       index-prefix: ${KNOWLEDGE_INDEX_PREFIX:salmon-evidence}
       shards: ${KNOWLEDGE_INDEX_SHARDS:1}
       replicas: ${KNOWLEDGE_INDEX_REPLICAS:0}
+      connect-timeout: ${KNOWLEDGE_SEARCH_CONNECT_TIMEOUT:5s}
+      read-timeout: ${KNOWLEDGE_SEARCH_READ_TIMEOUT:30s}
+      max-revision-filter: ${KNOWLEDGE_MAX_REVISION_FILTER:512}
+      vector-num-candidates: ${KNOWLEDGE_VECTOR_NUM_CANDIDATES:200}

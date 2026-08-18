@@ -4,7 +4,7 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Knowledge Stage 02 的唯一跨模块业务入口：上传、状态、详情、Evidence 预览和重试。
+ * Knowledge Stage 02 的唯一跨模块业务入口：上传、状态、详情、切片预览、重试和删除。
  * 查询召回、RRF、Rerank 与 Agent Tool 不属于本接口。
  */
 public interface KnowledgeService {
@@ -26,4 +26,10 @@ public interface KnowledgeService {
 
     /** 为可重试失败复用原 Revision/原件，创建下一次处理 Job。 */
     DocumentSummary retry(UUID documentId);
+
+    /**
+     * 删除当前 Workspace 下的单个终态文档。实现必须先切断检索可见性，
+     * 再完成外部派生数据与原件清理；成功时不返回文档正文。
+     */
+    void delete(UUID documentId);
 }

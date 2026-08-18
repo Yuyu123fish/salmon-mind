@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  deleteDocument,
   fetchDocument,
   fetchDocuments,
   fetchEvidence,
@@ -14,8 +15,14 @@ import {
   type SearchReason,
   type SearchStage,
 } from './knowledgeApi.ts'
+import { KnowledgeApiError } from './knowledgeApi.ts'
+import { MarkdownRenderer } from './MarkdownRenderer.tsx'
 
 const TERMINAL_STATES: KnowledgeState[] = ['READY', 'OCR_REQUIRED', 'FAILED']
+const DELETE_ELIGIBLE_STATES: KnowledgeState[] = [...TERMINAL_STATES, 'DELETING']
+const PROCESSING_STATES: KnowledgeState[] = [
+  'PENDING_DISPATCH', 'QUEUED', 'PARSING', 'EMBEDDING', 'INDEXING',
+]
 
 const stateLabels: Record<KnowledgeState, string> = {
   PENDING_DISPATCH: '等待排队',
@@ -26,6 +33,7 @@ const stateLabels: Record<KnowledgeState, string> = {
   READY: '已就绪',
   OCR_REQUIRED: '需要 OCR',
   FAILED: '处理失败',
+  DELETING: '删除未完成',
 }
 
 const formatLabels: Record<string, string> = {
@@ -37,6 +45,15 @@ const formatLabels: Record<string, string> = {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : '知识文档请求失败'
+}
+
+function deleteMessageOf(error: unknown): string {
+  if (error instanceof KnowledgeApiError) {
+    if (error.code === 'DOCUMENT_DELETE_NOT_ALLOWED') return '当前文档状态不允许删除。'
+    if (error.code === 'DOCUMENT_DELETE_INCOMPLETE') return '删除未完成，文档仍不可检索，请重试删除。'
+    if (error.code === 'DOCUMENT_NOT_FOUND') return '文档已不存在，正在刷新资料列表。'
+  }
+  return '删除未完成，请重试删除。'
 }
 
 function formatTime(iso: string): string {
@@ -80,6 +97,9 @@ function KnowledgeView() {
   const [detailLoading, setDetailLoading] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [retrying, setRetrying] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+  const [deleteConfirming, setDeleteConfirming] = useState(false)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [evidenceError, setEvidenceError] = useState<string | null>(null)
   const [evidencePageNumber, setEvidencePageNumber] = useState(0)
@@ -87,10 +107,13 @@ function KnowledgeView() {
   const [searching, setSearching] = useState(false)
   const [searchResult, setSearchResult] = useState<KnowledgeSearchResult | null>(null)
   const [searchError, setSearchError] = useState<string | null>(null)
+  const [expandedChunks, setExpandedChunks] = useState<Set<string>>(new Set())
   const [pageVisible, setPageVisible] = useState(window.document.visibilityState === 'visible')
   const detailRequest = useRef(0)
   const documentListRequest = useRef(0)
+  const evidenceRequest = useRef(0)
   const searchRequest = useRef(0)
+  const mutationGeneration = useRef(0)
 
   useEffect(() => {
     const updateVisibility = () => setPageVisible(window.document.visibilityState === 'visible')
@@ -100,19 +123,22 @@ function KnowledgeView() {
 
   const refreshDocuments = useCallback(async () => {
     const requestId = ++documentListRequest.current
+    const generation = mutationGeneration.current
     setError(null)
     try {
       const next = await fetchDocuments()
-      if (requestId !== documentListRequest.current) return
+      if (requestId !== documentListRequest.current || generation !== mutationGeneration.current) return
       setDocuments(next)
       setSelectedId((current) => {
         if (current !== null && next.some((item) => item.id === current)) return current
         return next[0]?.id ?? null
       })
     } catch (requestError: unknown) {
-      if (requestId === documentListRequest.current) setError(messageOf(requestError))
+      if (requestId === documentListRequest.current && generation === mutationGeneration.current) {
+        setError(messageOf(requestError))
+      }
     } finally {
-      if (requestId === documentListRequest.current) setLoading(false)
+      if (requestId === documentListRequest.current && generation === mutationGeneration.current) setLoading(false)
     }
   }, [])
 
@@ -122,20 +148,25 @@ function KnowledgeView() {
 
   const loadDetail = useCallback(async (id: string, silent = false) => {
     const requestId = ++detailRequest.current
+    const generation = mutationGeneration.current
     if (!silent) setDetailLoading(true)
     try {
       const next = await fetchDocument(id)
-      if (requestId !== detailRequest.current) return null
+      if (requestId !== detailRequest.current || generation !== mutationGeneration.current) return null
       setDetail(next)
       setDocuments((current) =>
         current.map((item) => (item.id === id ? next.document : item)),
       )
       return next
     } catch (requestError: unknown) {
-      if (requestId === detailRequest.current) setError(messageOf(requestError))
+      if (requestId === detailRequest.current && generation === mutationGeneration.current) {
+        setError(messageOf(requestError))
+      }
       return null
     } finally {
-      if (!silent && requestId === detailRequest.current) setDetailLoading(false)
+      if (!silent && requestId === detailRequest.current && generation === mutationGeneration.current) {
+        setDetailLoading(false)
+      }
     }
   }, [])
 
@@ -150,13 +181,16 @@ function KnowledgeView() {
     setEvidence(null)
     setEvidenceError(null)
     setEvidencePageNumber(0)
+    setExpandedChunks(new Set())
+    setDeleteConfirming(false)
+    setDeleteError(null)
     void loadDetail(selectedId)
   }, [loadDetail, selectedId])
 
   // 非终态持续刷新；页面不可见时降频，进入终态后停止。
   useEffect(() => {
     if (selectedId === null || detail === null || detail.document.id !== selectedId) return
-    if (TERMINAL_STATES.includes(detail.document.state)) return
+    if (TERMINAL_STATES.includes(detail.document.state) || detail.document.state === 'DELETING') return
     const timer = window.setInterval(() => {
       void loadDetail(selectedId, true)
     }, pageVisible ? 2000 : 10000)
@@ -164,25 +198,39 @@ function KnowledgeView() {
   }, [detail, loadDetail, pageVisible, selectedId])
 
   useEffect(() => {
-    if (selectedId === null || detail?.document.state !== 'READY') return
+    const requestId = ++evidenceRequest.current
+    const generation = mutationGeneration.current
+    if (selectedId === null || detail?.document.state !== 'READY') {
+      setEvidence(null)
+      setExpandedChunks(new Set())
+      return
+    }
     let cancelled = false
     setEvidence(null)
     setEvidenceError(null)
     void fetchEvidence(selectedId, evidencePageNumber, 20)
       .then((next) => {
-        if (!cancelled) setEvidence(next)
+        if (!cancelled && requestId === evidenceRequest.current && generation === mutationGeneration.current) {
+          setEvidence(next)
+        }
       })
       .catch((requestError: unknown) => {
-        if (!cancelled) setEvidenceError(messageOf(requestError))
+        if (!cancelled && requestId === evidenceRequest.current && generation === mutationGeneration.current) {
+          setEvidenceError(messageOf(requestError))
+        }
       })
     return () => {
       cancelled = true
     }
   }, [detail?.document.state, evidencePageNumber, selectedId])
 
+  useEffect(() => {
+    setExpandedChunks(new Set())
+  }, [evidencePageNumber, selectedId])
+
   const readyCount = useMemo(() => documents.filter((item) => item.state === 'READY').length, [documents])
   const activeCount = useMemo(
-    () => documents.filter((item) => !TERMINAL_STATES.includes(item.state)).length,
+    () => documents.filter((item) => PROCESSING_STATES.includes(item.state)).length,
     [documents],
   )
 
@@ -190,6 +238,7 @@ function KnowledgeView() {
     const file = event.target.files?.[0]
     event.target.value = ''
     if (file === undefined) return
+    mutationGeneration.current += 1
     setUploading(true)
     setError(null)
     try {
@@ -207,6 +256,7 @@ function KnowledgeView() {
 
   const handleRetry = async () => {
     if (selectedId === null || retrying) return
+    mutationGeneration.current += 1
     setRetrying(true)
     setError(null)
     try {
@@ -221,20 +271,65 @@ function KnowledgeView() {
     }
   }
 
+  const handleDelete = async () => {
+    if (selectedId === null || deleting) return
+    const deletingId = selectedId
+    mutationGeneration.current += 1
+    detailRequest.current += 1
+    evidenceRequest.current += 1
+    searchRequest.current += 1
+    setDeleting(true)
+    setLoading(false)
+    setDetailLoading(false)
+    setSearching(false)
+    setDeleteConfirming(false)
+    setDeleteError(null)
+    setError(null)
+    setSearchResult(null)
+    setEvidence(null)
+    setEvidenceError(null)
+    setExpandedChunks(new Set())
+    try {
+      await deleteDocument(deletingId)
+      const removedIndex = documents.findIndex((item) => item.id === deletingId)
+      const remaining = documents.filter((item) => item.id !== deletingId)
+      const nextId = remaining[removedIndex]?.id ?? remaining[removedIndex - 1]?.id ?? null
+      setDocuments(remaining)
+      setSelectedId(nextId)
+      setDetail(null)
+      setEvidence(null)
+      setEvidenceError(null)
+      setExpandedChunks(new Set())
+      setEvidencePageNumber(0)
+    } catch (requestError: unknown) {
+      setDeleteError(deleteMessageOf(requestError))
+      if (requestError instanceof KnowledgeApiError && requestError.code === 'DOCUMENT_NOT_FOUND') {
+        void refreshDocuments()
+      } else {
+        await loadDetail(deletingId)
+      }
+    } finally {
+      setDeleting(false)
+    }
+  }
+
   const handleSearch = async () => {
     const query = searchQuery.trim()
     if (query === '' || searching) return
     const requestId = ++searchRequest.current
+    const generation = mutationGeneration.current
     setSearching(true)
     setSearchError(null)
     setSearchResult(null)
     try {
       const next = await searchKnowledge(query)
-      if (requestId === searchRequest.current) setSearchResult(next)
+      if (requestId === searchRequest.current && generation === mutationGeneration.current) setSearchResult(next)
     } catch (requestError: unknown) {
-      if (requestId === searchRequest.current) setSearchError(messageOf(requestError))
+      if (requestId === searchRequest.current && generation === mutationGeneration.current) {
+        setSearchError(messageOf(requestError))
+      }
     } finally {
-      if (requestId === searchRequest.current) setSearching(false)
+      if (requestId === searchRequest.current && generation === mutationGeneration.current) setSearching(false)
     }
   }
 
@@ -272,61 +367,6 @@ function KnowledgeView() {
         <div><strong>{readyCount}</strong><span>已就绪</span></div>
         <div><strong>{activeCount}</strong><span>处理中</span></div>
       </div>
-
-      <section className="retrieval-diagnostics" aria-labelledby="retrieval-title">
-        <div className="section-heading">
-          <div>
-            <p className="kicker">检索诊断</p>
-            <h2 id="retrieval-title">看看一条查询如何穿过资料</h2>
-          </div>
-          {searchResult !== null && <span>{searchResult.policyVersion}</span>}
-        </div>
-        <form className="retrieval-form" onSubmit={(event) => { event.preventDefault(); void handleSearch() }}>
-          <input
-            value={searchQuery}
-            onChange={(event) => setSearchQuery(event.target.value)}
-            placeholder="输入中文或英文查询"
-            maxLength={2000}
-            aria-label="检索查询"
-          />
-          <button type="submit" className="primary-small" disabled={searching || searchQuery.trim() === ''}>
-            {searching ? '检索中…' : '运行检索'}
-          </button>
-        </form>
-        {searchError !== null && <p className="detail-error">{searchError}</p>}
-        {searchResult !== null && (
-          <>
-            <div className={`retrieval-status ${searchResult.status.toLowerCase()}`} role="status">
-              <strong>{searchResult.status}</strong>
-              <span>{searchReasonLabels[searchResult.reason]}</span>
-              <small>已执行：{searchResult.executedStages.join(' → ') || '—'} · 跳过：{searchResult.skippedStages.join('、') || '—'}</small>
-            </div>
-            <div className="retrieval-stages">
-              {searchStageLabels.map(([key, label]) => {
-                const stage: SearchStage = searchResult[key]
-                return (
-                  <section className="retrieval-stage" key={key}>
-                    <div className="section-heading compact"><h3>{label}</h3><span>{stage.items.length} 条</span></div>
-                    {stage.items.length === 0 ? <p className="detail-hint">没有候选</p> : (
-                      <ol>
-                        {stage.items.map((item) => (
-                          <li key={`${key}-${item.evidenceId}`}>
-                            <div>
-                              <strong>#{item.rank ?? '—'} · {item.documentName}</strong>
-                              <small>{item.location} · 诊断分数 {item.score === null ? '—' : item.score.toFixed(4)}</small>
-                            </div>
-                            <p>{item.text}</p>
-                          </li>
-                        ))}
-                      </ol>
-                    )}
-                  </section>
-                )
-              })}
-            </div>
-          </>
-        )}
-      </section>
 
       <div className="knowledge-grid">
         <section className="document-shelf" aria-labelledby="document-list-title">
@@ -390,13 +430,38 @@ function KnowledgeView() {
                 </div>
                 <div className="detail-actions">
                   <span className={`state-chip ${stateClass(detail.document.state)}`}>{stateLabels[detail.document.state]}</span>
+                  {DELETE_ELIGIBLE_STATES.includes(detail.document.state) && (
+                    <button
+                      type="button"
+                      className="danger-small"
+                      onClick={() => setDeleteConfirming(true)}
+                      disabled={deleting || retrying}
+                    >
+                      {deleting ? '正在删除…' : detail.document.state === 'DELETING' ? '重试删除' : '删除文档'}
+                    </button>
+                  )}
                   {detail.document.state === 'FAILED' && detail.document.retryable && (
-                    <button type="button" className="primary-small" onClick={() => void handleRetry()} disabled={retrying}>
+                    <button type="button" className="primary-small" onClick={() => void handleRetry()} disabled={retrying || deleting}>
                       {retrying ? '重新排队…' : '重试'}
                     </button>
                   )}
                 </div>
               </header>
+
+              {deleteConfirming && (
+                <div className="delete-confirm" role="alert">
+                  <div>
+                    <strong>确认删除“{detail.document.name}”？</strong>
+                    <span>将清理原件及 {detail.document.evidenceCount} 个切片，删除完成后无法恢复。</span>
+                  </div>
+                  <div className="detail-actions">
+                    <button type="button" className="quiet-button" onClick={() => setDeleteConfirming(false)} disabled={deleting}>取消</button>
+                    <button type="button" className="danger-small" onClick={() => void handleDelete()} disabled={deleting}>确认删除</button>
+                  </div>
+                </div>
+              )}
+              {deleting && <p className="delete-progress" role="status">正在删除“{detail.document.name}”，请不要重复操作。</p>}
+              {deleteError !== null && <p className="delete-error" role="alert">{deleteError}</p>}
 
               <div className="document-meta">
                 <div><span>格式</span><strong>{formatLabels[detail.document.format] ?? detail.document.format}</strong></div>
@@ -415,6 +480,9 @@ function KnowledgeView() {
               {detail.document.state === 'OCR_REQUIRED' && (
                 <div className="failure-note"><strong>需要 OCR</strong><span>当前版本不会伪造扫描文本；这份 PDF 暂未进入可检索状态。</span></div>
               )}
+              {detail.document.state === 'DELETING' && !deleting && (
+                <div className="failure-note delete-note"><strong>删除未完成</strong><span>文档已退出未来检索范围；可使用“重试删除”继续清理。</span></div>
+              )}
 
               <section className="job-history" aria-labelledby="job-history-title">
                 <div className="section-heading compact"><h3 id="job-history-title">处理轨迹</h3><span>{formatTime(detail.document.updatedAt)}</span></div>
@@ -428,22 +496,52 @@ function KnowledgeView() {
                 </ol>
               </section>
 
-              {detail.document.state === 'READY' && (
+              {detail.document.state === 'READY' && !deleting && (
                 <section className="evidence-section" aria-labelledby="evidence-title">
-                  <div className="section-heading compact"><h3 id="evidence-title">Evidence 预览</h3><span>{detail.document.evidenceCount} 个片段</span></div>
+                  <div className="section-heading compact"><h3 id="evidence-title">切片预览</h3><span>{detail.document.evidenceCount} 个切片</span></div>
                   {evidenceError !== null && <p className="detail-error">{evidenceError}</p>}
-                  {evidence === null && evidenceError === null && <p className="detail-hint">正在读取片段…</p>}
-                  {evidence !== null && evidence.items.length === 0 && <p className="detail-hint">没有可预览的片段。</p>}
+                  {evidence === null && evidenceError === null && <p className="detail-hint">正在读取切片…</p>}
+                  {evidence !== null && evidence.items.length === 0 && <p className="detail-hint">没有可预览的切片。</p>}
                   <div className="evidence-list">
                     {evidence?.items.map((item) => (
-                      <article className="evidence-card" key={item.id}>
-                        <div><span>{item.location}</span><small>{item.charCount} 字</small></div>
-                        <p>{item.text}</p>
+                      <article
+                        className="evidence-card"
+                        data-expanded={expandedChunks.has(`${selectedId}:${evidence.page}:${item.id}`)}
+                        key={item.id}
+                      >
+                        <div className="evidence-card-heading">
+                          <div>
+                            <strong>切片 {item.ordinal + 1}</strong>
+                            <span>{item.location}</span>
+                          </div>
+                          <div>
+                            <small>{item.charCount} 字符</small>
+                            <button
+                              type="button"
+                              className="chunk-toggle"
+                              aria-expanded={expandedChunks.has(`${selectedId}:${evidence.page}:${item.id}`)}
+                              onClick={() => setExpandedChunks((current) => {
+                                const key = `${selectedId}:${evidence.page}:${item.id}`
+                                const next = new Set(current)
+                                if (next.has(key)) next.delete(key)
+                                else next.add(key)
+                                return next
+                              })}
+                            >
+                              {expandedChunks.has(`${selectedId}:${evidence.page}:${item.id}`) ? '收起' : '展开'}
+                            </button>
+                          </div>
+                        </div>
+                        <div className="evidence-card-body">
+                          {detail.document.format === 'MARKDOWN'
+                            ? <MarkdownRenderer text={item.text} />
+                            : <p>{item.text}</p>}
+                        </div>
                       </article>
                     ))}
                   </div>
                   {evidence !== null && evidence.total > evidence.size && (
-                    <div className="evidence-pager" aria-label="Evidence 分页">
+                    <div className="evidence-pager" aria-label="切片分页">
                       <button
                         type="button"
                         className="quiet-button"
@@ -469,6 +567,63 @@ function KnowledgeView() {
           )}
         </section>
       </div>
+
+      <details className="retrieval-diagnostics">
+        <summary className="retrieval-summary">
+          <div>
+            <p className="kicker">检索诊断</p>
+            <h2 id="retrieval-title">看看一条查询如何穿过资料</h2>
+          </div>
+          <span>{searchResult?.policyVersion ?? '按需展开'}</span>
+        </summary>
+        <div className="retrieval-diagnostics-body" aria-labelledby="retrieval-title">
+          <form className="retrieval-form" onSubmit={(event) => { event.preventDefault(); void handleSearch() }}>
+            <input
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="输入中文或英文查询"
+              maxLength={2000}
+              aria-label="检索查询"
+            />
+            <button type="submit" className="primary-small" disabled={searching || searchQuery.trim() === ''}>
+              {searching ? '检索中…' : '运行检索'}
+            </button>
+          </form>
+          {searchError !== null && <p className="detail-error">{searchError}</p>}
+          {searchResult !== null && (
+            <>
+              <div className={`retrieval-status ${searchResult.status.toLowerCase()}`} role="status">
+                <strong>{searchResult.status}</strong>
+                <span>{searchReasonLabels[searchResult.reason]}</span>
+                <small>已执行：{searchResult.executedStages.join(' → ') || '—'} · 跳过：{searchResult.skippedStages.join('、') || '—'}</small>
+              </div>
+              <div className="retrieval-stages">
+                {searchStageLabels.map(([key, label]) => {
+                  const stage: SearchStage = searchResult[key]
+                  return (
+                    <section className="retrieval-stage" key={key}>
+                      <div className="section-heading compact"><h3>{label}</h3><span>{stage.items.length} 条</span></div>
+                      {stage.items.length === 0 ? <p className="detail-hint">没有候选</p> : (
+                        <ol>
+                          {stage.items.map((item) => (
+                            <li key={`${key}-${item.evidenceId}`}>
+                              <div>
+                                <strong>#{item.rank ?? '—'} · {item.documentName}</strong>
+                                <small>{item.location} · 诊断分数 {item.score === null ? '—' : item.score.toFixed(4)}</small>
+                              </div>
+                              <p>{item.text}</p>
+                            </li>
+                          ))}
+                        </ol>
+                      )}
+                    </section>
+                  )
+                })}
+              </div>
+            </>
+          )}
+        </div>
+      </details>
     </section>
   )
 }

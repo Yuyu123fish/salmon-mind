@@ -2,6 +2,7 @@ package com.yuyu.salmonmind.knowledge.application.port;
 
 import com.yuyu.salmonmind.knowledge.domain.DocumentFormat;
 import com.yuyu.salmonmind.knowledge.domain.IngestionJobState;
+import com.yuyu.salmonmind.knowledge.domain.KnowledgeSourceLifecycle;
 
 import java.time.Instant;
 import java.util.Collection;
@@ -52,6 +53,18 @@ public interface KnowledgeMetadataPort {
 
     /** 按 Workspace 隔离读取文档；不存在时返回 {@code null}。 */
     StoredDocument find(UUID workspaceId, UUID sourceId);
+
+    /**
+     * 在 PostgreSQL 事务内锁定精确 Source，校验最新 Job 的删除资格，
+     * 标记 DELETING 并冻结所有待清理的内部身份。跨 Workspace 目标必须表现为不存在。
+     */
+    DeletionTarget markDeleting(UUID workspaceId, UUID sourceId);
+
+    /**
+     * 外部索引与原件均确认清理后，按 Evidence → Job → Revision → Source 顺序完成最终删除，
+     * 并从剩余 Evidence 重算受影响 Generation 计数。目标之外出现新关联数据时必须失败。
+     */
+    void finalizeDeletion(DeletionTarget target);
 
     /** 读取单个 Job 的当前状态；不存在时返回 {@code null}。 */
     StoredJob findJob(UUID jobId);
@@ -113,6 +126,40 @@ public interface KnowledgeMetadataPort {
     /** 按同一 Generation 二次校验候选 Evidence，并补全文档名、位置等 PostgreSQL 元数据。 */
     Map<UUID, ReadyEvidence> findReadyEvidence(RetrievalScope scope, Collection<UUID> evidenceIds);
 
+    /**
+     * 删除开始时由 PostgreSQL 冻结的精确目标；物理索引、Object Key 和内部 ID 不越过 Knowledge API。
+     * generations 即使没有当前 Evidence 也保留，确保索引写入成功但 READY 发布失败的残留仍会被清理。
+     */
+    record DeletionTarget(
+            UUID workspaceId,
+            UUID sourceId,
+            List<RevisionTarget> revisions,
+            List<GenerationTarget> generations
+    ) {
+        public DeletionTarget {
+            revisions = revisions == null ? List.of() : List.copyOf(revisions);
+            generations = generations == null ? List.of() : List.copyOf(generations);
+        }
+
+        public List<UUID> revisionIds() {
+            return revisions.stream().map(RevisionTarget::revisionId).toList();
+        }
+    }
+
+    /** Source 下一个不可变 Revision 及标记时已存在的全部 Job。 */
+    record RevisionTarget(UUID revisionId, String objectKey, List<UUID> jobIds) {
+        public RevisionTarget {
+            jobIds = jobIds == null ? List.of() : List.copyOf(jobIds);
+        }
+    }
+
+    /** 一个已知物理 Generation 中属于目标 Revision 的 Evidence 身份。 */
+    record GenerationTarget(UUID generationId, String physicalIndex, List<UUID> evidenceIds) {
+        public GenerationTarget {
+            evidenceIds = evidenceIds == null ? List.of() : List.copyOf(evidenceIds);
+        }
+    }
+
     /** 上传事务提交后的稳定身份；后续 Stream 只携带 jobId 和 attemptNumber。 */
     record Submission(UUID sourceId, UUID revisionId, UUID jobId, int attemptNumber) {
     }
@@ -121,6 +168,7 @@ public interface KnowledgeMetadataPort {
     record StoredDocument(
             UUID sourceId,
             UUID workspaceId,
+            KnowledgeSourceLifecycle lifecycle,
             String name,
             StoredRevision revision,
             StoredJob latestJob,

@@ -5,6 +5,7 @@ import com.yuyu.salmonmind.knowledge.api.KnowledgeException;
 import com.yuyu.salmonmind.knowledge.application.port.KnowledgeMetadataPort;
 import com.yuyu.salmonmind.knowledge.domain.DocumentFormat;
 import com.yuyu.salmonmind.knowledge.domain.IngestionJobState;
+import com.yuyu.salmonmind.knowledge.domain.KnowledgeSourceLifecycle;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -12,9 +13,11 @@ import java.time.Instant;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -67,6 +70,7 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
         source.setWorkspaceId(workspaceId);
         source.setName(name);
         source.setKind("DOCUMENT");
+        source.setLifecycle(KnowledgeSourceLifecycle.ACTIVE.name());
         source.setCreatedAt(now);
         sourceMapper.insert(source);
 
@@ -156,6 +160,92 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
     }
 
     @Override
+    @Transactional
+    public DeletionTarget markDeleting(UUID workspaceId, UUID sourceId) {
+        KnowledgeSourceEntity source = sourceMapper.selectForUpdate(workspaceId, sourceId);
+        if (source == null) {
+            // Workspace 隔离与不存在使用同一错误，避免泄露其他 Workspace 的 Source 身份。
+            throw new KnowledgeException(KnowledgeException.Code.DOCUMENT_NOT_FOUND, "文档不存在");
+        }
+
+        KnowledgeSourceLifecycle lifecycle = KnowledgeSourceLifecycle.valueOf(source.getLifecycle());
+        List<KnowledgeRevisionEntity> revisions = revisionsFor(sourceId);
+        if (lifecycle == KnowledgeSourceLifecycle.ACTIVE) {
+            KnowledgeRevisionEntity latestRevision = revisions.stream()
+                    .max(Comparator.comparing(KnowledgeRevisionEntity::getRevisionNumber))
+                    .orElse(null);
+            KnowledgeIngestionJobEntity latestJob = latestRevision == null
+                    ? null
+                    : jobsFor(latestRevision.getId()).stream()
+                    .max(Comparator.comparing(KnowledgeIngestionJobEntity::getAttemptNumber))
+                    .orElse(null);
+            if (latestJob == null || !deletionEligible(latestJob.getState())) {
+                throw new KnowledgeException(KnowledgeException.Code.DOCUMENT_DELETE_NOT_ALLOWED,
+                        "当前文档状态不允许删除");
+            }
+            source.setLifecycle(KnowledgeSourceLifecycle.DELETING.name());
+            sourceMapper.updateById(source);
+        }
+        return freezeDeletionTarget(workspaceId, source, revisions);
+    }
+
+    @Override
+    @Transactional
+    public void finalizeDeletion(DeletionTarget target) {
+        KnowledgeSourceEntity source = sourceMapper.selectForUpdate(target.workspaceId(), target.sourceId());
+        if (source == null) {
+            // 另一个已经取得合法 Target 的并发请求可能刚完成最终删除；本请求可安全收束。
+            return;
+        }
+        if (!KnowledgeSourceLifecycle.DELETING.name().equals(source.getLifecycle())) {
+            throw incompleteDeletion("删除目标的 Source 生命周期已改变");
+        }
+
+        List<KnowledgeRevisionEntity> currentRevisions = revisionsFor(target.sourceId());
+        Set<UUID> expectedRevisionIds = new HashSet<>(target.revisionIds());
+        Set<UUID> currentRevisionIds = currentRevisions.stream()
+                .map(KnowledgeRevisionEntity::getId).collect(java.util.stream.Collectors.toSet());
+        if (!expectedRevisionIds.equals(currentRevisionIds)) {
+            throw incompleteDeletion("删除目标之外出现新的 Revision");
+        }
+
+        List<KnowledgeIngestionJobEntity> currentJobs = allJobs(currentRevisionIds);
+        Set<UUID> expectedJobIds = target.revisions().stream()
+                .flatMap(item -> item.jobIds().stream()).collect(java.util.stream.Collectors.toSet());
+        Set<UUID> currentJobIds = currentJobs.stream()
+                .map(KnowledgeIngestionJobEntity::getId).collect(java.util.stream.Collectors.toSet());
+        if (!expectedJobIds.equals(currentJobIds)) {
+            throw incompleteDeletion("删除目标之外出现新的处理 Job");
+        }
+
+        List<KnowledgeEvidenceEntity> currentEvidence = currentEvidence(currentRevisionIds);
+        Set<UUID> expectedEvidenceIds = target.generations().stream()
+                .flatMap(item -> item.evidenceIds().stream()).collect(java.util.stream.Collectors.toSet());
+        Set<UUID> currentEvidenceIds = currentEvidence.stream()
+                .map(KnowledgeEvidenceEntity::getId).collect(java.util.stream.Collectors.toSet());
+        if (!expectedEvidenceIds.equals(currentEvidenceIds)) {
+            throw incompleteDeletion("删除目标之外出现新的 Evidence");
+        }
+
+        // 外键是 RESTRICT；显式按依赖顺序删除，避免未来新增关联时被无差别级联掩盖。
+        if (!currentEvidenceIds.isEmpty()) {
+            evidenceMapper.delete(Wrappers.<KnowledgeEvidenceEntity>lambdaQuery()
+                    .in(KnowledgeEvidenceEntity::getId, currentEvidenceIds));
+        }
+        if (!currentJobIds.isEmpty()) {
+            jobMapper.delete(Wrappers.<KnowledgeIngestionJobEntity>lambdaQuery()
+                    .in(KnowledgeIngestionJobEntity::getId, currentJobIds));
+        }
+        if (!currentRevisionIds.isEmpty()) {
+            revisionMapper.delete(Wrappers.<KnowledgeRevisionEntity>lambdaQuery()
+                    .in(KnowledgeRevisionEntity::getId, currentRevisionIds));
+        }
+
+        recalculateGenerations(target.generations());
+        sourceMapper.deleteById(target.sourceId());
+    }
+
+    @Override
     public StoredJob findJob(UUID jobId) {
         KnowledgeIngestionJobEntity entity = jobMapper.selectById(jobId);
         return entity == null ? null : toJob(entity);
@@ -179,13 +269,18 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
     @Override
     @Transactional
     public StoredJob createRetry(UUID workspaceId, UUID sourceId) {
-        KnowledgeSourceEntity source = sourceMapper.selectOne(Wrappers.<KnowledgeSourceEntity>lambdaQuery()
-                .eq(KnowledgeSourceEntity::getId, sourceId)
-                .eq(KnowledgeSourceEntity::getWorkspaceId, workspaceId));
+        KnowledgeSourceEntity source = sourceMapper.selectForUpdate(workspaceId, sourceId);
         if (source == null) {
             throw new KnowledgeException(KnowledgeException.Code.DOCUMENT_NOT_FOUND, "文档不存在");
         }
+        if (!KnowledgeSourceLifecycle.ACTIVE.name().equals(source.getLifecycle())) {
+            throw new KnowledgeException(KnowledgeException.Code.DOCUMENT_DELETE_NOT_ALLOWED,
+                    "文档正在删除，不能重试入库");
+        }
         KnowledgeRevisionEntity revision = latestRevision(sourceId);
+        if (revision == null) {
+            throw new KnowledgeException(KnowledgeException.Code.DOCUMENT_NOT_FOUND, "文档不存在");
+        }
         List<KnowledgeIngestionJobEntity> jobs = jobsFor(revision.getId());
         KnowledgeIngestionJobEntity latest = jobs.stream()
                 .max(Comparator.comparing(KnowledgeIngestionJobEntity::getAttemptNumber)).orElseThrow();
@@ -206,7 +301,11 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
     }
 
     @Override
+    @Transactional
     public boolean prepareAutomaticRetry(UUID jobId) {
+        if (!lockActiveSourceForJob(jobId)) {
+            return false;
+        }
         KnowledgeIngestionJobEntity update = new KnowledgeIngestionJobEntity();
         update.setState(IngestionJobState.PENDING_DISPATCH.name());
         update.setRetryable(false);
@@ -225,7 +324,11 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
     }
 
     @Override
+    @Transactional
     public boolean transition(UUID jobId, Collection<IngestionJobState> expected, IngestionJobState target) {
+        if (!lockActiveSourceForJob(jobId)) {
+            return false;
+        }
         Instant now = Instant.now();
         KnowledgeIngestionJobEntity update = new KnowledgeIngestionJobEntity();
         update.setState(target.name());
@@ -239,7 +342,11 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
     }
 
     @Override
+    @Transactional
     public void updateParseMetadata(UUID revisionId, int pageCount, int textCharCount) {
+        if (!lockActiveSourceForRevision(revisionId)) {
+            return;
+        }
         KnowledgeRevisionEntity update = new KnowledgeRevisionEntity();
         update.setPageCount(pageCount);
         update.setTextCharCount(textCharCount);
@@ -248,12 +355,17 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
     }
 
     @Override
+    @Transactional
     public void markOcrRequired(UUID jobId, String errorCode, String message) {
         finishFailure(jobId, IngestionJobState.OCR_REQUIRED, errorCode, message, false);
     }
 
     @Override
+    @Transactional
     public void markFailed(UUID jobId, String errorCode, String message, boolean retryable) {
+        if (!lockActiveSourceForJob(jobId)) {
+            return;
+        }
         KnowledgeIngestionJobEntity update = new KnowledgeIngestionJobEntity();
         update.setState(IngestionJobState.FAILED.name());
         update.setRetryable(retryable);
@@ -310,6 +422,14 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
         if (job == null || !IngestionJobState.INDEXING.name().equals(job.getState())) {
             return;
         }
+        KnowledgeRevisionEntity revision = revisionMapper.selectById(revisionId);
+        KnowledgeSourceEntity source = revision == null
+                ? null
+                : sourceMapper.selectForUpdateById(revision.getSourceId());
+        if (source == null || !KnowledgeSourceLifecycle.ACTIVE.name().equals(source.getLifecycle())) {
+            // 删除先取得 Source 锁时，旧 Worker 只能收束消息，不能重新发布 READY。
+            return;
+        }
         updateParseMetadata(revisionId, pageCount, textCharCount);
         evidenceMapper.delete(Wrappers.<KnowledgeEvidenceEntity>lambdaQuery()
                 .eq(KnowledgeEvidenceEntity::getGenerationId, generation.id())
@@ -355,7 +475,8 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
         }
 
         List<KnowledgeSourceEntity> sources = sourceMapper.selectList(Wrappers.<KnowledgeSourceEntity>lambdaQuery()
-                .eq(KnowledgeSourceEntity::getWorkspaceId, workspaceId));
+                .eq(KnowledgeSourceEntity::getWorkspaceId, workspaceId)
+                .eq(KnowledgeSourceEntity::getLifecycle, KnowledgeSourceLifecycle.ACTIVE.name()));
         if (sources.isEmpty()) {
             return new RetrievalScope(workspaceId, active.getId(), active.getPhysicalIndex(), List.of(), true);
         }
@@ -429,6 +550,7 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
         List<KnowledgeSourceEntity> sources = sourceMapper.selectList(
                 Wrappers.<KnowledgeSourceEntity>lambdaQuery()
                         .eq(KnowledgeSourceEntity::getWorkspaceId, scope.workspaceId())
+                        .eq(KnowledgeSourceEntity::getLifecycle, KnowledgeSourceLifecycle.ACTIVE.name())
                         .in(KnowledgeSourceEntity::getId, sourceIds));
         Map<UUID, KnowledgeSourceEntity> sourceById = sources.stream()
                 .collect(java.util.stream.Collectors.toMap(KnowledgeSourceEntity::getId, value -> value));
@@ -450,7 +572,105 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
         return result;
     }
 
+    private DeletionTarget freezeDeletionTarget(
+            UUID workspaceId,
+            KnowledgeSourceEntity source,
+            List<KnowledgeRevisionEntity> revisions
+    ) {
+        Set<UUID> revisionIds = revisions.stream()
+                .map(KnowledgeRevisionEntity::getId).collect(java.util.stream.Collectors.toSet());
+        List<KnowledgeIngestionJobEntity> jobs = allJobs(revisionIds);
+        Map<UUID, List<UUID>> jobIdsByRevision = new HashMap<>();
+        for (KnowledgeIngestionJobEntity job : jobs) {
+            jobIdsByRevision.computeIfAbsent(job.getSourceRevisionId(), ignored -> new java.util.ArrayList<>())
+                    .add(job.getId());
+        }
+
+        List<KnowledgeEvidenceEntity> evidence = currentEvidence(revisionIds);
+        Map<UUID, List<UUID>> evidenceIdsByGeneration = new HashMap<>();
+        for (KnowledgeEvidenceEntity row : evidence) {
+            evidenceIdsByGeneration.computeIfAbsent(row.getGenerationId(), ignored -> new java.util.ArrayList<>())
+                    .add(row.getId());
+        }
+
+        List<RevisionTarget> revisionTargets = revisions.stream()
+                .map(revision -> new RevisionTarget(
+                        revision.getId(), revision.getContentObjectKey(),
+                        jobIdsByRevision.getOrDefault(revision.getId(), List.of())))
+                .toList();
+        List<GenerationTarget> generationTargets = generationMapper
+                .selectList(Wrappers.<KnowledgeGenerationEntity>lambdaQuery()).stream()
+                .map(generation -> new GenerationTarget(
+                        generation.getId(), generation.getPhysicalIndex(),
+                        evidenceIdsByGeneration.getOrDefault(generation.getId(), List.of())))
+                .toList();
+        return new DeletionTarget(workspaceId, source.getId(), revisionTargets, generationTargets);
+    }
+
+    private void recalculateGenerations(List<GenerationTarget> targets) {
+        for (GenerationTarget target : targets) {
+            List<KnowledgeEvidenceEntity> remaining = evidenceMapper.selectList(
+                    Wrappers.<KnowledgeEvidenceEntity>lambdaQuery()
+                            .eq(KnowledgeEvidenceEntity::getGenerationId, target.generationId()));
+            KnowledgeGenerationEntity update = new KnowledgeGenerationEntity();
+            update.setRevisionCount((int) remaining.stream()
+                    .map(KnowledgeEvidenceEntity::getSourceRevisionId).distinct().count());
+            update.setEvidenceCount(remaining.size());
+            generationMapper.update(update, Wrappers.<KnowledgeGenerationEntity>lambdaUpdate()
+                    .eq(KnowledgeGenerationEntity::getId, target.generationId()));
+        }
+    }
+
+    private List<KnowledgeRevisionEntity> revisionsFor(UUID sourceId) {
+        return revisionMapper.selectList(Wrappers.<KnowledgeRevisionEntity>lambdaQuery()
+                .eq(KnowledgeRevisionEntity::getSourceId, sourceId)
+                .orderByAsc(KnowledgeRevisionEntity::getRevisionNumber));
+    }
+
+    private List<KnowledgeIngestionJobEntity> allJobs(Set<UUID> revisionIds) {
+        if (revisionIds.isEmpty()) {
+            return List.of();
+        }
+        return jobMapper.selectList(Wrappers.<KnowledgeIngestionJobEntity>lambdaQuery()
+                .in(KnowledgeIngestionJobEntity::getSourceRevisionId, revisionIds));
+    }
+
+    private List<KnowledgeEvidenceEntity> currentEvidence(Set<UUID> revisionIds) {
+        if (revisionIds.isEmpty()) {
+            return List.of();
+        }
+        return evidenceMapper.selectList(Wrappers.<KnowledgeEvidenceEntity>lambdaQuery()
+                .in(KnowledgeEvidenceEntity::getSourceRevisionId, revisionIds));
+    }
+
+    private boolean lockActiveSourceForJob(UUID jobId) {
+        KnowledgeIngestionJobEntity job = jobMapper.selectById(jobId);
+        return job != null && lockActiveSourceForRevision(job.getSourceRevisionId());
+    }
+
+    private boolean lockActiveSourceForRevision(UUID revisionId) {
+        KnowledgeRevisionEntity revision = revisionMapper.selectById(revisionId);
+        if (revision == null) {
+            return false;
+        }
+        KnowledgeSourceEntity source = sourceMapper.selectForUpdateById(revision.getSourceId());
+        return source != null && KnowledgeSourceLifecycle.ACTIVE.name().equals(source.getLifecycle());
+    }
+
+    private static boolean deletionEligible(String state) {
+        return IngestionJobState.READY.name().equals(state)
+                || IngestionJobState.FAILED.name().equals(state)
+                || IngestionJobState.OCR_REQUIRED.name().equals(state);
+    }
+
+    private static KnowledgeException incompleteDeletion(String message) {
+        return new KnowledgeException(KnowledgeException.Code.DOCUMENT_DELETE_INCOMPLETE, message);
+    }
+
     private void finishFailure(UUID jobId, IngestionJobState state, String errorCode, String message, boolean retryable) {
+        if (!lockActiveSourceForJob(jobId)) {
+            return;
+        }
         KnowledgeIngestionJobEntity update = new KnowledgeIngestionJobEntity();
         update.setState(state.name());
         update.setRetryable(retryable);
@@ -475,7 +695,8 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
                 .eq(KnowledgeEvidenceEntity::getSourceRevisionId, revision.getId())));
         Instant updatedAt = latest == null ? revision.getCreatedAt() : latest.updatedAt();
         return new StoredDocument(
-                source.getId(), source.getWorkspaceId(), source.getName(), toRevision(revision), latest,
+                source.getId(), source.getWorkspaceId(), KnowledgeSourceLifecycle.valueOf(source.getLifecycle()),
+                source.getName(), toRevision(revision), latest,
                 jobs.stream().map(PostgresKnowledgeMetadataRepository::toJob).toList(), evidenceCount,
                 source.getCreatedAt(), updatedAt);
     }

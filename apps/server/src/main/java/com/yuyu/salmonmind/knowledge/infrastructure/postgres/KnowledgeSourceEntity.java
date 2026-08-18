@@ -16,6 +16,7 @@ public class KnowledgeSourceEntity {
     private UUID workspaceId;
     private String name;
     private String kind;
+    private String lifecycle;
     private Instant createdAt;
 
     public UUID getId() { return id; }
@@ -26,6 +27,8 @@ public class KnowledgeSourceEntity {
     public void setName(String name) { this.name = name; }
     public String getKind() { return kind; }
     public void setKind(String kind) { this.kind = kind; }
+    public String getLifecycle() { return lifecycle; }
+    public void setLifecycle(String lifecycle) { this.lifecycle = lifecycle; }
     public Instant getCreatedAt() { return createdAt; }
     public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
 }

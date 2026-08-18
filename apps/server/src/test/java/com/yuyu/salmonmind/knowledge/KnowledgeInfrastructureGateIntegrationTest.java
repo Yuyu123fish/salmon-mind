@@ -150,6 +150,28 @@ class KnowledgeInfrastructureGateIntegrationTest {
     }
 
     @Test
+    void elasticsearchStrictDeletionIsRevisionScopedAndIdempotent() {
+        String index = evidenceIndex.ensureIndex();
+        UUID deletedRevision = UUID.randomUUID();
+        UUID retainedRevision = UUID.randomUUID();
+        List<Float> vector = java.util.Collections.nCopies(2560, 0.01f);
+
+        evidenceIndex.upsert(index, new EvidenceIndexPort.IndexedEvidence(
+                UUID.randomUUID(), deletedRevision, UUID.randomUUID(), 0,
+                "to-delete", "待删除切片", vector, "d".repeat(64)));
+        evidenceIndex.upsert(index, new EvidenceIndexPort.IndexedEvidence(
+                UUID.randomUUID(), retainedRevision, UUID.randomUUID(), 0,
+                "retained", "保留切片", vector, "e".repeat(64)));
+
+        evidenceIndex.deleteForRevisions(index, List.of(deletedRevision));
+        evidenceIndex.deleteForRevisions(index, List.of(deletedRevision));
+
+        assertThat(evidenceIndex.countForRevision(index, deletedRevision)).isZero();
+        assertThat(evidenceIndex.countForRevision(index, retainedRevision)).isEqualTo(1);
+        evidenceIndex.deleteForRevisions("salmon-missing-index-" + UUID.randomUUID(), List.of(deletedRevision));
+    }
+
+    @Test
     void bm25AndKnnApplyTheRevisionPrefilterBeforeReturningCandidates() {
         String index = evidenceIndex.ensureIndex();
         UUID readyRevision = UUID.randomUUID();

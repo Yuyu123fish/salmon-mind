@@ -7,6 +7,7 @@ export type KnowledgeState =
   | 'READY'
   | 'OCR_REQUIRED'
   | 'FAILED'
+  | 'DELETING'
 
 export type DocumentSummary = {
   id: string
@@ -114,6 +115,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     throw await errorFromResponse(response)
   }
+  if (response.status === 204) return undefined as T
   return (await response.json()) as T
 }
 
@@ -151,6 +153,10 @@ export async function fetchEvidence(id: string, page = 0, size = 20): Promise<Ev
 
 export async function retryDocument(id: string): Promise<DocumentSummary> {
   return request(`/api/knowledge/documents/${encodeURIComponent(id)}/retry`, { method: 'POST' })
+}
+
+export async function deleteDocument(id: string): Promise<void> {
+  return request(`/api/knowledge/documents/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 
 export async function searchKnowledge(query: string): Promise<KnowledgeSearchResult> {

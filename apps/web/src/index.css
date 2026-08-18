@@ -1171,8 +1171,53 @@ button {
 .retrieval-diagnostics {
   margin: 0 0 28px;
   border: 1px solid var(--line);
-  padding: 20px 22px;
   background: rgba(255, 255, 255, 0.42);
+}
+
+.retrieval-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 20px 22px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.retrieval-summary::-webkit-details-marker {
+  display: none;
+}
+
+.retrieval-summary::after {
+  content: '展开';
+  flex: 0 0 auto;
+  color: var(--river);
+  font-size: 0.74rem;
+}
+
+.retrieval-diagnostics[open] .retrieval-summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.retrieval-diagnostics[open] .retrieval-summary::after {
+  content: '收起';
+}
+
+.retrieval-summary h2 {
+  margin: 2px 0 0;
+  font-family: var(--font-brand);
+  font-size: 1.55rem;
+  font-weight: 500;
+}
+
+.retrieval-summary > span {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.retrieval-diagnostics-body {
+  padding: 0 22px 20px;
 }
 
 .retrieval-form {
@@ -1433,6 +1478,12 @@ button {
   background: rgba(196, 92, 74, 0.08);
 }
 
+.state-chip.deleting {
+  border-color: rgba(143, 58, 50, 0.35);
+  color: var(--bad);
+  background: rgba(143, 58, 50, 0.08);
+}
+
 .knowledge-empty,
 .detail-placeholder {
   display: flex;
@@ -1522,6 +1573,20 @@ button {
   background: #243f3a;
 }
 
+.danger-small {
+  border: 1px solid rgba(143, 58, 50, 0.55);
+  border-radius: 7px;
+  padding: 6px 11px;
+  color: var(--bad);
+  background: rgba(143, 58, 50, 0.06);
+  font-size: 0.82rem;
+}
+
+.danger-small:hover:not(:disabled) {
+  color: #fff;
+  background: var(--bad);
+}
+
 .document-meta {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1578,6 +1643,50 @@ button {
 .failure-note strong {
   font-family: var(--font-mono);
   font-size: 0.72rem;
+}
+
+.delete-confirm {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 16px;
+  border-left: 3px solid var(--salmon);
+  padding: 10px 12px;
+  background: rgba(196, 92, 74, 0.07);
+}
+
+.delete-confirm > div:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.delete-confirm strong {
+  overflow-wrap: anywhere;
+  font-size: 0.86rem;
+}
+
+.delete-confirm span,
+.delete-progress,
+.delete-error {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.delete-progress {
+  margin: 14px 0 0;
+  color: var(--salmon);
+}
+
+.delete-error {
+  margin: 14px 0 0;
+  color: var(--bad);
+}
+
+.delete-note {
+  margin-top: 16px;
 }
 
 .job-history,
@@ -1652,7 +1761,7 @@ button {
   background: rgba(238, 243, 241, 0.48);
 }
 
-.evidence-card > div {
+.evidence-card-heading {
   display: flex;
   justify-content: space-between;
   gap: 10px;
@@ -1661,16 +1770,64 @@ button {
   font-size: 0.7rem;
 }
 
+.evidence-card-heading > div {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+}
+
+.evidence-card-heading > div:first-child {
+  flex-direction: column;
+  gap: 2px;
+}
+
+.evidence-card-heading strong {
+  color: var(--salmon);
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.evidence-card-heading span {
+  overflow-wrap: anywhere;
+}
+
 .evidence-card small {
   color: var(--muted);
 }
 
-.evidence-card p {
+.evidence-card-body {
+  max-height: 9.5rem;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.evidence-card[data-expanded='true'] .evidence-card-body {
+  max-height: none;
+  overflow: visible;
+}
+
+.evidence-card-body > p {
   margin: 8px 0 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font-size: 0.86rem;
   line-height: 1.65;
+}
+
+.evidence-card-body .markdown {
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+  font-size: 0.86rem;
+}
+
+.chunk-toggle {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: var(--river);
+  background: rgba(255, 255, 255, 0.5);
+  font-size: 0.66rem;
 }
 
 .evidence-pager {

@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
 import com.yuyu.salmonmind.conversation.api.CitationPayload;
 import com.yuyu.salmonmind.conversation.api.LocalCitationPayload;
+import com.yuyu.salmonmind.conversation.api.LocalRetrievedSourcePayload;
 import com.yuyu.salmonmind.conversation.api.RunTraceItemPayload;
 import com.yuyu.salmonmind.conversation.api.WebCitationPayload;
 import org.junit.jupiter.api.Test;
@@ -27,6 +28,24 @@ class AssistantContextRendererTest {
                                 "不可进入模型的工具摘要", null, false)));
 
         assertThat(AssistantContextRenderer.render(payload)).isEqualTo("普通回答");
+    }
+
+    @Test
+    void ignoresCitationNotesAndRetrievedSourcePreviewsInFutureModelContext() {
+        AssistantMessagePayload payload = new AssistantMessagePayload(
+                "回答 [L1]", UUID.randomUUID(), "provider", "model", null,
+                List.of(new LocalCitationPayload("L1", UUID.randomUUID(), UUID.randomUUID(),
+                        "manual.md", "p1", "Agent 不应被重复注入的摘要")),
+                List.of(new LocalRetrievedSourcePayload(
+                        "L1", UUID.randomUUID(), UUID.randomUUID(), "manual.md", "p1",
+                        Instant.parse("2026-08-17T00:00:00Z"), "LOCAL_EVIDENCE",
+                        "Agent 不应看到的来源摘录")),
+                List.of());
+
+        String rendered = AssistantContextRenderer.render(payload);
+
+        assertThat(rendered).contains("回答 [L1]")
+                .doesNotContain("Agent 不应被重复注入的摘要", "Agent 不应看到的来源摘录");
     }
 
     @Test

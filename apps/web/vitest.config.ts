@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react()],
   test: {
     environment: 'jsdom',
-    setupFiles: ['./src/testSetup.ts'],
+    setupFiles: ['./src/test/setup.ts'],
     restoreMocks: true,
     environmentOptions: {
       jsdom: { pretendToBeVisual: true },

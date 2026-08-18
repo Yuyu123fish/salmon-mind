@@ -51,6 +51,7 @@ export type LocalCitation = {
   revisionId: string
   documentName: string
   location: string
+  citationNote?: string | null
 }
 
 export type WebCitation = {
@@ -62,9 +63,37 @@ export type WebCitation = {
   site: string
   dateLabel: string | null
   retrievedAt: string
+  citationNote?: string | null
 }
 
 export type CitationPayload = LocalCitation | WebCitation
+
+export type LocalRetrievedSource = {
+  kind: 'local'
+  referenceId: string
+  evidenceId: string
+  revisionId: string
+  documentName: string
+  location: string
+  retrievedAt: string
+  excerptKind: string
+  sourceExcerpt?: string | null
+}
+
+export type WebRetrievedSource = {
+  kind: 'web'
+  referenceId: string
+  provider: string
+  title: string
+  url: string
+  site: string
+  dateLabel: string | null
+  retrievedAt: string
+  excerptKind: string
+  sourceExcerpt?: string | null
+}
+
+export type RetrievedSourcePayload = LocalRetrievedSource | WebRetrievedSource
 
 export type ReasoningTraceItem = {
   kind: 'REASONING'
@@ -92,6 +121,7 @@ export type EntryPayload = {
   model?: string
   usage?: TokenUsage | null
   citations?: CitationPayload[]
+  retrievedSources?: RetrievedSourcePayload[]
   trace?: RunTraceItem[]
   // TITLE
   title?: string
@@ -745,6 +775,10 @@ function requireEntry(
   if (expectedType === 'ASSISTANT_MESSAGE' && payload.trace !== undefined) {
     requireTrace(payload.trace)
   }
+  if (expectedType === 'ASSISTANT_MESSAGE') {
+    if (payload.citations !== undefined) requireCitations(payload.citations)
+    if (payload.retrievedSources !== undefined) requireRetrievedSources(payload.retrievedSources)
+  }
   if (expectedType === 'TITLE') {
     requireString(payload, 'title')
     requireString(payload, 'sourceRunId')
@@ -768,6 +802,57 @@ function requireTrace(raw: unknown): void {
       requireEnum(item, 'toolStatus', ['RUNNING', 'COMPLETED', 'FAILED'])
       requireString(item, 'safeSummary')
       requireNullableString(item, 'stableErrorCode')
+    }
+  }
+}
+
+function requireCitations(raw: unknown): void {
+  if (!Array.isArray(raw)) {
+    throw new ApiError('BAD_SSE_FRAME', '服务端流事件 Citation 不是数组', 0)
+  }
+  for (const rawCitation of raw) {
+    const citation = objectValue(rawCitation)
+    requireEnum(citation, 'kind', ['local', 'web'])
+    requireString(citation, 'referenceId')
+    if (citation.citationNote !== undefined) requireNullableString(citation, 'citationNote')
+    if (citation.kind === 'local') {
+      requireString(citation, 'evidenceId')
+      requireString(citation, 'revisionId')
+      requireString(citation, 'documentName')
+      requireString(citation, 'location')
+    } else {
+      requireString(citation, 'provider')
+      requireString(citation, 'title')
+      requireString(citation, 'url')
+      requireString(citation, 'site')
+      if (citation.dateLabel !== undefined) requireNullableString(citation, 'dateLabel')
+      requireString(citation, 'retrievedAt')
+    }
+  }
+}
+
+function requireRetrievedSources(raw: unknown): void {
+  if (!Array.isArray(raw)) {
+    throw new ApiError('BAD_SSE_FRAME', '服务端流事件 Retrieved Source 不是数组', 0)
+  }
+  for (const rawSource of raw) {
+    const source = objectValue(rawSource)
+    requireEnum(source, 'kind', ['local', 'web'])
+    requireString(source, 'referenceId')
+    requireString(source, 'retrievedAt')
+    requireString(source, 'excerptKind')
+    if (source.sourceExcerpt !== undefined) requireNullableString(source, 'sourceExcerpt')
+    if (source.kind === 'local') {
+      requireString(source, 'evidenceId')
+      requireString(source, 'revisionId')
+      requireString(source, 'documentName')
+      requireString(source, 'location')
+    } else {
+      requireString(source, 'provider')
+      requireString(source, 'title')
+      requireString(source, 'url')
+      requireString(source, 'site')
+      if (source.dateLabel !== undefined) requireNullableString(source, 'dateLabel')
     }
   }
 }

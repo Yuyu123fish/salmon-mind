@@ -4,7 +4,7 @@ import {
   distanceFromBottom,
   followModeAfterScroll,
   isNearBottom,
-} from './followMode.ts'
+} from '../followMode.ts'
 
 describe('follow mode boundary', () => {
   it('keeps following at the threshold and exits immediately beyond it', () => {

@@ -10,8 +10,17 @@ public record WebCitationPayload(
         String url,
         String site,
         String dateLabel,
-        Instant retrievedAt
+        Instant retrievedAt,
+        String citationNote
 ) implements CitationPayload {
+
+    /** 兼容旧 JSONL 与既有调用方没有 Note 的构造。 */
+    public WebCitationPayload(
+            String referenceId, String provider, String title, String url, String site,
+            String dateLabel, Instant retrievedAt
+    ) {
+        this(referenceId, provider, title, url, site, dateLabel, retrievedAt, null);
+    }
 
     @Override
     public String kind() {

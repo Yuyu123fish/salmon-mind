@@ -6,7 +6,10 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yuyu.salmonmind.agent.api.AgentCitation;
 import com.yuyu.salmonmind.agent.api.AgentLocalCitation;
+import com.yuyu.salmonmind.agent.api.AgentLocalRetrievedSource;
+import com.yuyu.salmonmind.agent.api.AgentRetrievedSource;
 import com.yuyu.salmonmind.agent.api.AgentWebCitation;
+import com.yuyu.salmonmind.agent.api.AgentWebRetrievedSource;
 
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -31,11 +34,14 @@ import java.util.regex.Pattern;
 final class RunSourceRegistry {
 
     static final String METADATA_KEY = "salmon:agent:source-registry";
+    static final int MAX_RETRIEVED_SOURCES = 32;
+    static final int MAX_SOURCE_EXCERPT_CHARS = 800;
     private static final Pattern REFERENCE = Pattern.compile(
             "(?<![A-Za-z0-9_])\\[(L|W)([1-9][0-9]*)](?![A-Za-z0-9_])");
 
     private final ObjectMapper mapper;
     private final Map<String, AgentCitation> citations = new LinkedHashMap<>();
+    private final Map<String, AgentRetrievedSource> sources = new LinkedHashMap<>();
     private final Map<String, String> identities = new HashMap<>();
     private int localSequence;
     private int webSequence;
@@ -74,7 +80,7 @@ final class RunSourceRegistry {
         ArrayNode items = envelope.withArray("items");
         String kind = envelope.path("sourceKind").asText();
         String provider = text(envelope, "provider");
-        Set<String> newlyRegistered = new HashSet<>();
+        Set<String> newlyRegistered = new LinkedHashSet<>();
         ArrayNode decoratedItems = mapper.createArrayNode();
         for (JsonNode item : items) {
             ObjectNode decorated = item != null && item.isObject()
@@ -97,7 +103,8 @@ final class RunSourceRegistry {
         envelope.set("items", decoratedItems);
         boolean truncated = false;
         while ((serializedLength(envelope) > maxChars
-                || ToolLifecycleInterceptor.estimateToolResultTokens(serialize(envelope)) > maxTokens)
+                || ToolLifecycleInterceptor.estimateToolResultTokens(serialize(envelope)) > maxTokens
+                || sourceLimitExceeded(decoratedItems, newlyRegistered))
                 && decoratedItems.size() > 0) {
             decoratedItems.remove(decoratedItems.size() - 1);
             truncated = true;
@@ -112,6 +119,7 @@ final class RunSourceRegistry {
         for (String referenceId : newlyRegistered) {
             if (!survivingReferences.contains(referenceId)) {
                 citations.remove(referenceId);
+                sources.remove(referenceId);
                 identities.values().removeIf(referenceId::equals);
             }
         }
@@ -137,13 +145,23 @@ final class RunSourceRegistry {
         }
         Set<String> references = new LinkedHashSet<>();
         Matcher matcher = REFERENCE.matcher(answer);
+        Map<String, String> notes = new LinkedHashMap<>();
         while (matcher.find()) {
-            references.add(matcher.group(1) + matcher.group(2));
+            String referenceId = matcher.group(1) + matcher.group(2);
+            references.add(referenceId);
+            notes.putIfAbsent(referenceId, CitationNoteExtractor.extract(
+                    answer, matcher.start(), matcher.end()));
         }
         return references.stream()
                 .map(citations::get)
                 .filter(java.util.Objects::nonNull)
+                .map(citation -> withCitationNote(citation, notes.get(citation.referenceId())))
                 .toList();
+    }
+
+    /** 返回本轮实际存活并交给模型的全部来源，顺序由首次登记位置决定。 */
+    synchronized List<AgentRetrievedSource> retrievedSources() {
+        return List.copyOf(sources.values());
     }
 
     private Registration registerLocal(ObjectNode item) {
@@ -162,6 +180,9 @@ final class RunSourceRegistry {
         identities.put(identity, referenceId);
         citations.put(referenceId, new AgentLocalCitation(referenceId, evidenceId, revisionId,
                 text(item, "documentName"), text(item, "location")));
+        sources.put(referenceId, new AgentLocalRetrievedSource(
+                referenceId, evidenceId, revisionId, text(item, "documentName"), text(item, "location"),
+                retrievedAt(item), "LOCAL_EVIDENCE", sourceExcerpt(item, "text")));
         return new Registration(referenceId, true);
     }
 
@@ -189,7 +210,54 @@ final class RunSourceRegistry {
         identities.put(identity, referenceId);
         citations.put(referenceId, new AgentWebCitation(referenceId, provider, title, url, site,
                 text(item, "dateLabel"), retrievedAt));
+        sources.put(referenceId, new AgentWebRetrievedSource(
+                referenceId, provider, title, url, site, text(item, "dateLabel"), retrievedAt,
+                "WEB_SEARCH_SUMMARY", sourceExcerpt(item, "snippet")));
         return new Registration(referenceId, true);
+    }
+
+    private boolean sourceLimitExceeded(ArrayNode items, Set<String> newlyRegistered) {
+        Set<String> survivingNewSources = new HashSet<>();
+        for (JsonNode item : items) {
+            String referenceId = text(item, "referenceId");
+            if (referenceId != null && newlyRegistered.contains(referenceId)) {
+                survivingNewSources.add(referenceId);
+            }
+        }
+        return sources.size() - newlyRegistered.size() + survivingNewSources.size() > MAX_RETRIEVED_SOURCES;
+    }
+
+    private static AgentCitation withCitationNote(AgentCitation citation, String note) {
+        return switch (citation) {
+            case AgentLocalCitation local -> new AgentLocalCitation(
+                    local.referenceId(), local.evidenceId(), local.revisionId(),
+                    local.documentName(), local.location(), note);
+            case AgentWebCitation web -> new AgentWebCitation(
+                    web.referenceId(), web.provider(), web.title(), web.url(), web.site(),
+                    web.dateLabel(), web.retrievedAt(), note);
+        };
+    }
+
+    private static String sourceExcerpt(JsonNode item, String field) {
+        String value = text(item, field);
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        String normalized = value.replaceAll("\\p{Cc}", " ")
+                .replaceAll("\\s+", " ").trim();
+        return CitationNoteExtractor.limit(normalized, MAX_SOURCE_EXCERPT_CHARS);
+    }
+
+    private static Instant retrievedAt(JsonNode item) {
+        String value = text(item, "retrievedAt");
+        if (value != null) {
+            try {
+                return Instant.parse(value);
+            } catch (RuntimeException ignored) {
+                // 旧本地 Tool Fixture 没有时间时仍保持来源身份兼容；生产 Tool 会写入时间。
+            }
+        }
+        return Instant.now();
     }
 
     private int serializedLength(ObjectNode envelope) {

@@ -6,8 +6,8 @@ import {
   isActiveRun,
   reduceActiveRun,
   type ActiveRunState,
-} from './runState.ts'
-import type { Entry, Run, RunStartedEvent } from './conversationApi.ts'
+} from '../runState.ts'
+import type { Entry, Run, RunStartedEvent } from '../conversationApi.ts'
 
 const RUN_ID = 'run-1'
 

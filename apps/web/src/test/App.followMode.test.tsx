@@ -4,7 +4,7 @@ import type {
   ConversationDetail,
   ConversationSummary,
   RunStreamListener,
-} from './conversationApi.ts'
+} from '../conversationApi.ts'
 
 const api = vi.hoisted(() => ({
   fetchCurrentWorkspace: vi.fn(),
@@ -14,17 +14,17 @@ const api = vi.hoisted(() => ({
   streamRetry: vi.fn(),
 }))
 
-vi.mock('./workspaceApi.ts', () => ({ fetchCurrentWorkspace: api.fetchCurrentWorkspace }))
-vi.mock('./conversationApi.ts', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./conversationApi.ts')>()),
+vi.mock('../workspaceApi.ts', () => ({ fetchCurrentWorkspace: api.fetchCurrentWorkspace }))
+vi.mock('../conversationApi.ts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../conversationApi.ts')>()),
   fetchConversations: api.fetchConversations,
   fetchConversation: api.fetchConversation,
   streamSend: api.streamSend,
   streamRetry: api.streamRetry,
 }))
-vi.mock('./KnowledgeView.tsx', () => ({ default: () => null }))
+vi.mock('../KnowledgeView.tsx', () => ({ default: () => null }))
 
-import App from './App.tsx'
+import App from '../App.tsx'
 
 const summary: ConversationSummary = {
   id: 'conversation-1',
@@ -77,6 +77,10 @@ describe('App follow mode', () => {
     Object.defineProperty(HTMLElement.prototype, 'scrollTo', {
       configurable: true,
       value: scrollTo,
+    })
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: vi.fn(),
     })
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
       callback(0)
@@ -200,6 +204,89 @@ describe('App follow mode', () => {
 
     expect(await screen.findByText('保留展开状态')).toBeVisible()
     expect(view.container.querySelector('.streaming')).toBeNull()
+  })
+
+  it('keeps evidence collapsed and focuses the cited source after activation', async () => {
+    const view = render(<App />)
+    const input = await screen.findByRole('textbox', { name: '消息输入' })
+    fireEvent.change(input, { target: { value: '查询本地资料' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    await waitFor(() => expect(listener).toBeDefined())
+
+    act(() => {
+      listener!.onRunStarted(runStartedEvent('查询本地资料'))
+      listener!.onAssistantCompleted({
+        conversationId: summary.id,
+        assistantEntry: {
+          formatVersion: 1,
+          conversationId: summary.id,
+          id: 'assistant-1',
+          seq: 2,
+          parentId: 'user-1',
+          type: 'ASSISTANT_MESSAGE',
+          createdAt: '2026-08-18T00:00:01Z',
+          payload: {
+            text: '结论 [L1]',
+            runId: 'run-1',
+            citations: [
+              {
+                kind: 'local',
+                referenceId: 'L1',
+                evidenceId: 'evidence-1',
+                revisionId: 'revision-1',
+                documentName: '项目手册',
+                location: '第一章',
+                citationNote: '与结论直接相关',
+              },
+            ],
+            retrievedSources: [
+              {
+                kind: 'local',
+                referenceId: 'L1',
+                evidenceId: 'evidence-1',
+                revisionId: 'revision-1',
+                documentName: '项目手册',
+                location: '第一章',
+                retrievedAt: '2026-08-18T00:00:00Z',
+                excerptKind: 'LOCAL_EVIDENCE',
+                sourceExcerpt: '本地资料摘录',
+              },
+              {
+                kind: 'web',
+                referenceId: 'W1',
+                provider: 'bocha',
+                title: '外部参考',
+                url: 'https://example.com/reference',
+                site: 'example.com',
+                dateLabel: null,
+                retrievedAt: '2026-08-18T00:00:00Z',
+                excerptKind: 'WEB_SEARCH_SUMMARY',
+                sourceExcerpt: '外部搜索摘要',
+              },
+            ],
+          },
+        },
+      })
+      listener!.onRunCompleted({
+        conversationId: summary.id,
+        run: completedRun('SUCCEEDED'),
+        conversation: { ...detail.conversation, activeLeafEntryId: 'assistant-1', lastConfirmedSeq: 2 },
+      })
+    })
+
+    const disclosure = await screen.findByRole('button', { name: /来源核验/ })
+    expect(disclosure).toHaveAttribute('aria-expanded', 'false')
+    expect(disclosure).toHaveTextContent('1 条回答已引用 · 1 条本轮召回未引用')
+    expect(screen.queryByText('项目手册')).toBeNull()
+
+    fireEvent.click(screen.getByRole('link', { name: '定位来源 [L1]' }))
+
+    await waitFor(() => expect(disclosure).toHaveAttribute('aria-expanded', 'true'))
+    expect(screen.getByText('回答已引用')).toBeVisible()
+    expect(screen.getByText('本轮召回未引用')).toBeVisible()
+    expect(screen.getByText('Agent 相关性摘要')).toBeVisible()
+    expect(screen.getByText('本地证据摘录')).toBeVisible()
+    expect(view.container.querySelector('#source-card-assistant-1-L1')).toHaveFocus()
   })
 })
 

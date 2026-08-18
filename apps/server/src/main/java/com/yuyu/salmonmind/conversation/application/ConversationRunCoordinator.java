@@ -5,9 +5,11 @@ import com.yuyu.salmonmind.agent.api.AgentExecutionException.AgentErrorCode;
 import com.yuyu.salmonmind.agent.api.AgentCitation;
 import com.yuyu.salmonmind.agent.api.AgentContextBudget;
 import com.yuyu.salmonmind.agent.api.AgentLocalCitation;
+import com.yuyu.salmonmind.agent.api.AgentLocalRetrievedSource;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
 import com.yuyu.salmonmind.agent.api.AgentRequest;
 import com.yuyu.salmonmind.agent.api.AgentResult;
+import com.yuyu.salmonmind.agent.api.AgentRetrievedSource;
 import com.yuyu.salmonmind.agent.api.AgentRunTraceItem;
 import com.yuyu.salmonmind.agent.api.AgentStreamListener;
 import com.yuyu.salmonmind.agent.api.AgentStreamSession;
@@ -19,6 +21,7 @@ import com.yuyu.salmonmind.agent.api.AgentTitleResult;
 import com.yuyu.salmonmind.agent.api.AgentTitleService;
 import com.yuyu.salmonmind.agent.api.AgentUsage;
 import com.yuyu.salmonmind.agent.api.AgentWebCitation;
+import com.yuyu.salmonmind.agent.api.AgentWebRetrievedSource;
 import com.yuyu.salmonmind.agent.api.CheckpointPolicy;
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
 import com.yuyu.salmonmind.conversation.api.CompactionPayload;
@@ -29,6 +32,7 @@ import com.yuyu.salmonmind.conversation.api.Entry;
 import com.yuyu.salmonmind.conversation.api.Entry.EntryType;
 import com.yuyu.salmonmind.conversation.api.CitationPayload;
 import com.yuyu.salmonmind.conversation.api.LocalCitationPayload;
+import com.yuyu.salmonmind.conversation.api.LocalRetrievedSourcePayload;
 import com.yuyu.salmonmind.conversation.api.Run;
 import com.yuyu.salmonmind.conversation.api.Run.RunStatus;
 import com.yuyu.salmonmind.conversation.api.RunStreamListener;
@@ -37,6 +41,8 @@ import com.yuyu.salmonmind.conversation.api.TitlePayload;
 import com.yuyu.salmonmind.conversation.api.TokenUsage;
 import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
 import com.yuyu.salmonmind.conversation.api.WebCitationPayload;
+import com.yuyu.salmonmind.conversation.api.WebRetrievedSourcePayload;
+import com.yuyu.salmonmind.conversation.api.RetrievedSourcePayload;
 import com.yuyu.salmonmind.conversation.application.port.ConversationHistoryRepository;
 import com.yuyu.salmonmind.conversation.application.port.ConversationMetadataRepository;
 import com.yuyu.salmonmind.conversation.domain.ConversationCompactionPolicy;
@@ -559,7 +565,8 @@ class ConversationRunCoordinator {
                 outcome.conversation().activeLeafEntryId(), EntryType.ASSISTANT_MESSAGE, answeredAt,
                 new AssistantMessagePayload(
                         result.text(), running.id(), result.provider(), result.model(), mapUsage(result.usage()),
-                        mapCitations(result.citations()), mapTrace(result.trace())));
+                        mapCitations(result.citations()), mapRetrievedSources(result.retrievedSources()),
+                        mapTrace(result.trace())));
         historyRepository.append(conversationId, assistantEntry);
 
         Run finished = new Run(
@@ -815,11 +822,27 @@ class ConversationRunCoordinator {
         return citations.stream().map(citation -> switch (citation) {
             case AgentLocalCitation local -> new LocalCitationPayload(
                     local.referenceId(), local.evidenceId(), local.revisionId(),
-                    local.documentName(), local.location());
+                    local.documentName(), local.location(), local.citationNote());
             case AgentWebCitation web -> new WebCitationPayload(
                     web.referenceId(), web.provider(), web.title(), web.url(), web.site(),
-                    web.dateLabel(), web.retrievedAt());
+                    web.dateLabel(), web.retrievedAt(), web.citationNote());
         }).map(CitationPayload.class::cast).toList();
+    }
+
+    /** Conversation 只接收 Agent 已完成预算与身份核对的 Retrieved Source。 */
+    private static List<RetrievedSourcePayload> mapRetrievedSources(List<AgentRetrievedSource> sources) {
+        if (sources == null || sources.isEmpty()) {
+            return List.of();
+        }
+        return sources.stream().map(source -> switch (source) {
+            case AgentLocalRetrievedSource local -> new LocalRetrievedSourcePayload(
+                    local.referenceId(), local.evidenceId(), local.revisionId(),
+                    local.documentName(), local.location(), local.retrievedAt(),
+                    local.excerptKind(), local.sourceExcerpt());
+            case AgentWebRetrievedSource web -> new WebRetrievedSourcePayload(
+                    web.referenceId(), web.provider(), web.title(), web.url(), web.site(),
+                    web.dateLabel(), web.retrievedAt(), web.excerptKind(), web.sourceExcerpt());
+        }).map(RetrievedSourcePayload.class::cast).toList();
     }
 
     /** Agent 的展示 Trace 只在该边界映射为 Conversation payload；上下文投影不读取该字段。 */

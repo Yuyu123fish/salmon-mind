@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import KnowledgeView from './KnowledgeView.tsx'
 import { MarkdownRenderer } from './MarkdownRenderer.tsx'
 import { RunTracePanel } from './RunTracePanel.tsx'
@@ -23,6 +23,7 @@ import {
   type Conversation,
   type ConversationSummary,
   type Entry,
+  type RetrievedSourcePayload,
   type Run,
   type RunStreamListener,
 } from './conversationApi.ts'
@@ -883,11 +884,23 @@ function MessageEntry({
             onToggle={onTraceToggle}
             onLayoutChange={onTraceLayoutChange}
           />
-          <MarkdownRenderer text={entry.payload.text ?? ''} />
+          <AssistantEvidenceView
+            entryId={entry.id}
+            citations={entry.payload.citations ?? []}
+            retrievedSources={entry.payload.retrievedSources ?? []}
+            onLayoutChange={onTraceLayoutChange}
+          >
+            {(activate) => (
+              <MarkdownRenderer
+                text={entry.payload.text ?? ''}
+                citationIds={new Set((entry.payload.citations ?? []).map((citation) => citation.referenceId))}
+                onCitationActivate={activate}
+              />
+            )}
+          </AssistantEvidenceView>
           <p className="model-line">
             {entry.payload.model ?? '模型'} · {formatTimeShort(entry.createdAt)}
           </p>
-          <CitationCards citations={entry.payload.citations ?? []} />
         </div>
       </div>
     )
@@ -904,45 +917,202 @@ function MessageEntry({
   return null
 }
 
-function CitationCards({ citations }: { citations: CitationPayload[] }) {
-  if (citations.length === 0) return null
+function AssistantEvidenceView({
+  entryId,
+  citations,
+  retrievedSources,
+  onLayoutChange,
+  children,
+}: {
+  entryId: string
+  citations: CitationPayload[]
+  retrievedSources: RetrievedSourcePayload[]
+  onLayoutChange: () => void
+  children: (activate: (referenceId: string) => void) => ReactNode
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const [pendingFocus, setPendingFocus] = useState<string | null>(null)
+  const cardRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const citedIds = new Set<string>()
+  const uniqueCitations: CitationPayload[] = []
+  for (const citation of citations) {
+    if (citedIds.has(citation.referenceId)) continue
+    citedIds.add(citation.referenceId)
+    uniqueCitations.push(citation)
+  }
+  const sourcesById = new Map<string, RetrievedSourcePayload>()
+  for (const source of retrievedSources) {
+    if (!sourcesById.has(source.referenceId)) sourcesById.set(source.referenceId, source)
+  }
+  const unreferenced = [...sourcesById.values()].filter((source) => !citedIds.has(source.referenceId))
+  const hasDisclosure = uniqueCitations.length > 0 || sourcesById.size > 0
+  const disclosureId = `source-disclosure-${entryId}`
+
+  useEffect(() => {
+    if (!expanded || pendingFocus === null) return
+    const referenceId = pendingFocus
+    const frame = requestAnimationFrame(() => {
+      const card = cardRefs.current[referenceId]
+      if (card === null || card === undefined) return
+      card.focus()
+      card.scrollIntoView({ block: 'nearest' })
+      setPendingFocus(null)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [expanded, pendingFocus])
+
+  const activate = (referenceId: string) => {
+    setExpanded(true)
+    setPendingFocus(referenceId)
+    onLayoutChange()
+  }
+
+  const toggle = () => {
+    setExpanded((current) => !current)
+    onLayoutChange()
+  }
+
   return (
-    <div className="citation-list" aria-label="回答来源">
-      {citations.map((citation) => {
-        if (citation.kind === 'local') {
-          return (
-            <div className="citation-card local-citation" key={citation.referenceId}>
-              <span className="citation-ref">[{citation.referenceId}]</span>
-              <div>
-                <strong>{citation.documentName}</strong>
-                <small>{citation.location}</small>
-              </div>
+    <>
+      {children(activate)}
+      {hasDisclosure ? (
+        <section className="source-disclosure" aria-label="来源核验">
+          <button
+            type="button"
+            className="source-disclosure-toggle"
+            aria-expanded={expanded}
+            aria-controls={disclosureId}
+            onClick={toggle}
+          >
+            <span>来源核验</span>
+            <small>
+              {uniqueCitations.length} 条回答已引用 · {unreferenced.length} 条本轮召回未引用
+            </small>
+          </button>
+          {expanded ? (
+            <div id={disclosureId} className="source-disclosure-body">
+              {uniqueCitations.length > 0 ? (
+                <section aria-labelledby={`${disclosureId}-cited`}>
+                  <h4 id={`${disclosureId}-cited`}>回答已引用</h4>
+                  <div className="citation-list">
+                    {uniqueCitations.map((citation) => (
+                      <SourceCard
+                        key={citation.referenceId}
+                        citation={citation}
+                        source={sourcesById.get(citation.referenceId)}
+                        referenceId={citation.referenceId}
+                        entryId={entryId}
+                        cardRef={(card) => {
+                          cardRefs.current[citation.referenceId] = card
+                        }}
+                      />
+                    ))}
+                  </div>
+                </section>
+              ) : null}
+              {unreferenced.length > 0 ? (
+                <section aria-labelledby={`${disclosureId}-unreferenced`}>
+                  <h4 id={`${disclosureId}-unreferenced`}>本轮召回未引用</h4>
+                  <div className="citation-list">
+                    {unreferenced.map((source) => (
+                      <SourceCard
+                        key={source.referenceId}
+                        source={source}
+                        referenceId={source.referenceId}
+                        entryId={entryId}
+                        unreferenced
+                        cardRef={(card) => {
+                          cardRefs.current[source.referenceId] = card
+                        }}
+                      />
+                    ))}
+                  </div>
+                </section>
+              ) : null}
             </div>
+          ) : null}
+        </section>
+      ) : null}
+    </>
+  )
+}
+
+function SourceCard({
+  citation,
+  source,
+  referenceId,
+  entryId,
+  unreferenced = false,
+  cardRef,
+}: {
+  citation?: CitationPayload
+  source?: RetrievedSourcePayload
+  referenceId: string
+  entryId: string
+  unreferenced?: boolean
+  cardRef: (card: HTMLDivElement | null) => void
+}) {
+  const local = source?.kind === 'local' ? source : citation?.kind === 'local' ? citation : null
+  const web = source?.kind === 'web' ? source : citation?.kind === 'web' ? citation : null
+  const safeUrl = web === null ? null : safeHttpUrl(web.url)
+  const note = !unreferenced && citation?.citationNote?.trim() ? citation.citationNote : null
+  const excerpt = source?.sourceExcerpt?.trim() ? source.sourceExcerpt : null
+  const excerptLabel = source?.kind === 'local' ? '本地证据摘录' : '搜索摘要'
+
+  return (
+    <div
+      id={`source-card-${entryId}-${referenceId}`}
+      ref={cardRef}
+      className="citation-card"
+      data-unreferenced={unreferenced ? 'true' : 'false'}
+      tabIndex={-1}
+    >
+      <span className="citation-ref">[{referenceId}]</span>
+      <div>
+        {local !== null ? <strong>{local.documentName}</strong> : null}
+        {web !== null ? (
+          safeUrl === null ? (
+            <strong>{web.title}</strong>
+          ) : (
+            <a href={safeUrl} target="_blank" rel="noopener noreferrer">
+              {web.title}
+            </a>
           )
-        }
-        const safeUrl = /^https?:\/\//i.test(citation.url) ? citation.url : null
-        return (
-          <div className="citation-card web-citation" key={citation.referenceId}>
-            <span className="citation-ref">[{citation.referenceId}]</span>
-            <div>
-              {safeUrl === null ? (
-                <strong>{citation.title}</strong>
-              ) : (
-                <a href={safeUrl} target="_blank" rel="noopener noreferrer">
-                  {citation.title}
-                </a>
-              )}
-              <small>
-                {citation.provider} · {citation.site}
-                {citation.dateLabel ? ` · ${citation.dateLabel}` : ''} · 检索于{' '}
-                {formatTime(citation.retrievedAt)}
-              </small>
-            </div>
-          </div>
-        )
-      })}
+        ) : null}
+        {local !== null ? <small>{local.location}</small> : null}
+        {web !== null ? (
+          <small>
+            {web.provider} · {web.site}
+            {web.dateLabel ? ` · ${web.dateLabel}` : ''} · 检索于 {formatTime(web.retrievedAt)}
+          </small>
+        ) : null}
+        {note !== null ? (
+          <p className="source-note">
+            <b>Agent 相关性摘要</b>
+            {note}
+          </p>
+        ) : null}
+        {excerpt !== null ? (
+          <p className="source-excerpt">
+            <b>{excerptLabel}</b>
+            {excerpt}
+          </p>
+        ) : null}
+      </div>
     </div>
   )
+}
+
+function safeHttpUrl(value: string): string | null {
+  try {
+    const url = new URL(value)
+    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password) {
+      return null
+    }
+    return url.toString()
+  } catch {
+    return null
+  }
 }
 
 // 运行中的临时 Assistant：只用于展示 delta，最终以持久化 Entry 替换

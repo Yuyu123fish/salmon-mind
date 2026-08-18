@@ -24,9 +24,11 @@ import com.yuyu.salmonmind.agent.api.AgentExecutionException;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException.AgentErrorCode;
 import com.yuyu.salmonmind.agent.api.AgentCitation;
 import com.yuyu.salmonmind.agent.api.AgentLocalCitation;
+import com.yuyu.salmonmind.agent.api.AgentLocalRetrievedSource;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
 import com.yuyu.salmonmind.agent.api.AgentRequest;
 import com.yuyu.salmonmind.agent.api.AgentResult;
+import com.yuyu.salmonmind.agent.api.AgentRetrievedSource;
 import com.yuyu.salmonmind.agent.api.AgentRunTraceItem;
 import com.yuyu.salmonmind.agent.api.AgentStreamListener;
 import com.yuyu.salmonmind.agent.api.AgentStreamSession;
@@ -322,14 +324,19 @@ class ConversationModuleIntegrationTest {
                 new AgentLocalCitation("L1", evidenceId, revisionId, "manual.md", "chapter-1"),
                 new AgentWebCitation("W1", "BOCHA", "网页标题", "https://example.com/a",
                         "example.com", "2026-08-17", Instant.parse("2026-08-17T00:00:00Z"))));
+        AGENT.completeWithRetrievedSources(List.of(new AgentLocalRetrievedSource(
+                "L1", evidenceId, revisionId, "manual.md", "chapter-1",
+                Instant.parse("2026-08-17T00:00:00Z"), "LOCAL_EVIDENCE", "本地证据摘录")));
 
         postSse("/api/conversations/" + conv + "/messages", Map.of("text", "请查资料"));
         Map<String, Object> first = open(conv.toString());
         Map<String, Object> firstAssistant = entryOf(((List<?>) first.get("activePath")).get(1));
         assertThat((List<?>) payloadOf(firstAssistant).get("citations")).hasSize(2);
+        assertThat((List<?>) payloadOf(firstAssistant).get("retrievedSources")).hasSize(1);
 
         // 第二轮的测试 Agent 不返回 Citation；历史摘要只能进入模型输入，不能被复制到新 Entry。
         AGENT.completeWithCitations(List.of());
+        AGENT.completeWithRetrievedSources(List.of());
         postSse("/api/conversations/" + conv + "/messages", Map.of("text", "继续说明"));
         String historical = messagesOf(agentRequest(1)).get(1).text();
         assertThat(historical).contains(
@@ -965,6 +972,7 @@ class ConversationModuleIntegrationTest {
         /** 主调用固定用量：totalTokens 作为压缩检测的 usage 锚点。 */
         private volatile AgentUsage usage = new AgentUsage(1000L, 200L, 1200L);
         private volatile List<AgentCitation> citations = List.of();
+        private volatile List<AgentRetrievedSource> retrievedSources = List.of();
         private volatile List<AgentRunTraceItem> trace = List.of();
 
         @Override
@@ -1023,7 +1031,7 @@ class ConversationModuleIntegrationTest {
             listener.onDelta("测试");
             listener.onDelta("回答");
             listener.onComplete(new AgentResult(
-                    "测试回答", "test-provider", "test-model", usage, citations, trace));
+                    "测试回答", "test-provider", "test-model", usage, citations, retrievedSources, trace));
         }
 
         @Override
@@ -1086,6 +1094,10 @@ class ConversationModuleIntegrationTest {
             citations = nextCitations == null ? List.of() : List.copyOf(nextCitations);
         }
 
+        void completeWithRetrievedSources(List<AgentRetrievedSource> nextSources) {
+            retrievedSources = nextSources == null ? List.of() : List.copyOf(nextSources);
+        }
+
         void completeWithTrace(List<AgentRunTraceItem> nextTrace) {
             trace = nextTrace == null ? List.of() : List.copyOf(nextTrace);
         }
@@ -1102,6 +1114,7 @@ class ConversationModuleIntegrationTest {
             failAfterDelta = false;
             usage = new AgentUsage(1000L, 200L, 1200L);
             citations = List.of();
+            retrievedSources = List.of();
             trace = List.of();
         }
     }

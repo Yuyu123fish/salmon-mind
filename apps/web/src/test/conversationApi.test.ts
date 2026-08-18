@@ -7,7 +7,7 @@ import {
   type Entry,
   type Run,
   type RunStreamListener,
-} from './conversationApi.ts'
+} from '../conversationApi.ts'
 
 describe('SSE event dispatch', () => {
   it('ignores an unknown optional event without invoking listeners', () => {
@@ -41,6 +41,50 @@ describe('SSE event dispatch', () => {
     expect(() => dispatch('run_failed', runFailed())).toThrowError(ApiError)
     expect(listener.onRunCompleted).toHaveBeenCalledOnce()
     expect(listener.onRunFailed).not.toHaveBeenCalled()
+  })
+
+  it('accepts optional retrieved sources and citation notes on Assistant entries', () => {
+    const listener = listenerStub()
+    dispatchRunEvent(
+      'assistant_completed',
+      {
+        conversationId: conversation.id,
+        assistantEntry: {
+          ...assistantCompleted().assistantEntry,
+          payload: {
+            text: '依据 [L1]',
+            runId: 'run-1',
+            citations: [
+              {
+                kind: 'local',
+                referenceId: 'L1',
+                evidenceId: 'evidence-1',
+                revisionId: 'revision-1',
+                documentName: 'manual.md',
+                location: 'p1',
+                citationNote: '支持说明',
+              },
+            ],
+            retrievedSources: [
+              {
+                kind: 'local',
+                referenceId: 'L1',
+                evidenceId: 'evidence-1',
+                revisionId: 'revision-1',
+                documentName: 'manual.md',
+                location: 'p1',
+                retrievedAt: '2026-08-18T00:00:00Z',
+                excerptKind: 'LOCAL_EVIDENCE',
+                sourceExcerpt: '摘录',
+              },
+            ],
+          },
+        },
+      },
+      listener,
+    )
+
+    expect(listener.onAssistantCompleted).toHaveBeenCalledOnce()
   })
 })
 

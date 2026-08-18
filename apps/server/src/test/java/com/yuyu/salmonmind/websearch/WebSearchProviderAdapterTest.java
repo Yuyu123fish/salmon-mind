@@ -46,8 +46,8 @@ class WebSearchProviderAdapterTest {
             path.set(exchange.getRequestURI().getRawPath());
             authorization.set(exchange.getRequestHeaders().getFirst("Authorization"));
             body.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
-            respond(exchange, """
-                    {"webPages":{"value":[{"name":"官方页面","url":"https://example.com/a","siteName":"example.com","summary":"摘要","datePublished":"2026-08-17"}]},"requestId":"bocha-trace"}
+                respond(exchange, """
+                    {"code":200,"log_id":"bocha-trace","data":{"webPages":{"value":[{"name":"官方页面","url":"https://example.com/a","siteName":"example.com","summary":"摘要","datePublished":"2026-08-17"}]}}}
                     """);
         });
         server.start();
@@ -68,6 +68,16 @@ class WebSearchProviderAdapterTest {
         assertThat(result.hits().get(0).url()).isEqualTo("https://example.com/a");
         assertThat(result.traceId()).isEqualTo("bocha-trace");
         assertThat(body.get()).doesNotContain("bocha-secret");
+    }
+
+    @Test
+    void acceptsAValidEmptyEnvelopeAndRejectsMalformedDataShapes() throws Exception {
+        assertBochaBody("{\"code\":200,\"log_id\":\"empty\",\"data\":{\"webPages\":{\"value\":[]}}}",
+                false);
+        assertBochaBody("{\"code\":200,\"data\":{}}", true);
+        assertBochaBody("{\"code\":200,\"data\":{\"webPages\":{}}}", true);
+        assertBochaBody("{\"code\":200,\"data\":{\"webPages\":{\"value\":{}}}}", true);
+        assertBochaBody("{\"code\":999,\"msg\":\"鉴权失败\",\"data\":{\"webPages\":{\"value\":[]}}}", true);
     }
 
     @Test
@@ -131,6 +141,24 @@ class WebSearchProviderAdapterTest {
         assertThatThrownBy(() -> adapter.search("query", WebSearchFreshness.ANY, 5))
                 .isInstanceOfSatisfying(WebSearchProviderException.class,
                         error -> assertThat(error.reason()).isEqualTo(expected));
+        server.stop(0);
+        server = null;
+    }
+
+    private void assertBochaBody(String body, boolean invalid) throws Exception {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/web-search", exchange -> respond(exchange, 200, body));
+        server.start();
+        BochaWebSearchAdapter adapter = new BochaWebSearchAdapter(
+                baseUrl(), "bocha-secret", Duration.ofSeconds(1), Duration.ofSeconds(1));
+
+        if (invalid) {
+            assertThatThrownBy(() -> adapter.search("query", WebSearchFreshness.ANY, 5))
+                    .isInstanceOfSatisfying(WebSearchProviderException.class,
+                            error -> assertThat(error.reason()).isEqualTo(WebSearchReason.INVALID_RESPONSE));
+        } else {
+            assertThat(adapter.search("query", WebSearchFreshness.ANY, 5).hits()).isEmpty();
+        }
         server.stop(0);
         server = null;
     }

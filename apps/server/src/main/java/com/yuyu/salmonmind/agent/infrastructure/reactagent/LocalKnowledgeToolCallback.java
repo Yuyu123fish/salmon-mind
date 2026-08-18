@@ -12,6 +12,7 @@ import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.definition.ToolDefinition;
 import org.springframework.ai.chat.model.ToolContext;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -103,6 +104,7 @@ final class LocalKnowledgeToolCallback implements ToolCallback {
                 item.put("revisionId", evidence.revisionId().toString());
                 item.put("documentName", evidence.documentName() == null ? "" : evidence.documentName());
                 item.put("location", evidence.location() == null ? "" : evidence.location());
+                item.put("retrievedAt", Instant.now().toString());
                 item.put("text", evidence.text() == null ? "" : evidence.text());
             }
             return objectMapper.writeValueAsString(envelope);

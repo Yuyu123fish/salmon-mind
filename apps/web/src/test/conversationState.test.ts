@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { mergeConversation } from './conversationState.ts'
-import type { Conversation } from './conversationApi.ts'
+import { mergeConversation } from '../conversationState.ts'
+import type { Conversation } from '../conversationApi.ts'
 
 describe('conversation snapshot merge', () => {
   it('keeps a newer confirmed title when an older run terminal arrives later', () => {

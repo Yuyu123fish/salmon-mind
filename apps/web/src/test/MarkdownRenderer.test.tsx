@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { MarkdownRenderer } from './MarkdownRenderer.tsx'
+import { MarkdownRenderer } from '../MarkdownRenderer.tsx'
 
 afterEach(cleanup)
 
@@ -46,5 +46,29 @@ describe('MarkdownRenderer', () => {
   it('renders an unfinished streaming fence without throwing', () => {
     expect(() => render(<MarkdownRenderer text={'回答开始\n\n```ts\nconst value = 1'} />)).not.toThrow()
     expect(screen.getByText('const value = 1')).toBeInTheDocument()
+  })
+
+  it('links only verified citations in ordinary text and leaves protected nodes unchanged', () => {
+    const activate = vi.fn()
+    const { container } = render(
+      <MarkdownRenderer
+        text={'普通 [L1]，未知 [W99]，行内 `[L1]`，已有 [L1](https://example.com)，转义 \\[L1]。\n\n```text\n[L1]\n```'}
+        citationIds={new Set(['L1'])}
+        onCitationActivate={activate}
+      />,
+    )
+
+    const citationLink = screen.getByRole('link', { name: '定位来源 [L1]' })
+    expect(citationLink).toHaveTextContent('[L1]')
+    expect(container.querySelector('a[href="#citation-W99"]')).toBeNull()
+    for (const codeNode of screen.getAllByText('[L1]', { selector: 'code' })) {
+      expect(codeNode).not.toHaveAttribute('href')
+    }
+    expect(screen.getByRole('link', { name: 'L1' })).toHaveAttribute('href', 'https://example.com')
+    expect(container.querySelectorAll('a[href="#citation-L1"]')).toHaveLength(1)
+    expect(container.textContent).toContain('转义 [L1]')
+
+    fireEvent.click(citationLink)
+    expect(activate).toHaveBeenCalledWith('L1')
   })
 })

@@ -7,16 +7,38 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 
-/** 明确禁止联网时的零网页调用策略单元验证。 */
+/** 明确检索限制只关闭对应来源的策略单元验证。 */
 class WebSearchPolicyTest {
 
     @Test
     void disablesOnlyWhenLatestUserExplicitlyForbidsBrowsing() {
-        assertThat(WebSearchPolicy.allows(List.of(new AgentMessage(AgentMessage.Role.USER, "禁止联网，只用已有知识"))))
-                .isFalse();
-        assertThat(WebSearchPolicy.allows(List.of(new AgentMessage(AgentMessage.Role.USER, "请勿访问互联网"))))
-                .isFalse();
-        assertThat(WebSearchPolicy.allows(List.of(new AgentMessage(AgentMessage.Role.USER, "请搜索最新资料"))))
-                .isTrue();
+        assertThat(EvidenceAccessPolicy.decide(List.of(
+                new AgentMessage(AgentMessage.Role.USER, "禁止联网，只用已有知识"))))
+                .extracting(EvidenceAccessPolicy.Decision::allowLocal, EvidenceAccessPolicy.Decision::allowWeb)
+                .containsExactly(true, false);
+        assertThat(EvidenceAccessPolicy.decide(List.of(
+                new AgentMessage(AgentMessage.Role.USER, "请勿访问互联网"))))
+                .extracting(EvidenceAccessPolicy.Decision::allowLocal, EvidenceAccessPolicy.Decision::allowWeb)
+                .containsExactly(true, false);
+        assertThat(EvidenceAccessPolicy.decide(List.of(
+                new AgentMessage(AgentMessage.Role.USER, "请搜索最新资料"))))
+                .extracting(EvidenceAccessPolicy.Decision::allowLocal, EvidenceAccessPolicy.Decision::allowWeb)
+                .containsExactly(true, true);
+    }
+
+    @Test
+    void distinguishesAllRetrievalAndLocalOnlyRestrictionsFromDiscussion() {
+        assertThat(EvidenceAccessPolicy.decide(List.of(
+                new AgentMessage(AgentMessage.Role.USER, "只根据当前对话回答，不要查询任何资料"))))
+                .extracting(EvidenceAccessPolicy.Decision::allowLocal, EvidenceAccessPolicy.Decision::allowWeb)
+                .containsExactly(false, false);
+        assertThat(EvidenceAccessPolicy.decide(List.of(
+                new AgentMessage(AgentMessage.Role.USER, "不要查本地资料，但可以联网核对"))))
+                .extracting(EvidenceAccessPolicy.Decision::allowLocal, EvidenceAccessPolicy.Decision::allowWeb)
+                .containsExactly(false, true);
+        assertThat(EvidenceAccessPolicy.decide(List.of(
+                new AgentMessage(AgentMessage.Role.USER, "为什么刚才没有联网？"))))
+                .extracting(EvidenceAccessPolicy.Decision::allowLocal, EvidenceAccessPolicy.Decision::allowWeb)
+                .containsExactly(true, true);
     }
 }

@@ -13,8 +13,11 @@ import com.yuyu.salmonmind.conversation.api.CompactionPayload;
 import com.yuyu.salmonmind.conversation.api.Entry;
 import com.yuyu.salmonmind.conversation.api.EntryPayload;
 import com.yuyu.salmonmind.conversation.api.LocalCitationPayload;
+import com.yuyu.salmonmind.conversation.api.LocalRetrievedSourcePayload;
+import com.yuyu.salmonmind.conversation.api.RetrievedSourcePayload;
 import com.yuyu.salmonmind.conversation.api.RunTraceItemPayload;
 import com.yuyu.salmonmind.conversation.api.WebCitationPayload;
+import com.yuyu.salmonmind.conversation.api.WebRetrievedSourcePayload;
 import com.yuyu.salmonmind.conversation.api.TokenUsage;
 import com.yuyu.salmonmind.conversation.api.TitlePayload;
 import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
@@ -113,6 +116,12 @@ class JsonlCodec {
                         citations.add(encodeCitation(citation));
                     }
                 }
+                if (!p.retrievedSources().isEmpty()) {
+                    ArrayNode sources = node.putArray("retrievedSources");
+                    for (RetrievedSourcePayload source : p.retrievedSources()) {
+                        sources.add(encodeRetrievedSource(source));
+                    }
+                }
                 if (!p.trace().isEmpty()) {
                     ArrayNode trace = node.putArray("trace");
                     for (RunTraceItemPayload item : p.trace()) {
@@ -189,10 +198,11 @@ class JsonlCodec {
             case ASSISTANT_MESSAGE -> {
                 TokenUsage usage = node.hasNonNull("usage") ? decodeUsage(node.get("usage")) : null;
                 List<CitationPayload> citations = decodeCitations(node.get("citations"));
+                List<RetrievedSourcePayload> retrievedSources = decodeRetrievedSources(node.get("retrievedSources"));
                 List<RunTraceItemPayload> trace = decodeTrace(node.get("trace"));
                 yield new AssistantMessagePayload(
                         text(node, "text"), uuid(node, "runId"), text(node, "provider"), text(node, "model"),
-                        usage, citations, trace);
+                        usage, citations, retrievedSources, trace);
             }
             case COMPACTION -> {
                 TokenUsage usage = node.hasNonNull("usage") ? decodeUsage(node.get("usage")) : null;
@@ -230,6 +240,9 @@ class JsonlCodec {
     private ObjectNode encodeCitation(CitationPayload citation) {
         ObjectNode node = mapper.createObjectNode();
         node.put("referenceId", citation.referenceId());
+        if (citation.citationNote() != null) {
+            node.put("citationNote", citation.citationNote());
+        }
         switch (citation) {
             case LocalCitationPayload local -> {
                 node.put("kind", "local");
@@ -275,6 +288,35 @@ class JsonlCodec {
         return node;
     }
 
+    private ObjectNode encodeRetrievedSource(RetrievedSourcePayload source) {
+        ObjectNode node = mapper.createObjectNode();
+        node.put("referenceId", source.referenceId());
+        node.put("kind", source.kind());
+        node.put("retrievedAt", source.retrievedAt().toString());
+        node.put("excerptKind", source.excerptKind());
+        if (source.sourceExcerpt() != null) {
+            node.put("sourceExcerpt", source.sourceExcerpt());
+        }
+        switch (source) {
+            case LocalRetrievedSourcePayload local -> {
+                node.put("evidenceId", local.evidenceId().toString());
+                node.put("revisionId", local.revisionId().toString());
+                node.put("documentName", local.documentName());
+                node.put("location", local.location());
+            }
+            case WebRetrievedSourcePayload web -> {
+                node.put("provider", web.provider());
+                node.put("title", web.title());
+                node.put("url", web.url());
+                node.put("site", web.site());
+                if (web.dateLabel() != null) {
+                    node.put("dateLabel", web.dateLabel());
+                }
+            }
+        }
+        return node;
+    }
+
     private List<CitationPayload> decodeCitations(JsonNode node) {
         if (node == null || node.isNull()) {
             return List.of();
@@ -288,16 +330,63 @@ class JsonlCodec {
             String referenceId = text(item, "referenceId");
             if ("local".equals(kind)) {
                 citations.add(new LocalCitationPayload(referenceId, uuid(item, "evidenceId"),
-                        uuid(item, "revisionId"), text(item, "documentName"), text(item, "location")));
+                        uuid(item, "revisionId"), text(item, "documentName"), text(item, "location"),
+                        optionalText(item, "citationNote")));
             } else if ("web".equals(kind)) {
                 citations.add(new WebCitationPayload(referenceId, text(item, "provider"), text(item, "title"),
                         text(item, "url"), text(item, "site"), optionalText(item, "dateLabel"),
-                        instant(item, "retrievedAt")));
+                        instant(item, "retrievedAt"), optionalText(item, "citationNote")));
             } else {
                 throw corrupted("未知 Citation kind: " + kind);
             }
         }
         return List.copyOf(citations);
+    }
+
+    private List<RetrievedSourcePayload> decodeRetrievedSources(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return List.of();
+        }
+        if (!node.isArray()) {
+            throw corrupted("assistant retrievedSources 不是数组");
+        }
+        List<RetrievedSourcePayload> sources = new ArrayList<>();
+        for (JsonNode item : node) {
+            String kind = text(item, "kind");
+            String referenceId = text(item, "referenceId");
+            String excerptKind = text(item, "excerptKind");
+            Instant retrievedAt = instant(item, "retrievedAt");
+            if (referenceId == null || !referenceId.matches("[LW][1-9][0-9]*")
+                    || excerptKind == null || retrievedAt == null) {
+                throw corrupted("retrieved source 身份字段缺失");
+            }
+            if ("local".equals(kind)) {
+                UUID evidenceId = uuid(item, "evidenceId");
+                UUID revisionId = uuid(item, "revisionId");
+                String documentName = text(item, "documentName");
+                String location = text(item, "location");
+                if (evidenceId == null || revisionId == null || documentName == null || location == null) {
+                    throw corrupted("local retrieved source 身份字段损坏");
+                }
+                sources.add(new LocalRetrievedSourcePayload(
+                        referenceId, evidenceId, revisionId, documentName, location, retrievedAt,
+                        excerptKind, optionalText(item, "sourceExcerpt")));
+            } else if ("web".equals(kind)) {
+                String provider = text(item, "provider");
+                String title = text(item, "title");
+                String url = text(item, "url");
+                String site = text(item, "site");
+                if (provider == null || title == null || url == null || site == null) {
+                    throw corrupted("web retrieved source 身份字段损坏");
+                }
+                sources.add(new WebRetrievedSourcePayload(
+                        referenceId, provider, title, url, site, optionalText(item, "dateLabel"),
+                        retrievedAt, excerptKind, optionalText(item, "sourceExcerpt")));
+            } else {
+                throw corrupted("未知 Retrieved Source kind: " + kind);
+            }
+        }
+        return List.copyOf(sources);
     }
 
     private List<RunTraceItemPayload> decodeTrace(JsonNode node) {

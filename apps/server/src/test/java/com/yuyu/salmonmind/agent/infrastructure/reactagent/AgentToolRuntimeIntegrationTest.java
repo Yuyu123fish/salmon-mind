@@ -239,10 +239,105 @@ class AgentToolRuntimeIntegrationTest {
                 .contains("referenceId\":\"W1");
         assertThat(result.citations()).hasSize(1);
         assertThat(result.citations().get(0).referenceId()).isEqualTo("W1");
+        assertThat(result.citations().get(0).citationNote()).contains("回答依据");
+        assertThat(result.retrievedSources()).hasSize(1)
+                .singleElement()
+                .satisfies(retrieved -> assertThat(retrieved.sourceExcerpt()).isEqualTo("摘要"));
         assertThat(events.completed).singleElement().satisfies(event -> {
             assertThat(event.provider()).isEqualTo("BOCHA");
             assertThat(event.sourceCount()).isEqualTo(1);
         });
+    }
+
+    @Test
+    void blocksWebProviderBeforeHandlerWhenUserForbidsBrowsing() {
+        var tool = new RecordingSearchTool("search_web_bocha", false,
+                "{\"status\":\"SUCCESS\",\"sourceKind\":\"WEB\",\"provider\":\"BOCHA\",\"items\":[]}");
+        var model = new ToolCallingChatModel("已按要求不联网回答。", "search_web_bocha");
+        var adapter = newAdapter(model, List.of(tool), 200_000);
+        var events = new RecordingListener();
+
+        AgentResult result = completeSync(adapter, events, new AgentRequest(
+                "web-disabled-thread", null, UUID.randomUUID(),
+                userList("请只根据当前对话回答，不要联网"), CheckpointPolicy.REUSE_IF_MATCH));
+
+        assertThat(tool.calls).isEmpty();
+        assertThat(events.failed).singleElement()
+                .extracting(AgentToolFailed::stableErrorCode)
+                .isEqualTo("WEB_SEARCH_DISABLED");
+        assertThat(result.text()).isEqualTo("已按要求不联网回答。");
+    }
+
+    @Test
+    void keepsLocalSearchAvailableWhenOnlyBrowsingIsForbidden() {
+        var tool = new RecordingSearchTool("search_local_knowledge", false,
+                "{\"status\":\"SUCCESS\",\"sourceKind\":\"LOCAL\",\"provider\":\"LOCAL\",\"items\":[]}");
+        var model = new ToolCallingChatModel("已依据本地资料回答。", "search_local_knowledge");
+        var adapter = newAdapter(model, List.of(tool), 200_000);
+        var events = new RecordingListener();
+
+        AgentResult result = completeSync(adapter, events, new AgentRequest(
+                "local-allowed-thread", null, UUID.randomUUID(),
+                userList("请查本地资料，但不要联网"), CheckpointPolicy.REUSE_IF_MATCH));
+
+        assertThat(tool.calls).hasSize(1);
+        assertThat(events.completed).singleElement().extracting(AgentToolCompleted::sourceCount).isEqualTo(0);
+        assertThat(result.text()).isEqualTo("已依据本地资料回答。");
+    }
+
+    @Test
+    void blocksLocalProviderBeforeHandlerWhenUserForbidsAllRetrieval() {
+        var tool = new RecordingSearchTool("search_local_knowledge", false,
+                "{\"status\":\"SUCCESS\",\"sourceKind\":\"LOCAL\",\"provider\":\"LOCAL\",\"items\":[]}");
+        var model = new ToolCallingChatModel("已按要求只使用当前对话。", "search_local_knowledge");
+        var adapter = newAdapter(model, List.of(tool), 200_000);
+        var events = new RecordingListener();
+
+        AgentResult result = completeSync(adapter, events, new AgentRequest(
+                "local-disabled-thread", null, UUID.randomUUID(),
+                userList("只根据当前对话回答，不要查询任何资料"), CheckpointPolicy.REUSE_IF_MATCH));
+
+        assertThat(tool.calls).isEmpty();
+        assertThat(events.failed).singleElement()
+                .extracting(AgentToolFailed::stableErrorCode)
+                .isEqualTo("LOCAL_SEARCH_DISABLED");
+        assertThat(result.text()).isEqualTo("已按要求只使用当前对话。");
+    }
+
+    @Test
+    void keepsInvalidProviderResponseDistinctInToolTrace() {
+        var tool = new RecordingSearchTool(false,
+                "{\"status\":\"UNAVAILABLE\",\"reason\":\"INVALID_RESPONSE\","
+                        + "\"sourceKind\":\"WEB\",\"provider\":\"BOCHA\",\"items\":[]}");
+        var model = new ToolCallingChatModel("未完成网页核验，仍返回当前对话结果。", RecordingSearchTool.NAME);
+        var adapter = newAdapter(model, List.of(tool), 200_000);
+        var events = new RecordingListener();
+
+        completeSync(adapter, events, new AgentRequest(
+                "invalid-provider-thread", null, UUID.randomUUID(), userList("核对网页"),
+                CheckpointPolicy.REUSE_IF_MATCH));
+
+        assertThat(events.failed).singleElement()
+                .extracting(AgentToolFailed::stableErrorCode)
+                .isEqualTo("WEB_SEARCH_INVALID_RESPONSE");
+    }
+
+    @Test
+    void keepsOrdinaryProviderFailureDistinctFromInvalidResponse() {
+        var tool = new RecordingSearchTool(false,
+                "{\"status\":\"UNAVAILABLE\",\"reason\":\"PROVIDER_FAILED\","
+                        + "\"sourceKind\":\"WEB\",\"provider\":\"BOCHA\",\"items\":[]}");
+        var model = new ToolCallingChatModel("未完成网页核验，仍返回当前对话结果。", RecordingSearchTool.NAME);
+        var adapter = newAdapter(model, List.of(tool), 200_000);
+        var events = new RecordingListener();
+
+        completeSync(adapter, events, new AgentRequest(
+                "provider-failure-thread", null, UUID.randomUUID(), userList("核对网页"),
+                CheckpointPolicy.REUSE_IF_MATCH));
+
+        assertThat(events.failed).singleElement()
+                .extracting(AgentToolFailed::stableErrorCode)
+                .isEqualTo("WEB_SEARCH_PROVIDER_FAILED");
     }
 
     @Test
@@ -410,19 +505,26 @@ class AgentToolRuntimeIntegrationTest {
 
         private final List<String> calls = new CopyOnWriteArrayList<>();
 
+        private final String name;
+
         private final boolean throwOnCall;
 
         private final String resultText;
 
         RecordingSearchTool() {
-            this(false, "检索命中：SalmonMind 支持本地文档问答，混合召回与引用。");
+            this(NAME, false, "检索命中：SalmonMind 支持本地文档问答，混合召回与引用。");
         }
 
         RecordingSearchTool(boolean throwOnCall) {
-            this(throwOnCall, null);
+            this(NAME, throwOnCall, null);
         }
 
         RecordingSearchTool(boolean throwOnCall, String resultText) {
+            this(NAME, throwOnCall, resultText);
+        }
+
+        RecordingSearchTool(String name, boolean throwOnCall, String resultText) {
+            this.name = name;
             this.throwOnCall = throwOnCall;
             this.resultText = resultText;
         }
@@ -430,7 +532,7 @@ class AgentToolRuntimeIntegrationTest {
         @Override
         public ToolDefinition getToolDefinition() {
             return ToolDefinition.builder()
-                    .name(NAME)
+                    .name(name)
                     .description("只读测试搜索工具：按查询返回固定短结果")
                     .inputSchema("""
                             {"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
@@ -466,13 +568,19 @@ class AgentToolRuntimeIntegrationTest {
         static final String FINAL_ANSWER = "根据检索结果，SalmonMind 支持本地文档问答。";
 
         private final String finalAnswer;
+        private final String toolName;
 
         ToolCallingChatModel() {
             this(FINAL_ANSWER);
         }
 
         ToolCallingChatModel(String finalAnswer) {
+            this(finalAnswer, RecordingSearchTool.NAME);
+        }
+
+        ToolCallingChatModel(String finalAnswer, String toolName) {
             this.finalAnswer = finalAnswer;
+            this.toolName = toolName;
         }
 
         private final List<List<Message>> calls = new CopyOnWriteArrayList<>();
@@ -489,7 +597,7 @@ class AgentToolRuntimeIntegrationTest {
             if (!sawToolResult) {
                 var toolCallMessage = AssistantMessage.builder()
                         .toolCalls(List.of(new AssistantMessage.ToolCall(
-                                TOOL_CALL_ID, "function", TOOL_NAME, "{\"query\":\"salmon\"}")))
+                                TOOL_CALL_ID, "function", toolName, "{\"query\":\"salmon\"}")))
                         .properties(Map.of("reasoningContent", "需要先查询资料。"))
                         .build();
                 return new ChatResponse(List.of(new Generation(toolCallMessage)));

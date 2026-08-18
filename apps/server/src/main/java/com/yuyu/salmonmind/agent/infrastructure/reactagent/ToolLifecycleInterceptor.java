@@ -45,6 +45,7 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
     /** 每次 Agent stream 独立的工具预算 metadata 键。 */
     static final String INVOCATION_BUDGET_METADATA_KEY = "salmon:agent:tool-budget";
     static final String RESULT_BUDGET_METADATA_KEY = "salmon:agent:tool-result-budget";
+    static final String LOCAL_SEARCH_ALLOWED_METADATA_KEY = "salmon:agent:local-search-allowed";
     static final String WEB_SEARCH_ALLOWED_METADATA_KEY = "salmon:agent:web-search-allowed";
     static final String TOOL_CALL_BUDGET_EXCEEDED = "TOOL_CALL_BUDGET_EXCEEDED";
     static final String TOOL_CONTEXT_BUDGET_EXCEEDED = "TOOL_CONTEXT_BUDGET_EXCEEDED";
@@ -94,6 +95,15 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             }
             // 预算耗尽仍返回可被模型理解的结构化结果；不抛异常，避免工具失败制造 Run 双终态。
             return ToolCallResponse.error(request.getToolCallId(), request.getToolName(), TOOL_CALL_BUDGET_RESULT);
+        }
+        if (isLocalTool(request.getToolName()) && !localSearchAllowed(request)) {
+            if (listener != null) {
+                listener.onToolFailed(new AgentToolFailed(
+                        request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
+                        "LOCAL_SEARCH_DISABLED", "用户已禁止本地检索"));
+            }
+            return ToolCallResponse.error(request.getToolCallId(), request.getToolName(),
+                    disabledLocalSearchResult());
         }
         if (isWebTool(request.getToolName()) && !webSearchAllowed(request)) {
             if (listener != null) {
@@ -196,6 +206,18 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                 .orElse(true);
     }
 
+    private static boolean localSearchAllowed(ToolCallRequest request) {
+        return request.getExecutionContext()
+                .flatMap(context -> context.config().metadata(LOCAL_SEARCH_ALLOWED_METADATA_KEY))
+                .filter(Boolean.class::isInstance)
+                .map(Boolean.class::cast)
+                .orElse(true);
+    }
+
+    private static boolean isLocalTool(String toolName) {
+        return "search_local_knowledge".equals(toolName);
+    }
+
     private static boolean isWebTool(String toolName) {
         return "search_web_bocha".equals(toolName) || "search_web_searchapi".equals(toolName);
     }
@@ -204,6 +226,11 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
         String provider = "search_web_bocha".equals(toolName) ? "BOCHA" : "SEARCH_API";
         return "{\"status\":\"UNAVAILABLE\",\"reason\":\"USER_DISABLED\","
                 + "\"sourceKind\":\"WEB\",\"provider\":\"" + provider + "\",\"items\":[]}";
+    }
+
+    private static String disabledLocalSearchResult() {
+        return "{\"status\":\"UNAVAILABLE\",\"reason\":\"USER_DISABLED\","
+                + "\"sourceKind\":\"LOCAL\",\"provider\":\"LOCAL\",\"items\":[]}";
     }
 
     /** 工具结果进入模型上下文前的有界控制点；来源结果必须按完整 item 边界裁剪。 */
@@ -319,8 +346,14 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                     case "RATE_LIMITED" -> "WEB_SEARCH_RATE_LIMITED";
                     case "TIMEOUT" -> "WEB_SEARCH_TIMEOUT";
                     case "USER_DISABLED" -> "WEB_SEARCH_DISABLED";
-                    default -> "WEB_SEARCH_FAILED";
+                    case "INVALID_RESPONSE" -> "WEB_SEARCH_INVALID_RESPONSE";
+                    case "PROVIDER_FAILED" -> "WEB_SEARCH_PROVIDER_FAILED";
+                    default -> "WEB_SEARCH_PROVIDER_FAILED";
                 };
+            }
+            if ("LOCAL".equals(root.path("sourceKind").asText())
+                    && "USER_DISABLED".equals(root.path("reason").asText())) {
+                return "LOCAL_SEARCH_DISABLED";
             }
         } catch (Exception ignored) {
             // 结构化前缀已经成立，解析失败时退回稳定通用码
@@ -379,8 +412,10 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             case "WEB_SEARCH_AUTH_FAILED" -> "网页搜索鉴权失败";
             case "WEB_SEARCH_RATE_LIMITED" -> "网页搜索请求过于频繁";
             case "WEB_SEARCH_TIMEOUT" -> "网页搜索超时";
+            case "WEB_SEARCH_INVALID_RESPONSE" -> "网页搜索响应格式异常";
             case "WEB_SEARCH_DISABLED" -> "用户已禁止联网";
-            case "WEB_SEARCH_FAILED", "RETRIEVAL_UNAVAILABLE" -> "检索服务暂不可用";
+            case "LOCAL_SEARCH_DISABLED" -> "用户已禁止本地检索";
+            case "WEB_SEARCH_FAILED", "WEB_SEARCH_PROVIDER_FAILED", "RETRIEVAL_UNAVAILABLE" -> "检索服务暂不可用";
             case TOOL_CALL_BUDGET_EXCEEDED -> "已达到本轮工具调用上限";
             case TOOL_CONTEXT_BUDGET_EXCEEDED -> "已达到本轮工具结果上下文预算";
             default -> "工具执行失败";

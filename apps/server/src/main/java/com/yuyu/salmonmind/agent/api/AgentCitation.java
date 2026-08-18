@@ -5,4 +5,7 @@ public sealed interface AgentCitation permits AgentLocalCitation, AgentWebCitati
 
     /** 当前 Run 内模型可引用的稳定标记，例如 {@code L1} 或 {@code W2}。 */
     String referenceId();
+
+    /** 从 Agent 已有回答中提取的有界相关性说明；无法取得时为 null。 */
+    String citationNote();
 }

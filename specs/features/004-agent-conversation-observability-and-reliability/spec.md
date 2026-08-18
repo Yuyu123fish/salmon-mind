@@ -1,6 +1,6 @@
 # Feature 004：Agent 对话可观测性、证据交互与运行可靠性
 
-Status: Draft
+Status: Accepted
 
 ## Problem Statement
 

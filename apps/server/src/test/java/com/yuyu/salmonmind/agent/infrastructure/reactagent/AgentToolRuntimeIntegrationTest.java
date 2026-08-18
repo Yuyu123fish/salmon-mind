@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 
@@ -11,6 +12,7 @@ import com.yuyu.salmonmind.agent.api.AgentExecutionException;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
 import com.yuyu.salmonmind.agent.api.AgentRequest;
 import com.yuyu.salmonmind.agent.api.AgentResult;
+import com.yuyu.salmonmind.agent.api.AgentRunTraceItem;
 import com.yuyu.salmonmind.agent.api.AgentStreamListener;
 import com.yuyu.salmonmind.agent.api.AgentToolCompleted;
 import com.yuyu.salmonmind.agent.api.AgentToolFailed;
@@ -112,7 +114,8 @@ class AgentToolRuntimeIntegrationTest {
         assertThat(events.started).hasSize(1);
         assertThat(events.started.get(0).toolCallId()).isEqualTo(ToolCallingChatModel.TOOL_CALL_ID);
         assertThat(events.started.get(0).toolName()).isEqualTo(ToolCallingChatModel.TOOL_NAME);
-        assertThat(events.started.get(0).safeQuerySummary()).contains("salmon");
+        assertThat(events.started.get(0).safeQuerySummary()).isEqualTo("工具执行中");
+        assertThat(events.started.get(0).safeQuerySummary()).doesNotContain("salmon");
         assertThat(events.completed).hasSize(1);
         assertThat(events.completed.get(0).toolCallId()).isEqualTo(ToolCallingChatModel.TOOL_CALL_ID);
         assertThat(events.completed.get(0).toolName()).isEqualTo(ToolCallingChatModel.TOOL_NAME);
@@ -123,6 +126,16 @@ class AgentToolRuntimeIntegrationTest {
         assertThat(events.error()).isNull();
         // delta 拼接即最终回答
         assertThat(String.join("", events.deltas)).isEqualTo(ToolCallingChatModel.FINAL_ANSWER);
+        assertThat(events.reasoning).containsExactly("需要先查询资料。", "资料足够，可以作答。");
+        assertThat(result.trace()).satisfiesExactly(
+                item -> assertThat(item).extracting(AgentRunTraceItem::kind, AgentRunTraceItem::text)
+                        .containsExactly(AgentRunTraceItem.Kind.REASONING, "需要先查询资料。"),
+                item -> assertThat(item).extracting(
+                        AgentRunTraceItem::kind, AgentRunTraceItem::toolCallId, AgentRunTraceItem::toolStatus)
+                        .containsExactly(AgentRunTraceItem.Kind.TOOL, ToolCallingChatModel.TOOL_CALL_ID,
+                                AgentRunTraceItem.ToolStatus.COMPLETED),
+                item -> assertThat(item).extracting(AgentRunTraceItem::kind, AgentRunTraceItem::text)
+                        .containsExactly(AgentRunTraceItem.Kind.REASONING, "资料足够，可以作答。"));
     }
 
     @Test
@@ -141,7 +154,8 @@ class AgentToolRuntimeIntegrationTest {
         assertThat(events.failed.get(0).toolCallId()).isEqualTo(ToolCallingChatModel.TOOL_CALL_ID);
         assertThat(events.failed.get(0).toolName()).isEqualTo(ToolCallingChatModel.TOOL_NAME);
         assertThat(events.failed.get(0).stableErrorCode()).isEqualTo("TOOL_EXECUTION_FAILED");
-        assertThat(events.failed.get(0).safeMessage()).contains("搜索服务不可用");
+        assertThat(events.failed.get(0).safeMessage()).isEqualTo("工具执行失败");
+        assertThat(events.failed.get(0).safeMessage()).doesNotContain("gate 测试注入异常");
         assertThat(events.completed).isEmpty();
         assertThat(events.result()).isNotNull();
         assertThat(events.error()).isNull();
@@ -335,6 +349,7 @@ class AgentToolRuntimeIntegrationTest {
     private static final class RecordingListener implements AgentStreamListener {
 
         private final List<String> deltas = new CopyOnWriteArrayList<>();
+        private final List<String> reasoning = new CopyOnWriteArrayList<>();
         private final List<AgentToolStarted> started = new CopyOnWriteArrayList<>();
         private final List<AgentToolCompleted> completed = new CopyOnWriteArrayList<>();
         private final List<AgentToolFailed> failed = new CopyOnWriteArrayList<>();
@@ -344,6 +359,11 @@ class AgentToolRuntimeIntegrationTest {
         @Override
         public void onDelta(String delta) {
             deltas.add(delta);
+        }
+
+        @Override
+        public void onReasoningDelta(String delta) {
+            reasoning.add(delta);
         }
 
         @Override
@@ -470,10 +490,14 @@ class AgentToolRuntimeIntegrationTest {
                 var toolCallMessage = AssistantMessage.builder()
                         .toolCalls(List.of(new AssistantMessage.ToolCall(
                                 TOOL_CALL_ID, "function", TOOL_NAME, "{\"query\":\"salmon\"}")))
+                        .properties(Map.of("reasoningContent", "需要先查询资料。"))
                         .build();
                 return new ChatResponse(List.of(new Generation(toolCallMessage)));
             }
-            var answer = AssistantMessage.builder().content(finalAnswer).build();
+            var answer = AssistantMessage.builder()
+                    .content(finalAnswer)
+                    .properties(Map.of("reasoningContent", "资料足够，可以作答。"))
+                    .build();
             var metadata = ChatResponseMetadata.builder().usage(new DefaultUsage(42, 7, 49)).build();
             return new ChatResponse(List.of(new Generation(answer)), metadata);
         }

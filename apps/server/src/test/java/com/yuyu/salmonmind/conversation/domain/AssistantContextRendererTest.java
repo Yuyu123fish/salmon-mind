@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
 import com.yuyu.salmonmind.conversation.api.CitationPayload;
 import com.yuyu.salmonmind.conversation.api.LocalCitationPayload;
+import com.yuyu.salmonmind.conversation.api.RunTraceItemPayload;
 import com.yuyu.salmonmind.conversation.api.WebCitationPayload;
 import org.junit.jupiter.api.Test;
 
@@ -16,9 +17,14 @@ import java.util.UUID;
 class AssistantContextRendererTest {
 
     @Test
-    void keepsOldAssistantTextByteSemanticsWhenThereIsNoCitation() {
+    void keepsOldAssistantTextSemanticsAndNeverProjectsDisplayTrace() {
         AssistantMessagePayload payload = new AssistantMessagePayload(
-                "普通回答", UUID.randomUUID(), "provider", "model", null);
+                "普通回答", UUID.randomUUID(), "provider", "model", null, List.of(),
+                List.of(
+                        RunTraceItemPayload.reasoning("不可进入模型的推理", false),
+                        RunTraceItemPayload.tool(
+                                "call-1", "search", RunTraceItemPayload.ToolStatus.COMPLETED,
+                                "不可进入模型的工具摘要", null, false)));
 
         assertThat(AssistantContextRenderer.render(payload)).isEqualTo("普通回答");
     }

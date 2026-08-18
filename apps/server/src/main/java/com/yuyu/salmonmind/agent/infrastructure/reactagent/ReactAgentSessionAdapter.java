@@ -86,6 +86,10 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
     private static final int MAX_TOOL_CALLS_PER_RUN = 4;
     private static final int DEFAULT_MAX_TOOL_RESULT_TOKENS_PER_RUN = 32_768;
     private static final int DEFAULT_MAX_STEPS = 32;
+    private static final int MAX_TRACE_ITEMS = 64;
+    private static final int MAX_REASONING_TRACE_CHARS = 32_768;
+    private static final int MAX_TOOL_TRACE_SUMMARY_CHARS = 512;
+    private static final String REASONING_METADATA_KEY = "reasoningContent";
     private static final int MIN_TOOL_RESULT_TOKENS = 64;
     private static final long MAX_TOOL_RESULT_TOKENS = 196_712L;
     private static final long TOOL_CALL_FRAME_TOKENS = 64L;
@@ -117,6 +121,9 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
     private final int maxToolCallsPerRun;
     private final int maxToolResultTokensPerRun;
     private final int maxSteps;
+    private final int maxTraceItems;
+    private final int maxReasoningTraceChars;
+    private final int maxToolTraceSummaryChars;
     private final AgentContextBudget contextBudget;
 
     private volatile ChatModelHandle chatModelHandle;
@@ -141,7 +148,10 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
             WebSearchService webSearchService,
             @Value("${salmon.agent.max-tool-calls-per-run:4}") int maxToolCallsPerRun,
             @Value("${salmon.agent.max-tool-result-tokens-per-run:32768}") int maxToolResultTokensPerRun,
-            @Value("${salmon.agent.max-steps:32}") int maxSteps
+            @Value("${salmon.agent.max-steps:32}") int maxSteps,
+            @Value("${salmon.agent.trace.max-items:64}") int maxTraceItems,
+            @Value("${salmon.agent.trace.max-reasoning-chars:32768}") int maxReasoningTraceChars,
+            @Value("${salmon.agent.trace.max-tool-summary-chars:512}") int maxToolTraceSummaryChars
     ) {
         this(chatModelProvider, redisClientProvider, maxOutputTokens, summaryMaxOutputTokens,
                 summaryTemperature, maxToolResultChars, List.of(),
@@ -151,7 +161,8 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
                                 WebSearchService.WebSearchProvider.BOCHA),
                         new WebSearchToolCallback(objectMapper, webSearchService,
                                 WebSearchService.WebSearchProvider.SEARCH_API)),
-                maxToolCallsPerRun, maxToolResultTokensPerRun, maxSteps);
+                maxToolCallsPerRun, maxToolResultTokensPerRun, maxSteps,
+                maxTraceItems, maxReasoningTraceChars, maxToolTraceSummaryChars);
     }
 
     /** 兼容既有测试的包内构造：使用默认结果上限，不注册测试工具。 */
@@ -268,6 +279,29 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
             int maxToolResultTokensPerRun,
             int maxSteps
     ) {
+        this(chatModelProvider, redisClientProvider, maxOutputTokens, summaryMaxOutputTokens,
+                summaryTemperature, maxToolResultChars, testTools, productionTools,
+                maxToolCallsPerRun, maxToolResultTokensPerRun, maxSteps,
+                MAX_TRACE_ITEMS, MAX_REASONING_TRACE_CHARS, MAX_TOOL_TRACE_SUMMARY_CHARS);
+    }
+
+    /** 完整构造：展示 Trace 允许通过配置降低上限，但不能突破 Stage 01 固定硬边界。 */
+    ReactAgentSessionAdapter(
+            ChatModelProvider chatModelProvider,
+            RedisClientProvider redisClientProvider,
+            int maxOutputTokens,
+            int summaryMaxOutputTokens,
+            double summaryTemperature,
+            int maxToolResultChars,
+            List<ToolCallback> testTools,
+            List<ToolCallback> productionTools,
+            int maxToolCallsPerRun,
+            int maxToolResultTokensPerRun,
+            int maxSteps,
+            int maxTraceItems,
+            int maxReasoningTraceChars,
+            int maxToolTraceSummaryChars
+    ) {
         if (maxToolResultTokensPerRun < MIN_TOOL_RESULT_TOKENS
                 || maxToolResultTokensPerRun > MAX_TOOL_RESULT_TOKENS) {
             throw new IllegalArgumentException("每 Run 工具结果 token 预算必须在 64 到 196712 之间");
@@ -287,6 +321,11 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
         this.maxToolCallsPerRun = Math.min(MAX_TOOL_CALLS_PER_RUN, Math.max(0, maxToolCallsPerRun));
         this.maxToolResultTokensPerRun = maxToolResultTokensPerRun;
         this.maxSteps = maxSteps;
+        this.maxTraceItems = Math.min(MAX_TRACE_ITEMS, Math.max(1, maxTraceItems));
+        this.maxReasoningTraceChars = Math.min(
+                MAX_REASONING_TRACE_CHARS, Math.max(1, maxReasoningTraceChars));
+        this.maxToolTraceSummaryChars = Math.min(
+                MAX_TOOL_TRACE_SUMMARY_CHARS, Math.max(1, maxToolTraceSummaryChars));
         // 测试工具不代表生产 Tool schema；无生产工具时返回 ZERO 以保持既有测试替身的
         // usage 锚点兼容。这里仅读取定义，不初始化 ChatModel、Redis 或 Provider。
         this.contextBudget = this.productionTools.isEmpty()
@@ -312,6 +351,8 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
      */
     @Override
     public void stream(AgentRequest request, AgentStreamListener listener) {
+        RunTraceCollector traceListener = new RunTraceCollector(
+                listener, maxTraceItems, maxReasoningTraceChars, maxToolTraceSummaryChars);
         try {
             ChatModelHandle handle = handle();
             ReactAgent agent = reactAgent(handle);
@@ -320,7 +361,7 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
             // 把当前流监听器挂到 config metadata：工具生命周期拦截器在执行前从中取回；
             // 同一 Adapter 上的并发流各自携带独立 listener，互不干扰
             RunnableConfig.Builder configBuilder = RunnableConfig.builder().threadId(request.threadId());
-            configBuilder.addMetadata(ToolLifecycleInterceptor.LISTENER_METADATA_KEY, listener);
+            configBuilder.addMetadata(ToolLifecycleInterceptor.LISTENER_METADATA_KEY, traceListener);
             configBuilder.addMetadata(
                     ToolLifecycleInterceptor.INVOCATION_BUDGET_METADATA_KEY,
                     new ToolLifecycleInterceptor.InvocationBudget(maxToolCallsPerRun));
@@ -356,10 +397,17 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
                         }
                         return;
                     }
-                    if (so.message() instanceof AssistantMessage chunk && chunk.getText() != null) {
-                        // AGENT_MODEL_STREAMING 增量：转发给调用方并累积，不在此处写盘
-                        accumulated.append(chunk.getText());
-                        listener.onDelta(chunk.getText());
+                    if (so.message() instanceof AssistantMessage chunk) {
+                        // 只读取 Spring AI 公开的 reasoning metadata；不解析日志或 Provider 原始响应。
+                        Object reasoning = chunk.getMetadata().get(REASONING_METADATA_KEY);
+                        if (reasoning instanceof String text && !text.isEmpty()) {
+                            traceListener.onReasoningDelta(text);
+                        }
+                        if (chunk.getText() != null) {
+                            // AGENT_MODEL_STREAMING 回答增量：与 reasoning 分开转发并累积，不在此处写盘
+                            accumulated.append(chunk.getText());
+                            traceListener.onDelta(chunk.getText());
+                        }
                     }
                 }).blockLast();// 流结束后才会执行下面的代码
 
@@ -372,35 +420,35 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
                 String text = accumulated.toString();
                 if ("length".equalsIgnoreCase(finishReason)) {
                     // 输出达到长度限制是不完整回答，不能当作成功；与上下文溢出不同，不自动压缩重试
-                    listener.onError(new AgentExecutionException(
+                    traceListener.onError(new AgentExecutionException(
                             AgentErrorCode.CHAT_MODEL_FAILED, "模型输出达到长度限制，回答不完整"));
                     return;
                 }
                 if (text.isBlank()) {
-                    listener.onError(new AgentExecutionException(
+                    traceListener.onError(new AgentExecutionException(
                             AgentErrorCode.CHAT_MODEL_FAILED, "模型返回了空回答"));
                     return;
                 }
 
                 // 模型成功：更新 Checkpoint 叶子标记为预分配的回答 Entry，保证下一轮可复用
                 writeCheckpointLeaf(request);
-                listener.onComplete(new AgentResult(
+                traceListener.onComplete(new AgentResult(
                         text, handle.provider(), handle.modelName(), mapUsage(usage),
-                        sourceRegistry.citationsFor(text)));
+                        sourceRegistry.citationsFor(text), traceListener.snapshot()));
             } catch (RuntimeException ex) {
-                listener.onError(mapError(ex));
+                traceListener.onError(mapError(ex));
             }
         } catch (AgentExecutionException ex) {
-            listener.onError(ex);
+            traceListener.onError(ex);
         } catch (ChatModelException ex) {
-            listener.onError(new AgentExecutionException(
+            traceListener.onError(new AgentExecutionException(
                     AgentErrorCode.CHAT_MODEL_NOT_CONFIGURED, "Chat 模型未配置", ex));
         } catch (RedisClientUnavailableException ex) {
-            listener.onError(new AgentExecutionException(AgentErrorCode.REDIS_UNAVAILABLE, ex.getMessage(), ex));
+            traceListener.onError(new AgentExecutionException(AgentErrorCode.REDIS_UNAVAILABLE, ex.getMessage(), ex));
         } catch (RedisException ex) {
-            listener.onError(redisFailure("Redis 不可用", ex));
+            traceListener.onError(redisFailure("Redis 不可用", ex));
         } catch (Exception ex) {
-            listener.onError(new AgentExecutionException(AgentErrorCode.CHAT_MODEL_FAILED, "模型调用失败", ex));
+            traceListener.onError(new AgentExecutionException(AgentErrorCode.CHAT_MODEL_FAILED, "模型调用失败", ex));
         }
     }
 
@@ -612,6 +660,8 @@ class ReactAgentSessionAdapter implements AgentStreamSession, AgentSummaryServic
                     .name("chat-agent")
                     .model(handle.chatModel())
                     .systemPrompt(SYSTEM_PROMPT)
+                    // 官方公开选项保留 reasoning 内容；Adapter 仍只读取 AssistantMessage metadata。
+                    .returnReasoningContents(true)
                     // 主回答输出上限与流式 usage：与模型默认选项字段级合并，不修改默认 temperature
                     .chatOptions(mainOptions)
                     .saver(saver())

@@ -8,6 +8,7 @@ import com.yuyu.salmonmind.agent.api.AgentLocalCitation;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
 import com.yuyu.salmonmind.agent.api.AgentRequest;
 import com.yuyu.salmonmind.agent.api.AgentResult;
+import com.yuyu.salmonmind.agent.api.AgentRunTraceItem;
 import com.yuyu.salmonmind.agent.api.AgentStreamListener;
 import com.yuyu.salmonmind.agent.api.AgentStreamSession;
 import com.yuyu.salmonmind.agent.api.AgentSummaryRequest;
@@ -31,6 +32,7 @@ import com.yuyu.salmonmind.conversation.api.LocalCitationPayload;
 import com.yuyu.salmonmind.conversation.api.Run;
 import com.yuyu.salmonmind.conversation.api.Run.RunStatus;
 import com.yuyu.salmonmind.conversation.api.RunStreamListener;
+import com.yuyu.salmonmind.conversation.api.RunTraceItemPayload;
 import com.yuyu.salmonmind.conversation.api.TitlePayload;
 import com.yuyu.salmonmind.conversation.api.TokenUsage;
 import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
@@ -459,6 +461,11 @@ class ConversationRunCoordinator {
         AgentExecutionException[] failure = {null};
         agentStream.stream(request, new AgentStreamListener() {
             @Override
+            public void onReasoningDelta(String delta) {
+                listener.onReasoningDelta(new RunStreamListener.ReasoningDelta(running.id(), delta));
+            }
+
+            @Override
             public void onDelta(String delta) {
                 // delta 只用于临时显示：不写 JSONL，也不参与最终结果拼接
                 deltaSeen[0] = true;
@@ -478,21 +485,22 @@ class ConversationRunCoordinator {
             @Override
             public void onToolStarted(com.yuyu.salmonmind.agent.api.AgentToolStarted event) {
                 listener.onToolStarted(new RunStreamListener.ToolStarted(
-                        running.id(), event.toolCallId(), event.toolName()));
+                        running.id(), event.toolCallId(), event.toolName(), event.safeQuerySummary()));
             }
 
             @Override
             public void onToolCompleted(com.yuyu.salmonmind.agent.api.AgentToolCompleted event) {
                 listener.onToolCompleted(new RunStreamListener.ToolCompleted(
                         running.id(), event.toolCallId(), event.toolName(), event.durationMillis(),
-                        event.provider(), event.sourceCount(), event.truncated(), event.degraded()));
+                        event.provider(), event.sourceCount(), event.truncated(), event.degraded(),
+                        event.safeSummary()));
             }
 
             @Override
             public void onToolFailed(com.yuyu.salmonmind.agent.api.AgentToolFailed event) {
                 listener.onToolFailed(new RunStreamListener.ToolFailed(
                         running.id(), event.toolCallId(), event.toolName(), event.durationMillis(),
-                        event.stableErrorCode()));
+                        event.stableErrorCode(), event.safeMessage()));
             }
         });
 
@@ -551,7 +559,7 @@ class ConversationRunCoordinator {
                 outcome.conversation().activeLeafEntryId(), EntryType.ASSISTANT_MESSAGE, answeredAt,
                 new AssistantMessagePayload(
                         result.text(), running.id(), result.provider(), result.model(), mapUsage(result.usage()),
-                        mapCitations(result.citations())));
+                        mapCitations(result.citations()), mapTrace(result.trace())));
         historyRepository.append(conversationId, assistantEntry);
 
         Run finished = new Run(
@@ -565,9 +573,10 @@ class ConversationRunCoordinator {
         });
 
         // 标题持久化也属于业务侧（失败不影响已成功的主 Run），成功则产出待发送事件
-        RunStreamListener.TitleUpdated titleEvent = maybeGenerateTitle(
+        TitleOutcome titleOutcome = maybeGenerateTitle(
                 conversationId, finalConversation, assistantEntry, running);
-        sendSuccessEvents(listener, conversationId, finished, finalConversation, assistantEntry, titleEvent);
+        sendSuccessEvents(listener, conversationId, finished, titleOutcome.conversation(),
+                assistantEntry, titleOutcome.event());
     }
 
     /**
@@ -599,24 +608,23 @@ class ConversationRunCoordinator {
     }
 
     /**
-     * 首次成功交互后尝试生成标题并落盘，成功时返回待发送的 TitleUpdated 事件，否则返回
-     * {@code null}。路径上已有 Title Entry 时直接返回 null；模型调用独立于 ReactAgent
-     * Checkpoint，失败保留默认标题且不回滚已成功的 Assistant 或 Run。
+     * 首次成功交互后尝试生成标题并落盘。无须生成或生成失败时仍返回当前 Conversation，
+     * 但不携带 TitleUpdated 事件；模型调用独立于 ReactAgent Checkpoint，失败保留默认标题且
+     * 不回滚已成功的 Assistant 或 Run。
      *
      * <p>Title 只推进确认序号与 Conversation 标题，不推进活动叶子，因此模型上下文与
      * Checkpoint 仍停在 Assistant。Title Entry 已写入 JSONL 而数据库未更新时，由下次
      * 打开的恢复流程修复。事件发送由调用方在传输阶段统一执行，本方法不做传输。
      */
-    private RunStreamListener.TitleUpdated maybeGenerateTitle(
+    private TitleOutcome maybeGenerateTitle(
             UUID conversationId, Conversation conversation, Entry assistantEntry, Run running
     ) {
-        Entry titleEntry = null;
-        String normalized = null;
         try {
-            List<Entry> path = historyRepository.read(conversationId).activePath(conversation.activeLeafEntryId());
-            if (path.stream().anyMatch(e -> e.type() == EntryType.TITLE)) {
-                return null;
+            ConversationHistory history = historyRepository.read(conversationId);
+            if (history.entries().stream().anyMatch(e -> e.type() == EntryType.TITLE)) {
+                return new TitleOutcome(conversation, null);
             }
+            List<Entry> path = history.activePath(conversation.activeLeafEntryId());
             Entry firstUser = null;
             Entry firstAssistant = null;
             for (Entry entry : path) {
@@ -629,23 +637,24 @@ class ConversationRunCoordinator {
                 }
             }
             if (firstUser == null || firstAssistant == null) {
-                return null;
+                return new TitleOutcome(conversation, null);
             }
             AgentTitleResult result = titleService.generateTitle(new AgentTitleRequest(List.of(
                     new AgentMessage(AgentMessage.Role.USER, TitleTemplate.render(
                             ((UserMessagePayload) firstUser.payload()).text(),
                             ((AssistantMessagePayload) firstAssistant.payload()).text())))));
             if (result.title() == null || result.title().isBlank()) {
-                return null;
+                return new TitleOutcome(conversation, null);
             }
-            normalized = ConversationTitle.normalize(result.title());
+            String normalized = ConversationTitle.normalize(result.title());
             if (normalized.isBlank()) {
-                return null;
+                return new TitleOutcome(conversation, null);
             }
             long seq = conversation.lastConfirmedSeq() + 1;
-            titleEntry = new Entry(
+            Instant titledAt = Instant.now();
+            Entry titleEntry = new Entry(
                     ConversationHistory.FORMAT_VERSION, conversationId, UUID.randomUUID(), seq,
-                    assistantEntry.id(), EntryType.TITLE, Instant.now(),
+                    assistantEntry.id(), EntryType.TITLE, titledAt,
                     new TitlePayload(normalized, running.id(), assistantEntry.id(),
                             result.provider(), result.model()));
             historyRepository.append(conversationId, titleEntry);
@@ -654,14 +663,15 @@ class ConversationRunCoordinator {
                     conversation.id(), conversation.workspaceId(), normalized,
                     conversation.historyFormatVersion(), conversation.activeLeafEntryId(), seq,
                     conversation.latestCompactionEntryId(), conversation.latestCompactionSeq(),
-                    conversation.latestCompactionByteOffset(), conversation.createdAt(), Instant.now());
+                    conversation.latestCompactionByteOffset(), conversation.createdAt(), titledAt);
             transactionTemplate.executeWithoutResult(status -> metadataRepository.update(withTitle));
+            return new TitleOutcome(withTitle, new RunStreamListener.TitleUpdated(
+                    conversationId, titleEntry, normalized, withTitle));
         } catch (RuntimeException ex) {
             // 标题失败或标题落盘异常不回滚已成功的 Assistant 或 Run：保留默认标题，
             // 下一次成功 Run 再尝试；Title Entry 已写而数据库未更新时由恢复流程修复
-            return null;
+            return new TitleOutcome(conversation, null);
         }
-        return titleEntry == null ? null : new RunStreamListener.TitleUpdated(conversationId, titleEntry, normalized);
     }
 
     /**
@@ -812,6 +822,24 @@ class ConversationRunCoordinator {
         }).map(CitationPayload.class::cast).toList();
     }
 
+    /** Agent 的展示 Trace 只在该边界映射为 Conversation payload；上下文投影不读取该字段。 */
+    private static List<RunTraceItemPayload> mapTrace(List<AgentRunTraceItem> trace) {
+        if (trace == null || trace.isEmpty()) {
+            return List.of();
+        }
+        return trace.stream().map(item -> switch (item.kind()) {
+            case REASONING -> RunTraceItemPayload.reasoning(item.text(), item.truncated());
+            case TOOL -> RunTraceItemPayload.tool(
+                    item.toolCallId(), item.toolName(),
+                    switch (item.toolStatus()) {
+                        case RUNNING -> RunTraceItemPayload.ToolStatus.RUNNING;
+                        case COMPLETED -> RunTraceItemPayload.ToolStatus.COMPLETED;
+                        case FAILED -> RunTraceItemPayload.ToolStatus.FAILED;
+                    },
+                    item.safeSummary(), item.stableErrorCode(), item.truncated());
+        }).toList();
+    }
+
     private static Entry findEntry(ConversationHistory history, UUID entryId) {
         for (Entry entry : history.entries()) {
             if (entry.id().equals(entryId)) {
@@ -837,5 +865,9 @@ class ConversationRunCoordinator {
      * 成功落盘必须以它为叶子权威，而不是 {@link #execute} 入口时的快照。
      */
     private record MainOutcome(AgentResult result, Conversation conversation) {
+    }
+
+    /** 标题尝试后的最新终态快照；事件为空表示沿用默认或既有标题。 */
+    private record TitleOutcome(Conversation conversation, RunStreamListener.TitleUpdated event) {
     }
 }

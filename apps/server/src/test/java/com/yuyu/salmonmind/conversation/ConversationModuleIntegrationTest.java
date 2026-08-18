@@ -27,6 +27,7 @@ import com.yuyu.salmonmind.agent.api.AgentLocalCitation;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
 import com.yuyu.salmonmind.agent.api.AgentRequest;
 import com.yuyu.salmonmind.agent.api.AgentResult;
+import com.yuyu.salmonmind.agent.api.AgentRunTraceItem;
 import com.yuyu.salmonmind.agent.api.AgentStreamListener;
 import com.yuyu.salmonmind.agent.api.AgentStreamSession;
 import com.yuyu.salmonmind.agent.api.AgentSummaryRequest;
@@ -37,6 +38,9 @@ import com.yuyu.salmonmind.agent.api.AgentTitleResult;
 import com.yuyu.salmonmind.agent.api.AgentTitleService;
 import com.yuyu.salmonmind.agent.api.AgentUsage;
 import com.yuyu.salmonmind.agent.api.AgentWebCitation;
+import com.yuyu.salmonmind.agent.api.AgentToolCompleted;
+import com.yuyu.salmonmind.agent.api.AgentToolFailed;
+import com.yuyu.salmonmind.agent.api.AgentToolStarted;
 import com.yuyu.salmonmind.conversation.api.ConversationService;
 import com.yuyu.salmonmind.conversation.api.RunStreamListener;
 import com.yuyu.salmonmind.conversation.api.RunStreamListener.RunStarted;
@@ -195,6 +199,15 @@ class ConversationModuleIntegrationTest {
         Map<String, Object> titleEntry = (Map<String, Object>) titleData.get("titleEntry");
         assertThat(titleEntry.get("type")).isEqualTo("TITLE");
         assertThat(titleEntry.get("parentId")).isEqualTo(assistantEntry.get("id"));
+        Map<String, Object> titleConversation = (Map<String, Object>) titleData.get("conversation");
+        Map<String, Object> terminalConversation = (Map<String, Object>) events.stream()
+                .filter(e -> e.event.equals("run_completed")).findFirst().orElseThrow()
+                .data.get("conversation");
+        assertThat(titleConversation.get("title")).isEqualTo("模型生成的标题");
+        assertThat(terminalConversation.get("title")).isEqualTo(titleConversation.get("title"));
+        assertThat(terminalConversation.get("lastConfirmedSeq"))
+                .isEqualTo(titleConversation.get("lastConfirmedSeq"))
+                .isEqualTo(titleEntry.get("seq"));
 
         Map<String, Object> detail = open(conv.toString());
         assertThat((List<?>) detail.get("activePath")).hasSize(2);
@@ -204,6 +217,51 @@ class ConversationModuleIntegrationTest {
         List<Map<String, Object>> list = parseList(listJson);
         assertThat(list.stream().filter(m -> m.get("id").toString().equals(conv.toString())).findFirst().orElseThrow())
                 .containsEntry("title", "模型生成的标题");
+    }
+
+    @Test
+    void streamsAndPersistsReasoningToolTraceWithoutProjectingItBackToModel() throws Exception {
+        UUID conv = createId();
+        AGENT.completeWithTrace(List.of(
+                AgentRunTraceItem.reasoning("先确定检索范围。", false),
+                AgentRunTraceItem.tool(
+                        "call-1", "search_local_knowledge", AgentRunTraceItem.ToolStatus.COMPLETED,
+                        "命中 2 条资料", null, false),
+                AgentRunTraceItem.reasoning("资料足够，组织回答。", false)));
+
+        List<SseEvent> events = postSse(
+                "/api/conversations/" + conv + "/messages", Map.of("text", "请查资料"));
+
+        assertThat(events).extracting(SseEvent::event).containsExactly(
+                "run_started", "reasoning_delta", "tool_started", "tool_completed",
+                "reasoning_delta", "assistant_delta", "assistant_delta",
+                "assistant_completed", "title_updated", "run_completed");
+        assertThat(events.stream().filter(e -> e.event.equals("reasoning_delta"))
+                .map(e -> e.data.get("delta")))
+                .containsExactly("先确定检索范围。", "资料足够，组织回答。");
+        assertThat(events.stream().filter(e -> e.event.equals("assistant_delta"))
+                .map(e -> e.data.get("delta")))
+                .containsExactly("测试", "回答");
+
+        Map<String, Object> completed = events.stream()
+                .filter(e -> e.event.equals("assistant_completed")).findFirst().orElseThrow().data;
+        Map<String, Object> assistant = entryOf(completed.get("assistantEntry"));
+        List<?> persistedTrace = (List<?>) payloadOf(assistant).get("trace");
+        assertThat(persistedTrace).hasSize(3);
+        assertThat(entryOf(persistedTrace.get(0))).containsEntry("kind", "REASONING")
+                .containsEntry("text", "先确定检索范围。");
+        assertThat(entryOf(persistedTrace.get(1))).containsEntry("kind", "TOOL")
+                .containsEntry("toolCallId", "call-1")
+                .containsEntry("toolStatus", "COMPLETED");
+
+        // 下一轮只看 durable 回答和 Citation 投影，展示 Trace 不回灌标题、摘要或主模型。
+        AGENT.completeWithTrace(List.of());
+        postSse("/api/conversations/" + conv + "/messages", Map.of("text", "继续"));
+        assertThat(messagesOf(agentRequest(1)).get(1).text())
+                .isEqualTo("测试回答")
+                .doesNotContain("先确定检索范围", "命中 2 条资料");
+        assertThat(Files.readAllLines(fileOf(conv)).stream()
+                .filter(line -> line.contains("\"type\":\"title\"")).count()).isEqualTo(1);
     }
 
     @Test
@@ -907,6 +965,7 @@ class ConversationModuleIntegrationTest {
         /** 主调用固定用量：totalTokens 作为压缩检测的 usage 锚点。 */
         private volatile AgentUsage usage = new AgentUsage(1000L, 200L, 1200L);
         private volatile List<AgentCitation> citations = List.of();
+        private volatile List<AgentRunTraceItem> trace = List.of();
 
         @Override
         public void stream(AgentRequest request, AgentStreamListener listener) {
@@ -944,9 +1003,27 @@ class ConversationModuleIntegrationTest {
                         AgentErrorCode.CHAT_MODEL_FAILED, "压缩后主调用失败"));
                 return;
             }
+            for (AgentRunTraceItem item : trace) {
+                if (item.kind() == AgentRunTraceItem.Kind.REASONING) {
+                    listener.onReasoningDelta(item.text());
+                    continue;
+                }
+                listener.onToolStarted(new AgentToolStarted(
+                        item.toolCallId(), item.toolName(), item.safeSummary()));
+                if (item.toolStatus() == AgentRunTraceItem.ToolStatus.FAILED) {
+                    listener.onToolFailed(new AgentToolFailed(
+                            item.toolCallId(), item.toolName(), 1,
+                            item.stableErrorCode(), item.safeSummary()));
+                } else {
+                    listener.onToolCompleted(new AgentToolCompleted(
+                            item.toolCallId(), item.toolName(), 1,
+                            "TEST", 2, item.truncated(), false));
+                }
+            }
             listener.onDelta("测试");
             listener.onDelta("回答");
-            listener.onComplete(new AgentResult("测试回答", "test-provider", "test-model", usage, citations));
+            listener.onComplete(new AgentResult(
+                    "测试回答", "test-provider", "test-model", usage, citations, trace));
         }
 
         @Override
@@ -1009,6 +1086,10 @@ class ConversationModuleIntegrationTest {
             citations = nextCitations == null ? List.of() : List.copyOf(nextCitations);
         }
 
+        void completeWithTrace(List<AgentRunTraceItem> nextTrace) {
+            trace = nextTrace == null ? List.of() : List.copyOf(nextTrace);
+        }
+
         void reset() {
             requests.clear();
             summaryRequests.clear();
@@ -1021,6 +1102,7 @@ class ConversationModuleIntegrationTest {
             failAfterDelta = false;
             usage = new AgentUsage(1000L, 200L, 1200L);
             citations = List.of();
+            trace = List.of();
         }
     }
 }

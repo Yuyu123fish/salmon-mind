@@ -20,7 +20,9 @@
 html,
 body,
 #root {
-  min-height: 100%;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
 }
 
 body {
@@ -39,9 +41,12 @@ button {
 }
 
 .shell {
-  min-height: 100svh;
+  width: 100%;
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
   display: grid;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .topbar {
@@ -52,8 +57,7 @@ button {
   padding: 16px 28px;
   border-bottom: 1px solid var(--line);
   background: rgba(238, 243, 241, 0.9);
-  position: sticky;
-  top: 0;
+  position: relative;
   z-index: 10;
 }
 
@@ -132,12 +136,17 @@ button {
 
 .workspace {
   display: grid;
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: 280px minmax(0, 1fr);
+  min-width: 0;
   min-height: 0;
+  overflow: hidden;
+  position: relative;
 }
 
 .workspace[data-view='knowledge'] {
   display: block;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .sidebar {
@@ -147,7 +156,8 @@ button {
   padding: 16px 14px;
   border-right: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.35);
-  overflow-y: auto;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .new-chat {
@@ -166,6 +176,9 @@ button {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .conv-item {
@@ -222,7 +235,9 @@ button {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  height: calc(100svh - 57px);
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
 }
 
 .conversation {
@@ -230,6 +245,9 @@ button {
   flex-direction: column;
   flex: 1;
   min-height: 0;
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
 }
 
 .chat-head {
@@ -301,7 +319,11 @@ button {
 
 .messages {
   flex: 1;
+  min-height: 0;
+  min-width: 0;
   overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
   padding: 22px 28px;
   display: flex;
   flex-direction: column;
@@ -324,6 +346,8 @@ button {
 
 .bubble {
   max-width: min(720px, 86%);
+  min-width: 0;
+  overflow: hidden;
   padding: 10px 14px;
   border-radius: 12px;
   font-size: 0.96rem;
@@ -443,6 +467,190 @@ button {
   overflow-x: auto;
   font-family: var(--font-mono);
   font-size: 0.88rem;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4 {
+  margin: 0.9em 0 0.4em;
+  line-height: 1.28;
+}
+
+.markdown h1 { font-size: 1.45em; }
+.markdown h2 { font-size: 1.28em; }
+.markdown h3 { font-size: 1.13em; }
+
+.markdown hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 1em 0;
+}
+
+.markdown table {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.markdown th,
+.markdown td {
+  border: 1px solid var(--line);
+  padding: 6px 9px;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.markdown th {
+  background: #f3f6f4;
+}
+
+.markdown input[type='checkbox'] {
+  margin: 0 0.4em 0 0;
+}
+
+.markdown .contains-task-list,
+.markdown .task-list-item {
+  list-style: none;
+}
+
+.unsafe-link {
+  text-decoration: line-through;
+}
+
+.code-block {
+  max-width: 100%;
+  margin: 0.7em 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f3f6f4;
+}
+
+.code-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 9px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+}
+
+.code-toolbar button {
+  border: 0;
+  padding: 2px 7px;
+  border-radius: 4px;
+  color: var(--river);
+  background: rgba(47, 79, 72, 0.08);
+}
+
+.markdown .code-block pre {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+}
+
+.run-trace {
+  margin-bottom: 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  overflow: hidden;
+  background: rgba(47, 79, 72, 0.035);
+}
+
+.trace-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border: 0;
+  padding: 7px 10px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 0.78rem;
+  text-align: left;
+}
+
+.run-trace[data-running='true'] .trace-toggle {
+  color: var(--river);
+}
+
+.trace-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  max-height: 340px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  border-top: 1px solid var(--line);
+  list-style: none;
+}
+
+.trace-list li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(197, 210, 205, 0.65);
+}
+
+.trace-list li:last-child { border-bottom: 0; }
+
+.trace-kind {
+  align-self: start;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 6px;
+  color: var(--muted);
+  font-size: 0.66rem;
+}
+
+.trace-list p {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.trace-list strong {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 0.8rem;
+}
+
+.trace-list small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.trace-tool[data-status='FAILED'] strong,
+.trace-tool[data-status='FAILED'] small {
+  color: var(--bad);
+}
+
+.new-content-button {
+  position: absolute;
+  right: 28px;
+  bottom: 126px;
+  z-index: 3;
+  border: 1px solid var(--river);
+  border-radius: 999px;
+  padding: 7px 12px;
+  color: #f4f8f6;
+  background: var(--river);
+  box-shadow: 0 3px 12px rgba(28, 42, 40, 0.18);
+  font-size: 0.78rem;
 }
 
 .markdown code {
@@ -589,7 +797,8 @@ button {
 
 /* Knowledge：像一张安静的资料工作台，状态是主角，装饰只留一条 salmon 轨迹。 */
 .knowledge-main {
-  height: calc(100svh - 57px);
+  height: 100%;
+  min-height: 0;
   overflow-y: auto;
 }
 
@@ -1270,11 +1479,12 @@ button:focus-visible {
 
   .workspace {
     display: block;
+    min-height: 0;
   }
 
   .sidebar {
-    position: fixed;
-    inset: 56px auto 0 0;
+    position: absolute;
+    inset: 0 auto 0 0;
     width: min(300px, 84vw);
     bottom: 0;
     z-index: 9;
@@ -1289,11 +1499,15 @@ button:focus-visible {
   }
 
   .chat {
-    height: calc(100svh - 56px);
+    height: 100%;
   }
 
   .messages {
     padding: 16px;
+  }
+
+  .new-content-button {
+    right: 16px;
   }
 
   .chat-head,
@@ -1323,7 +1537,7 @@ button:focus-visible {
   }
 
   .knowledge-main {
-    height: calc(100svh - 103px);
+    height: 100%;
   }
 
   .knowledge-view {

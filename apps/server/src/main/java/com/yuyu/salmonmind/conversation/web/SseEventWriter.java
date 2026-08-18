@@ -44,6 +44,11 @@ class SseEventWriter implements RunStreamListener {
     }
 
     @Override
+    public void onReasoningDelta(ReasoningDelta event) {
+        write("reasoning_delta", event);
+    }
+
+    @Override
     public void onToolStarted(ToolStarted event) {
         write("tool_started", event);
     }

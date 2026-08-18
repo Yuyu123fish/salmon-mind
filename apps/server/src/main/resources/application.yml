@@ -70,6 +70,11 @@ salmon:
     max-tool-calls-per-run: ${AGENT_MAX_TOOL_CALLS_PER_RUN:4}
     # 一次主调用内所有工具消息的总 token 预算；工具结果在返回模型前按完整 item/文本边界裁剪。
     max-tool-result-tokens-per-run: ${AGENT_MAX_TOOL_RESULT_TOKENS_PER_RUN:32768}
+    trace:
+      # 展示/持久化硬上限，不是模型 Token Budget；部署只能下调，代码不会允许突破固定边界。
+      max-items: ${AGENT_TRACE_MAX_ITEMS:64}
+      max-reasoning-chars: ${AGENT_TRACE_MAX_REASONING_CHARS:32768}
+      max-tool-summary-chars: ${AGENT_TRACE_MAX_TOOL_SUMMARY_CHARS:512}
   websearch:
     connect-timeout: ${WEB_SEARCH_CONNECT_TIMEOUT:5s}
     read-timeout: ${WEB_SEARCH_READ_TIMEOUT:15s}

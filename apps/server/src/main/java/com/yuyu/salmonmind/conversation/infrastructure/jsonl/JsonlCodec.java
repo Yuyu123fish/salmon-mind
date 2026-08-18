@@ -13,6 +13,7 @@ import com.yuyu.salmonmind.conversation.api.CompactionPayload;
 import com.yuyu.salmonmind.conversation.api.Entry;
 import com.yuyu.salmonmind.conversation.api.EntryPayload;
 import com.yuyu.salmonmind.conversation.api.LocalCitationPayload;
+import com.yuyu.salmonmind.conversation.api.RunTraceItemPayload;
 import com.yuyu.salmonmind.conversation.api.WebCitationPayload;
 import com.yuyu.salmonmind.conversation.api.TokenUsage;
 import com.yuyu.salmonmind.conversation.api.TitlePayload;
@@ -112,6 +113,12 @@ class JsonlCodec {
                         citations.add(encodeCitation(citation));
                     }
                 }
+                if (!p.trace().isEmpty()) {
+                    ArrayNode trace = node.putArray("trace");
+                    for (RunTraceItemPayload item : p.trace()) {
+                        trace.add(encodeTraceItem(item));
+                    }
+                }
                 yield node;
             }
             case CompactionPayload p -> {
@@ -182,9 +189,10 @@ class JsonlCodec {
             case ASSISTANT_MESSAGE -> {
                 TokenUsage usage = node.hasNonNull("usage") ? decodeUsage(node.get("usage")) : null;
                 List<CitationPayload> citations = decodeCitations(node.get("citations"));
+                List<RunTraceItemPayload> trace = decodeTrace(node.get("trace"));
                 yield new AssistantMessagePayload(
                         text(node, "text"), uuid(node, "runId"), text(node, "provider"), text(node, "model"),
-                        usage, citations);
+                        usage, citations, trace);
             }
             case COMPACTION -> {
                 TokenUsage usage = node.hasNonNull("usage") ? decodeUsage(node.get("usage")) : null;
@@ -245,6 +253,28 @@ class JsonlCodec {
         return node;
     }
 
+    private ObjectNode encodeTraceItem(RunTraceItemPayload item) {
+        ObjectNode node = mapper.createObjectNode();
+        node.put("kind", item.kind() == RunTraceItemPayload.Kind.REASONING ? "reasoning" : "tool");
+        node.put("truncated", item.truncated());
+        if (item.kind() == RunTraceItemPayload.Kind.REASONING) {
+            node.put("text", item.text());
+            return node;
+        }
+        node.put("toolCallId", item.toolCallId());
+        node.put("toolName", item.toolName());
+        node.put("status", switch (item.toolStatus()) {
+            case RUNNING -> "running";
+            case COMPLETED -> "completed";
+            case FAILED -> "failed";
+        });
+        node.put("safeSummary", item.safeSummary());
+        if (item.stableErrorCode() != null) {
+            node.put("stableErrorCode", item.stableErrorCode());
+        }
+        return node;
+    }
+
     private List<CitationPayload> decodeCitations(JsonNode node) {
         if (node == null || node.isNull()) {
             return List.of();
@@ -268,6 +298,37 @@ class JsonlCodec {
             }
         }
         return List.copyOf(citations);
+    }
+
+    private List<RunTraceItemPayload> decodeTrace(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return List.of();
+        }
+        if (!node.isArray()) {
+            throw corrupted("assistant trace 不是数组");
+        }
+        List<RunTraceItemPayload> trace = new ArrayList<>();
+        for (JsonNode item : node) {
+            boolean truncated = optionalBoolean(item, "truncated", false);
+            switch (text(item, "kind")) {
+                case "reasoning" -> trace.add(RunTraceItemPayload.reasoning(
+                        text(item, "text"), truncated));
+                case "tool" -> trace.add(RunTraceItemPayload.tool(
+                        text(item, "toolCallId"),
+                        text(item, "toolName"),
+                        switch (text(item, "status")) {
+                            case "running" -> RunTraceItemPayload.ToolStatus.RUNNING;
+                            case "completed" -> RunTraceItemPayload.ToolStatus.COMPLETED;
+                            case "failed" -> RunTraceItemPayload.ToolStatus.FAILED;
+                            default -> throw corrupted("未知 Tool Trace status");
+                        },
+                        text(item, "safeSummary"),
+                        optionalText(item, "stableErrorCode"),
+                        truncated));
+                default -> throw corrupted("未知 Trace kind");
+            }
+        }
+        return List.copyOf(trace);
     }
 
     // 解析整行：JSON 语法截断（EOF 未闭合）抛 TornTailException，其余解析错误视为损坏
@@ -331,6 +392,17 @@ class JsonlCodec {
             throw corrupted("字段不是文本: " + field);
         }
         return value.asText();
+    }
+
+    private static boolean optionalBoolean(JsonNode node, String field, boolean defaultValue) {
+        JsonNode value = node.get(field);
+        if (value == null || value.isNull()) {
+            return defaultValue;
+        }
+        if (!value.isBoolean()) {
+            throw corrupted("字段不是布尔值: " + field);
+        }
+        return value.asBoolean();
     }
 
     private static UUID uuid(JsonNode node, String field) {

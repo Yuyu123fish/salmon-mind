@@ -7,8 +7,7 @@ import java.util.UUID;
  * 标准 SSE 帧；application 只按下列顺序回调，不直接接触 HTTP 或序列化。
  *
  * <p>顺序合同：恰好一次 {@link #onRunStarted}；随后零或一次
- * {@link #onCompactionCompleted}，以及零到多次工具状态事件和
- * {@link #onAssistantDelta}；
+ * {@link #onCompactionCompleted}，以及零到多次 reasoning、工具状态和回答事件；
  * 成功时恰好一次 {@link #onAssistantCompleted}；零或一次 {@link #onTitleUpdated}；
  * 最后以 {@link #onRunCompleted} 或 {@link #onRunFailed} 恰好一次结束，
  * 终态事件之后不得再有业务事件。
@@ -32,30 +31,37 @@ public interface RunStreamListener {
     record AssistantDelta(UUID runId, String delta) {
     }
 
+    /** reasoning_delta：模型公开提供的可展示推理增量，不属于最终回答正文。 */
+    record ReasoningDelta(UUID runId, String delta) {
+    }
+
     /** 工具开始事件；不携带 query、正文或原始参数。 */
-    record ToolStarted(UUID runId, String toolCallId, String toolName) {
+    record ToolStarted(UUID runId, String toolCallId, String toolName, String safeSummary) {
     }
 
     /** 工具成功结束事件；来源状态只保留 Provider、数量和边界标记。 */
     record ToolCompleted(
             UUID runId, String toolCallId, String toolName, long durationMillis,
-            String provider, int sourceCount, boolean truncated, boolean degraded
+            String provider, int sourceCount, boolean truncated, boolean degraded, String safeSummary
     ) {
         public ToolCompleted(UUID runId, String toolCallId, String toolName, long durationMillis) {
-            this(runId, toolCallId, toolName, durationMillis, null, 0, false, false);
+            this(runId, toolCallId, toolName, durationMillis, null, 0, false, false, "工具执行完成");
         }
     }
 
     /** 工具失败事件；错误码稳定且不携带内部堆栈或工具结果。 */
-    record ToolFailed(UUID runId, String toolCallId, String toolName, long durationMillis, String stableErrorCode) {
+    record ToolFailed(
+            UUID runId, String toolCallId, String toolName, long durationMillis,
+            String stableErrorCode, String safeMessage
+    ) {
     }
 
     /** assistant_completed：完整且已持久化的 Assistant Entry。 */
     record AssistantCompleted(UUID conversationId, Entry assistantEntry) {
     }
 
-    /** title_updated：Title Entry 已追加，Conversation 标题已更新。 */
-    record TitleUpdated(UUID conversationId, Entry titleEntry, String title) {
+    /** title_updated：Title Entry 已追加，并携带包含该确认序号的最新 Conversation 快照。 */
+    record TitleUpdated(UUID conversationId, Entry titleEntry, String title, Conversation conversation) {
     }
 
     /** run_completed：唯一成功终态。 */
@@ -71,6 +77,9 @@ public interface RunStreamListener {
     void onCompactionCompleted(CompactionCompleted event);
 
     void onAssistantDelta(AssistantDelta event);
+
+    default void onReasoningDelta(ReasoningDelta event) {
+    }
 
     default void onToolStarted(ToolStarted event) {
     }

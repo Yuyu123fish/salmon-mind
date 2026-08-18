@@ -66,6 +66,24 @@ export type WebCitation = {
 
 export type CitationPayload = LocalCitation | WebCitation
 
+export type ReasoningTraceItem = {
+  kind: 'REASONING'
+  text: string
+  truncated: boolean
+}
+
+export type ToolTraceItem = {
+  kind: 'TOOL'
+  truncated: boolean
+  toolCallId: string
+  toolName: string
+  toolStatus: 'RUNNING' | 'COMPLETED' | 'FAILED'
+  safeSummary: string
+  stableErrorCode: string | null
+}
+
+export type RunTraceItem = ReasoningTraceItem | ToolTraceItem
+
 // 类型化 payload：后端按实际类型序列化字段，前端依据 entry.type 读取对应字段
 export type EntryPayload = {
   text?: string
@@ -74,6 +92,7 @@ export type EntryPayload = {
   model?: string
   usage?: TokenUsage | null
   citations?: CitationPayload[]
+  trace?: RunTraceItem[]
   // TITLE
   title?: string
   sourceRunId?: string
@@ -121,10 +140,16 @@ export type AssistantDeltaEvent = {
   delta: string
 }
 
+export type ReasoningDeltaEvent = {
+  runId: string
+  delta: string
+}
+
 export type ToolStartedEvent = {
   runId: string
   toolCallId: string
   toolName: string
+  safeSummary: string
 }
 
 export type ToolCompletedEvent = {
@@ -136,6 +161,7 @@ export type ToolCompletedEvent = {
   sourceCount: number
   truncated: boolean
   degraded: boolean
+  safeSummary: string
 }
 
 export type ToolFailedEvent = {
@@ -144,6 +170,7 @@ export type ToolFailedEvent = {
   toolName: string
   durationMillis: number
   stableErrorCode: string
+  safeMessage: string
 }
 
 export type AssistantCompletedEvent = {
@@ -155,6 +182,7 @@ export type TitleUpdatedEvent = {
   conversationId: string
   titleEntry: Entry
   title: string
+  conversation: Conversation
 }
 
 export type RunCompletedEvent = {
@@ -173,7 +201,7 @@ export type RunFailedEvent = {
 
 /**
  * 一次发送 / 重试的 SSE 事件消费合同；与后端 RunStreamListener 顺序一致：
- * run_started → 可选 compaction_completed → 零到多条 assistant_delta →
+ * run_started → 可选 compaction_completed → 可交错的 reasoning/tool/assistant delta →
  * 成功时 assistant_completed → 可选 title_updated → 唯一 run_completed / run_failed。
  * 终态事件之后不再有业务事件；run_started 之前的前置错误以 ApiError 抛出（JSON 错误体）。
  */
@@ -183,6 +211,7 @@ export type RunStreamListener = {
   onToolStarted(event: ToolStartedEvent): void
   onToolCompleted(event: ToolCompletedEvent): void
   onToolFailed(event: ToolFailedEvent): void
+  onReasoningDelta(event: ReasoningDeltaEvent): void
   onAssistantDelta(event: AssistantDeltaEvent): void
   onAssistantCompleted(event: AssistantCompletedEvent): void
   onTitleUpdated(event: TitleUpdatedEvent): void
@@ -264,8 +293,9 @@ async function streamRun(
   let eventName = ''
   const dataLines: string[] = []
   let terminalReceived = false
+  const dispatchRunFrame = createRunEventDispatcher(listener)
 
-  // 分发一个完整 SSE 帧（空行结束）：解析 JSON 后回调对应事件；未知事件视为协议错误
+  // 分发一个完整 SSE 帧：已知事件缺字段仍报协议错误，未来可选中间事件直接忽略。
   const dispatch = () => {
     if (eventName === '' || dataLines.length === 0) {
       return
@@ -277,42 +307,8 @@ async function streamRun(
     } catch {
       throw new ApiError('BAD_SSE_FRAME', '服务端返回了无法解析的流事件', 0)
     }
-    switch (eventName) {
-      case 'run_started':
-        listener.onRunStarted(parsed as RunStartedEvent)
-        break
-      case 'compaction_completed':
-        listener.onCompactionCompleted(parsed as CompactionCompletedEvent)
-        break
-      case 'tool_started':
-        listener.onToolStarted(parsed as ToolStartedEvent)
-        break
-      case 'tool_completed':
-        listener.onToolCompleted(parsed as ToolCompletedEvent)
-        break
-      case 'tool_failed':
-        listener.onToolFailed(parsed as ToolFailedEvent)
-        break
-      case 'assistant_delta':
-        listener.onAssistantDelta(parsed as AssistantDeltaEvent)
-        break
-      case 'assistant_completed':
-        listener.onAssistantCompleted(parsed as AssistantCompletedEvent)
-        break
-      case 'title_updated':
-        listener.onTitleUpdated(parsed as TitleUpdatedEvent)
-        break
-      case 'run_completed':
-        listener.onRunCompleted(parsed as RunCompletedEvent)
-        terminalReceived = true
-        break
-      case 'run_failed':
-        listener.onRunFailed(parsed as RunFailedEvent)
-        terminalReceived = true
-        break
-      default:
-        throw new ApiError('BAD_SSE_FRAME', `未知流事件：${eventName}`, 0)
-    }
+    const result = dispatchRunFrame(eventName, parsed)
+    if (result === 'terminal') terminalReceived = true
     eventName = ''
     dataLines.length = 0
   }
@@ -353,6 +349,426 @@ async function streamRun(
     }
   } finally {
     reader.releaseLock()
+  }
+}
+
+type DispatchResult = 'intermediate' | 'terminal' | 'ignored'
+
+const KNOWN_RUN_EVENTS = [
+  'run_started',
+  'compaction_completed',
+  'reasoning_delta',
+  'tool_started',
+  'tool_completed',
+  'tool_failed',
+  'assistant_delta',
+  'assistant_completed',
+  'title_updated',
+  'run_completed',
+  'run_failed',
+] as const
+
+type KnownRunEventName = (typeof KNOWN_RUN_EVENTS)[number]
+
+type RunEventSequence = {
+  conversationId: string | null
+  runId: string | null
+  assistantCompleted: boolean
+  titleUpdated: boolean
+  terminal: boolean
+}
+
+/** 为单条 SSE 连接建立严格的单 Run、单终态分发器。 */
+export function createRunEventDispatcher(listener: RunStreamListener) {
+  const sequence: RunEventSequence = {
+    conversationId: null,
+    runId: null,
+    assistantCompleted: false,
+    titleUpdated: false,
+    terminal: false,
+  }
+  return (eventName: string, parsed: unknown): DispatchResult =>
+    dispatchRunEvent(eventName, parsed, listener, sequence)
+}
+
+/**
+ * 类型化分发一个已解析事件。未知事件按向前兼容的可选中间事件忽略；
+ * 已知事件的稳定身份/终态字段缺失时仍拒绝，避免静默破坏 Run 隔离。
+ */
+export function dispatchRunEvent(
+  eventName: string,
+  parsed: unknown,
+  listener: RunStreamListener,
+  sequence?: RunEventSequence,
+): DispatchResult {
+  if (!isKnownRunEvent(eventName)) return 'ignored'
+  const value = objectValue(parsed)
+  validateKnownRunEvent(eventName, value)
+  if (sequence !== undefined) validateRunEventSequence(eventName, value, sequence)
+
+  switch (eventName) {
+    case 'run_started':
+      listener.onRunStarted(parsed as RunStartedEvent)
+      break
+    case 'compaction_completed':
+      listener.onCompactionCompleted(parsed as CompactionCompletedEvent)
+      break
+    case 'reasoning_delta':
+      listener.onReasoningDelta(parsed as ReasoningDeltaEvent)
+      break
+    case 'tool_started':
+      listener.onToolStarted(parsed as ToolStartedEvent)
+      break
+    case 'tool_completed':
+      listener.onToolCompleted(parsed as ToolCompletedEvent)
+      break
+    case 'tool_failed':
+      listener.onToolFailed(parsed as ToolFailedEvent)
+      break
+    case 'assistant_delta':
+      listener.onAssistantDelta(parsed as AssistantDeltaEvent)
+      break
+    case 'assistant_completed':
+      listener.onAssistantCompleted(parsed as AssistantCompletedEvent)
+      break
+    case 'title_updated':
+      listener.onTitleUpdated(parsed as TitleUpdatedEvent)
+      break
+    case 'run_completed':
+      listener.onRunCompleted(parsed as RunCompletedEvent)
+      break
+    case 'run_failed':
+      listener.onRunFailed(parsed as RunFailedEvent)
+      break
+  }
+
+  if (sequence !== undefined) advanceRunEventSequence(eventName, value, sequence)
+  return eventName === 'run_completed' || eventName === 'run_failed' ? 'terminal' : 'intermediate'
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ApiError('BAD_SSE_FRAME', '服务端流事件缺少对象数据', 0)
+  }
+  return value as Record<string, unknown>
+}
+
+function isKnownRunEvent(eventName: string): eventName is KnownRunEventName {
+  return (KNOWN_RUN_EVENTS as readonly string[]).includes(eventName)
+}
+
+function validateKnownRunEvent(
+  eventName: KnownRunEventName,
+  value: Record<string, unknown>,
+): void {
+  switch (eventName) {
+    case 'run_started':
+      requireString(value, 'conversationId')
+      requireRun(value, 'run')
+      requireEntry(value, 'userEntry', 'USER_MESSAGE')
+      requireBoolean(value, 'isRetry')
+      return
+    case 'compaction_completed':
+      requireString(value, 'conversationId')
+      requireEntry(value, 'compactionEntry', 'COMPACTION')
+      requireConversation(value, 'conversation')
+      return
+    case 'reasoning_delta':
+    case 'assistant_delta':
+      requireString(value, 'runId')
+      requireString(value, 'delta')
+      return
+    case 'tool_started':
+      requireToolIdentity(value)
+      requireString(value, 'safeSummary')
+      return
+    case 'tool_completed':
+      requireToolIdentity(value)
+      requireNumber(value, 'durationMillis')
+      requireNullableString(value, 'provider')
+      requireNumber(value, 'sourceCount')
+      requireBoolean(value, 'truncated')
+      requireBoolean(value, 'degraded')
+      requireString(value, 'safeSummary')
+      return
+    case 'tool_failed':
+      requireToolIdentity(value)
+      requireNumber(value, 'durationMillis')
+      requireString(value, 'stableErrorCode')
+      requireString(value, 'safeMessage')
+      return
+    case 'assistant_completed':
+      requireString(value, 'conversationId')
+      requireEntry(value, 'assistantEntry', 'ASSISTANT_MESSAGE')
+      return
+    case 'title_updated':
+      requireString(value, 'conversationId')
+      requireEntry(value, 'titleEntry', 'TITLE')
+      requireString(value, 'title')
+      requireConversation(value, 'conversation')
+      return
+    case 'run_completed':
+      requireString(value, 'conversationId')
+      requireRun(value, 'run')
+      requireConversation(value, 'conversation')
+      return
+    case 'run_failed':
+      requireString(value, 'conversationId')
+      requireString(value, 'errorCode')
+      requireString(value, 'message')
+      requireRun(value, 'run')
+      requireConversation(value, 'conversation')
+  }
+}
+
+function validateRunEventSequence(
+  eventName: KnownRunEventName,
+  value: Record<string, unknown>,
+  sequence: RunEventSequence,
+): void {
+  if (sequence.terminal) {
+    throwSequenceError('终态之后又收到业务事件')
+  }
+  if (eventName === 'run_started') {
+    if (sequence.runId !== null) throwSequenceError('同一连接重复收到 run_started')
+    const run = objectValue(value.run)
+    const userEntry = objectValue(value.userEntry)
+    const payload = objectValue(userEntry.payload)
+    if (run.status !== 'RUNNING') throwSequenceError('run_started 未携带 RUNNING Run')
+    if (run.conversationId !== value.conversationId || userEntry.conversationId !== value.conversationId) {
+      throwSequenceError('run_started 的 Conversation 身份不一致')
+    }
+    if (payload.runId !== run.id) throwSequenceError('User Entry 与 Run 身份不一致')
+    return
+  }
+  if (sequence.runId === null || sequence.conversationId === null) {
+    throwSequenceError('run_started 之前收到业务事件')
+  }
+
+  if (typeof value.runId === 'string' && value.runId !== sequence.runId) {
+    throwSequenceError('事件属于其他 Run')
+  }
+  if (typeof value.conversationId === 'string' && value.conversationId !== sequence.conversationId) {
+    throwSequenceError('事件属于其他 Conversation')
+  }
+  if (sequence.titleUpdated && eventName !== 'run_completed') {
+    throwSequenceError('title_updated 之后只允许 run_completed')
+  }
+  if (
+    sequence.assistantCompleted &&
+    eventName !== 'title_updated' &&
+    eventName !== 'run_completed'
+  ) {
+    throwSequenceError('assistant_completed 之后收到非法中间事件')
+  }
+
+  switch (eventName) {
+    case 'compaction_completed': {
+      const conversation = objectValue(value.conversation)
+      if (conversation.id !== sequence.conversationId) {
+        throwSequenceError('Compaction 快照属于其他 Conversation')
+      }
+      return
+    }
+    case 'assistant_completed': {
+      if (sequence.assistantCompleted) throwSequenceError('重复收到 assistant_completed')
+      const entry = objectValue(value.assistantEntry)
+      const payload = objectValue(entry.payload)
+      if (entry.conversationId !== sequence.conversationId || payload.runId !== sequence.runId) {
+        throwSequenceError('Assistant Entry 与当前 Run 身份不一致')
+      }
+      return
+    }
+    case 'title_updated': {
+      if (!sequence.assistantCompleted) throwSequenceError('标题事件早于 Assistant 持久化')
+      if (sequence.titleUpdated) throwSequenceError('重复收到 title_updated')
+      const entry = objectValue(value.titleEntry)
+      const payload = objectValue(entry.payload)
+      const conversation = objectValue(value.conversation)
+      if (
+        entry.conversationId !== sequence.conversationId ||
+        payload.sourceRunId !== sequence.runId ||
+        conversation.id !== sequence.conversationId
+      ) {
+        throwSequenceError('标题事件与当前 Run 身份不一致')
+      }
+      return
+    }
+    case 'run_completed': {
+      if (!sequence.assistantCompleted) throwSequenceError('run_completed 早于 Assistant 持久化')
+      const run = objectValue(value.run)
+      const conversation = objectValue(value.conversation)
+      if (
+        run.id !== sequence.runId ||
+        run.conversationId !== sequence.conversationId ||
+        run.status !== 'SUCCEEDED' ||
+        conversation.id !== sequence.conversationId
+      ) {
+        throwSequenceError('run_completed 未携带当前 SUCCEEDED Run')
+      }
+      return
+    }
+    case 'run_failed': {
+      if (sequence.assistantCompleted) throwSequenceError('已持久化 Assistant 的 Run 不能再失败')
+      const run = objectValue(value.run)
+      const conversation = objectValue(value.conversation)
+      if (
+        run.id !== sequence.runId ||
+        run.conversationId !== sequence.conversationId ||
+        (run.status !== 'FAILED' && run.status !== 'INTERRUPTED') ||
+        conversation.id !== sequence.conversationId
+      ) {
+        throwSequenceError('run_failed 未携带当前失败 Run')
+      }
+      return
+    }
+    default:
+      return
+  }
+}
+
+function advanceRunEventSequence(
+  eventName: KnownRunEventName,
+  value: Record<string, unknown>,
+  sequence: RunEventSequence,
+): void {
+  if (eventName === 'run_started') {
+    const run = objectValue(value.run)
+    sequence.conversationId = value.conversationId as string
+    sequence.runId = run.id as string
+  } else if (eventName === 'assistant_completed') {
+    sequence.assistantCompleted = true
+  } else if (eventName === 'title_updated') {
+    sequence.titleUpdated = true
+  } else if (eventName === 'run_completed' || eventName === 'run_failed') {
+    sequence.terminal = true
+  }
+}
+
+function throwSequenceError(message: string): never {
+  throw new ApiError('BAD_SSE_SEQUENCE', `服务端流事件顺序非法：${message}`, 0)
+}
+
+function requireString(value: Record<string, unknown>, field: string): void {
+  if (typeof value[field] !== 'string') {
+    throw new ApiError('BAD_SSE_FRAME', `服务端流事件缺少字段：${field}`, 0)
+  }
+}
+
+function requireNumber(value: Record<string, unknown>, field: string): void {
+  if (typeof value[field] !== 'number' || !Number.isFinite(value[field])) {
+    throw new ApiError('BAD_SSE_FRAME', `服务端流事件缺少数值字段：${field}`, 0)
+  }
+}
+
+function requireBoolean(value: Record<string, unknown>, field: string): void {
+  if (typeof value[field] !== 'boolean') {
+    throw new ApiError('BAD_SSE_FRAME', `服务端流事件缺少布尔字段：${field}`, 0)
+  }
+}
+
+function requireNullableString(value: Record<string, unknown>, field: string): void {
+  if (value[field] !== null && typeof value[field] !== 'string') {
+    throw new ApiError('BAD_SSE_FRAME', `服务端流事件字段类型错误：${field}`, 0)
+  }
+}
+
+function requireNullableNumber(value: Record<string, unknown>, field: string): void {
+  if (value[field] !== null && (typeof value[field] !== 'number' || !Number.isFinite(value[field]))) {
+    throw new ApiError('BAD_SSE_FRAME', `服务端流事件字段类型错误：${field}`, 0)
+  }
+}
+
+function requireEnum(
+  value: Record<string, unknown>,
+  field: string,
+  allowed: readonly string[],
+): void {
+  if (typeof value[field] !== 'string' || !allowed.includes(value[field])) {
+    throw new ApiError('BAD_SSE_FRAME', `服务端流事件枚举字段非法：${field}`, 0)
+  }
+}
+
+function requireToolIdentity(value: Record<string, unknown>): void {
+  requireString(value, 'runId')
+  requireString(value, 'toolCallId')
+  requireString(value, 'toolName')
+}
+
+function requireRun(value: Record<string, unknown>, field: string): void {
+  const run = objectValue(value[field])
+  requireString(run, 'id')
+  requireString(run, 'conversationId')
+  requireString(run, 'triggerEntryId')
+  requireEnum(run, 'status', ['RUNNING', 'SUCCEEDED', 'FAILED', 'INTERRUPTED'])
+  requireNullableString(run, 'errorCode')
+  requireString(run, 'startedAt')
+  requireNullableString(run, 'endedAt')
+}
+
+function requireConversation(value: Record<string, unknown>, field: string): void {
+  const conversation = objectValue(value[field])
+  requireString(conversation, 'id')
+  requireString(conversation, 'workspaceId')
+  requireString(conversation, 'title')
+  requireNumber(conversation, 'historyFormatVersion')
+  requireNullableString(conversation, 'activeLeafEntryId')
+  requireNumber(conversation, 'lastConfirmedSeq')
+  requireNullableString(conversation, 'latestCompactionEntryId')
+  requireNullableNumber(conversation, 'latestCompactionSeq')
+  requireNullableNumber(conversation, 'latestCompactionByteOffset')
+  requireString(conversation, 'createdAt')
+  requireString(conversation, 'updatedAt')
+}
+
+function requireEntry(
+  value: Record<string, unknown>,
+  field: string,
+  expectedType: EntryType,
+): void {
+  const entry = objectValue(value[field])
+  requireNumber(entry, 'formatVersion')
+  requireString(entry, 'conversationId')
+  requireString(entry, 'id')
+  requireNumber(entry, 'seq')
+  requireNullableString(entry, 'parentId')
+  requireEnum(entry, 'type', ['USER_MESSAGE', 'ASSISTANT_MESSAGE', 'COMPACTION', 'TITLE'])
+  requireString(entry, 'createdAt')
+  if (entry.type !== expectedType) {
+    throw new ApiError('BAD_SSE_FRAME', `服务端流事件 Entry 类型错误：${field}`, 0)
+  }
+  const payload = objectValue(entry.payload)
+  if (expectedType === 'USER_MESSAGE' || expectedType === 'ASSISTANT_MESSAGE') {
+    requireString(payload, 'text')
+    requireString(payload, 'runId')
+  }
+  if (expectedType === 'ASSISTANT_MESSAGE' && payload.trace !== undefined) {
+    requireTrace(payload.trace)
+  }
+  if (expectedType === 'TITLE') {
+    requireString(payload, 'title')
+    requireString(payload, 'sourceRunId')
+    requireString(payload, 'sourceAssistantEntryId')
+  }
+}
+
+function requireTrace(raw: unknown): void {
+  if (!Array.isArray(raw)) {
+    throw new ApiError('BAD_SSE_FRAME', '服务端流事件 Trace 不是数组', 0)
+  }
+  for (const rawItem of raw) {
+    const item = objectValue(rawItem)
+    requireEnum(item, 'kind', ['REASONING', 'TOOL'])
+    requireBoolean(item, 'truncated')
+    if (item.kind === 'REASONING') {
+      requireString(item, 'text')
+    } else {
+      requireString(item, 'toolCallId')
+      requireString(item, 'toolName')
+      requireEnum(item, 'toolStatus', ['RUNNING', 'COMPLETED', 'FAILED'])
+      requireString(item, 'safeSummary')
+      requireNullableString(item, 'stableErrorCode')
+    }
   }
 }
 

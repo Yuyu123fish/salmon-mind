@@ -42,9 +42,6 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
     /** 工具失败的标准错误码：所有未分类的异常统一使用该稳定错误码。 */
     private static final String ERROR_CODE_TOOL_EXECUTION_FAILED = "TOOL_EXECUTION_FAILED";
 
-    /** 工具参数安全摘要的最大字符数：只用于状态展示，不承载完整参数。 */
-    private static final int SUMMARY_MAX_CHARS = 100;
-
     /** 每次 Agent stream 独立的工具预算 metadata 键。 */
     static final String INVOCATION_BUDGET_METADATA_KEY = "salmon:agent:tool-budget";
     static final String RESULT_BUDGET_METADATA_KEY = "salmon:agent:tool-result-budget";
@@ -86,7 +83,7 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
         if (listener != null) {
             listener.onToolStarted(new AgentToolStarted(
                     request.getToolCallId(), request.getToolName(),
-                    toolStartSummary(request.getToolName(), request.getArguments())));
+                    toolStartSummary(request.getToolName())));
         }
         InvocationBudget budget = budgetOf(request);
         if (budget != null && !budget.tryAcquire()) {
@@ -147,9 +144,10 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             long durationMillis = elapsedMillis(startedNanos);
             if (listener != null) {
                 if (response.isError() || isStructuredUnavailable(response.getResult())) {
+                    String errorCode = stableErrorCode(response);
                     listener.onToolFailed(new AgentToolFailed(
                             response.getToolCallId(), response.getToolName(), durationMillis,
-                            stableErrorCode(response), safeSummary(response.getResult())));
+                            errorCode, safeFailureSummary(errorCode)));
                 } else {
                     listener.onToolCompleted(new AgentToolCompleted(
                             response.getToolCallId(), response.getToolName(), durationMillis,
@@ -166,7 +164,7 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             if (listener != null) {
                 listener.onToolFailed(new AgentToolFailed(
                         request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
-                        ERROR_CODE_TOOL_EXECUTION_FAILED, safeSummary(ex.getMessage())));
+                        ERROR_CODE_TOOL_EXECUTION_FAILED, safeFailureSummary(ERROR_CODE_TOOL_EXECUTION_FAILED)));
             }
             return ToolCallResponse.error(request.getToolCallId(), request.getToolName(), ex);
         }
@@ -367,19 +365,26 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
         return Math.max(1L, (bytes + 1L) / 2L);
     }
 
-    /** 网页工具事件只报告能力名称，不把完整用户查询写入 SSE。 */
-    private static String toolStartSummary(String toolName, String arguments) {
-        // 网页查询正文可能包含个人问题或完整检索词；SSE 只需展示工具名对应的短状态。
-        return isWebTool(toolName) ? "网页检索" : safeSummary(arguments);
+    /** 工具开始事件只报告能力状态，任何工具的原始参数都不进入 SSE。 */
+    private static String toolStartSummary(String toolName) {
+        return isWebTool(toolName) ? "网页检索" : "工具执行中";
     }
 
-    /** 安全摘要：去掉控制字符后按固定长度截断，避免原始参数/结果泄露到事件中。 */
-    static String safeSummary(String raw) {
-        if (raw == null || raw.isBlank()) {
-            return "";
-        }
-        String cleaned = raw.replaceAll("\\p{Cc}", " ").trim();
-        return cleaned.length() <= SUMMARY_MAX_CHARS ? cleaned : cleaned.substring(0, SUMMARY_MAX_CHARS);
+    /**
+     * 错误展示只由稳定错误码映射，绝不回退到原始工具结果、Provider 响应或异常消息。
+     */
+    private static String safeFailureSummary(String errorCode) {
+        return switch (errorCode) {
+            case "WEB_SEARCH_NOT_CONFIGURED" -> "网页搜索尚未配置";
+            case "WEB_SEARCH_AUTH_FAILED" -> "网页搜索鉴权失败";
+            case "WEB_SEARCH_RATE_LIMITED" -> "网页搜索请求过于频繁";
+            case "WEB_SEARCH_TIMEOUT" -> "网页搜索超时";
+            case "WEB_SEARCH_DISABLED" -> "用户已禁止联网";
+            case "WEB_SEARCH_FAILED", "RETRIEVAL_UNAVAILABLE" -> "检索服务暂不可用";
+            case TOOL_CALL_BUDGET_EXCEEDED -> "已达到本轮工具调用上限";
+            case TOOL_CONTEXT_BUDGET_EXCEEDED -> "已达到本轮工具结果上下文预算";
+            default -> "工具执行失败";
+        };
     }
 
     private static long elapsedMillis(long startedNanos) {

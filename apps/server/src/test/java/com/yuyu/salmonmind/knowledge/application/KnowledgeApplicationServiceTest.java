@@ -20,6 +20,7 @@ import com.yuyu.salmonmind.knowledge.application.port.KnowledgeQueuePort;
 import com.yuyu.salmonmind.knowledge.application.port.ObjectStoragePort;
 import com.yuyu.salmonmind.knowledge.domain.DocumentFormat;
 import com.yuyu.salmonmind.knowledge.domain.IngestionJobState;
+import com.yuyu.salmonmind.knowledge.domain.KnowledgeSourceLifecycle;
 import com.yuyu.salmonmind.workspace.api.Workspace;
 import com.yuyu.salmonmind.workspace.api.WorkspaceRegistry;
 import org.junit.jupiter.api.BeforeEach;
@@ -45,11 +46,13 @@ class KnowledgeApplicationServiceTest {
     private final ObjectStoragePort objectStorage = mock(ObjectStoragePort.class);
     private final DocumentParserPort parser = mock(DocumentParserPort.class);
     private final EvidenceIndexPort evidenceIndex = mock(EvidenceIndexPort.class);
+    private final KnowledgeDeletion deletion = mock(KnowledgeDeletion.class);
     private KnowledgeApplicationService service;
 
     @BeforeEach
     void setUp() {
-        service = new KnowledgeApplicationService(workspace, metadata, queue, objectStorage, parser, evidenceIndex, 10);
+        service = new KnowledgeApplicationService(
+                workspace, metadata, queue, objectStorage, parser, evidenceIndex, deletion, 10);
     }
 
     @Test
@@ -129,6 +132,13 @@ class KnowledgeApplicationServiceTest {
         verify(metadata).markQueued(JOB_ID, "1-0");
     }
 
+    @Test
+    void deleteDelegatesWithTheCurrentWorkspaceIdentity() {
+        service.delete(SOURCE_ID);
+
+        verify(deletion).delete(WORKSPACE_ID, SOURCE_ID);
+    }
+
     private static KnowledgeMetadataPort.StoredDocument pendingDocument() {
         Instant now = Instant.now();
         KnowledgeMetadataPort.StoredRevision revision = new KnowledgeMetadataPort.StoredRevision(
@@ -138,6 +148,7 @@ class KnowledgeApplicationServiceTest {
                 JOB_ID, REVISION_ID, 1, IngestionJobState.PENDING_DISPATCH, false,
                 null, null, now, now, null, null, null);
         return new KnowledgeMetadataPort.StoredDocument(
-                SOURCE_ID, WORKSPACE_ID, "note.txt", revision, job, List.of(job), 0, now, now);
+                SOURCE_ID, WORKSPACE_ID, KnowledgeSourceLifecycle.ACTIVE,
+                "note.txt", revision, job, List.of(job), 0, now, now);
     }
 }

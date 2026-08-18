@@ -14,8 +14,25 @@ public record RunTraceItemPayload(
         String toolName,
         ToolStatus toolStatus,
         String safeSummary,
-        String stableErrorCode
+        String stableErrorCode,
+        ToolRequestDetailPayload requestDetail,
+        ToolOutcomeDetailPayload outcomeDetail
 ) {
+
+    /** 兼容没有展示详情的既有 Trace payload。 */
+    public RunTraceItemPayload(
+            Kind kind,
+            String text,
+            boolean truncated,
+            String toolCallId,
+            String toolName,
+            ToolStatus toolStatus,
+            String safeSummary,
+            String stableErrorCode
+    ) {
+        this(kind, text, truncated, toolCallId, toolName, toolStatus, safeSummary, stableErrorCode,
+                null, null);
+    }
 
     public RunTraceItemPayload {
         if (kind == null) {
@@ -32,7 +49,7 @@ public record RunTraceItemPayload(
 
     public static RunTraceItemPayload reasoning(String text, boolean truncated) {
         return new RunTraceItemPayload(
-                Kind.REASONING, text, truncated, null, null, null, null, null);
+                Kind.REASONING, text, truncated, null, null, null, null, null, null, null);
     }
 
     public static RunTraceItemPayload tool(
@@ -44,7 +61,24 @@ public record RunTraceItemPayload(
             boolean truncated
     ) {
         return new RunTraceItemPayload(
-                Kind.TOOL, null, truncated, toolCallId, toolName, status, safeSummary, stableErrorCode);
+                Kind.TOOL, null, truncated, toolCallId, toolName, status, safeSummary, stableErrorCode,
+                null, null);
+    }
+
+    /** 创建带请求与终态详情的 Tool Trace；详情只用于展示和历史核验。 */
+    public static RunTraceItemPayload tool(
+            String toolCallId,
+            String toolName,
+            ToolStatus status,
+            String safeSummary,
+            String stableErrorCode,
+            ToolRequestDetailPayload requestDetail,
+            ToolOutcomeDetailPayload outcomeDetail,
+            boolean truncated
+    ) {
+        return new RunTraceItemPayload(
+                Kind.TOOL, null, truncated, toolCallId, toolName, status, safeSummary, stableErrorCode,
+                requestDetail, outcomeDetail);
     }
 
     public enum Kind {

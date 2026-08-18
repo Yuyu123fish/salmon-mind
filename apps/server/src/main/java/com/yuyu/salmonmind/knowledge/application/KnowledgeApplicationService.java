@@ -15,6 +15,7 @@ import com.yuyu.salmonmind.knowledge.application.port.KnowledgeQueuePort;
 import com.yuyu.salmonmind.knowledge.application.port.ObjectStoragePort;
 import com.yuyu.salmonmind.knowledge.domain.DocumentFormat;
 import com.yuyu.salmonmind.knowledge.domain.IngestionJobState;
+import com.yuyu.salmonmind.knowledge.domain.KnowledgeSourceLifecycle;
 import com.yuyu.salmonmind.workspace.api.WorkspaceRegistry;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -44,6 +45,7 @@ class KnowledgeApplicationService implements KnowledgeService {
     private final ObjectStoragePort objectStorage;
     private final DocumentParserPort parser;
     private final EvidenceIndexPort index;
+    private final KnowledgeDeletion deletion;
     private final long maxObjectBytes;
 
     KnowledgeApplicationService(
@@ -53,6 +55,7 @@ class KnowledgeApplicationService implements KnowledgeService {
             ObjectStoragePort objectStorage,
             DocumentParserPort parser,
             EvidenceIndexPort index,
+            KnowledgeDeletion deletion,
             @Value("${salmon.knowledge.max-object-bytes:52428800}") long maxObjectBytes
     ) {
         this.workspaceRegistry = workspaceRegistry;
@@ -61,6 +64,7 @@ class KnowledgeApplicationService implements KnowledgeService {
         this.objectStorage = objectStorage;
         this.parser = parser;
         this.index = index;
+        this.deletion = deletion;
         this.maxObjectBytes = maxObjectBytes;
     }
 
@@ -159,6 +163,10 @@ class KnowledgeApplicationService implements KnowledgeService {
             throw new KnowledgeException(KnowledgeException.Code.INVALID_UPLOAD, "Evidence 分页参数无效");
         }
         KnowledgeMetadataPort.StoredDocument document = requireDocument(documentId);
+        if (document.lifecycle() != KnowledgeSourceLifecycle.ACTIVE) {
+            throw new KnowledgeException(KnowledgeException.Code.DOCUMENT_DELETE_NOT_ALLOWED,
+                    "文档正在删除，不能读取切片");
+        }
         if (document.latestJob() == null || document.latestJob().state() != IngestionJobState.READY) {
             throw new KnowledgeException(KnowledgeException.Code.DOCUMENT_NOT_READY, "文档尚未完成入库");
         }
@@ -183,6 +191,11 @@ class KnowledgeApplicationService implements KnowledgeService {
             }
         }
         return toSummary(requireDocument(documentId));
+    }
+
+    @Override
+    public void delete(UUID documentId) {
+        deletion.delete(workspaceRegistry.current().id(), documentId);
     }
 
     private KnowledgeMetadataPort.StoredDocument requireDocument(UUID documentId) {
@@ -257,8 +270,12 @@ class KnowledgeApplicationService implements KnowledgeService {
         return new DocumentSummary(
                 document.sourceId(), document.workspaceId(), revision.id(), job == null ? null : job.id(),
                 document.name(), revision.format().name(), revision.mediaType(), revision.sizeBytes(), revision.sha256(),
-                job == null ? IngestionJobState.PENDING_DISPATCH.name() : job.state().name(),
-                job != null && job.retryable(), document.evidenceCount(), document.createdAt(), document.updatedAt());
+                document.lifecycle() == KnowledgeSourceLifecycle.DELETING
+                        ? KnowledgeSourceLifecycle.DELETING.name()
+                        : job == null ? IngestionJobState.PENDING_DISPATCH.name() : job.state().name(),
+                document.lifecycle() == KnowledgeSourceLifecycle.ACTIVE
+                        && job != null && job.retryable(),
+                document.evidenceCount(), document.createdAt(), document.updatedAt());
     }
 
     private static IngestionJobView toJobView(KnowledgeMetadataPort.StoredJob job) {

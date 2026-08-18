@@ -8,6 +8,8 @@ public class KnowledgeException extends RuntimeException {
         UNSUPPORTED_FORMAT,
         FILE_TOO_LARGE,
         DOCUMENT_NOT_FOUND,
+        DOCUMENT_DELETE_NOT_ALLOWED,
+        DOCUMENT_DELETE_INCOMPLETE,
         DOCUMENT_NOT_READY,
         REVISION_NOT_RETRYABLE,
         OBJECT_STORAGE_UNAVAILABLE,

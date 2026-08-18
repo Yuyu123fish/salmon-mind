@@ -8,6 +8,7 @@ import com.yuyu.salmonmind.agent.api.AgentCitation;
 import com.yuyu.salmonmind.agent.api.AgentLocalCitation;
 import com.yuyu.salmonmind.agent.api.AgentLocalRetrievedSource;
 import com.yuyu.salmonmind.agent.api.AgentRetrievedSource;
+import com.yuyu.salmonmind.agent.api.AgentToolOutcomeDetail;
 import com.yuyu.salmonmind.agent.api.AgentWebCitation;
 import com.yuyu.salmonmind.agent.api.AgentWebRetrievedSource;
 
@@ -38,6 +39,12 @@ final class RunSourceRegistry {
     static final int MAX_SOURCE_EXCERPT_CHARS = 800;
     private static final Pattern REFERENCE = Pattern.compile(
             "(?<![A-Za-z0-9_])\\[(L|W)([1-9][0-9]*)](?![A-Za-z0-9_])");
+    private static final Set<String> STABLE_REASON_CODES = Set.of(
+            "NONE", "NO_READY_DOCUMENTS", "COMPLETE", "NO_MATCH", "VECTOR_UNAVAILABLE",
+            "RERANK_UNAVAILABLE", "INDEX_UNAVAILABLE", "READY_SCOPE_TOO_LARGE", "INVALID_QUERY",
+            "RETRIEVAL_UNAVAILABLE", "TOOL_BUDGET_EXCEEDED", "NOT_CONFIGURED", "AUTH_FAILED",
+            "RATE_LIMITED", "TIMEOUT", "PROVIDER_FAILED", "INVALID_RESPONSE", "USER_DISABLED",
+            "TOOL_CALL_BUDGET_EXCEEDED", "TOOL_CONTEXT_BUDGET_EXCEEDED");
 
     private final ObjectMapper mapper;
     private final Map<String, AgentCitation> citations = new LinkedHashMap<>();
@@ -55,7 +62,7 @@ final class RunSourceRegistry {
      * 原有字符边界；生产来源工具始终得到合法 JSON，超限时从尾部删除完整 item。
      */
     synchronized Decoration decorate(String result, int maxChars) {
-        return decorate(result, maxChars, Long.MAX_VALUE);
+        return decorate(result, maxChars, Long.MAX_VALUE, null);
     }
 
     /**
@@ -64,6 +71,13 @@ final class RunSourceRegistry {
      * 工具失败，刚登记但未存活的来源在本方法末尾被撤销。
      */
     synchronized Decoration decorate(String result, int maxChars, long maxTokens) {
+        return decorate(result, maxChars, maxTokens, null);
+    }
+
+    /**
+     * 为生产拦截器登记来源。toolCallId 只用于冻结首次召回位置，不进入 Tool Result。
+     */
+    synchronized Decoration decorate(String result, int maxChars, long maxTokens, String toolCallId) {
         if (result == null || result.isBlank()) {
             return null;
         }
@@ -80,6 +94,8 @@ final class RunSourceRegistry {
         ArrayNode items = envelope.withArray("items");
         String kind = envelope.path("sourceKind").asText();
         String provider = text(envelope, "provider");
+        AgentToolOutcomeDetail.ResultStatus resultStatus = resultStatus(envelope);
+        String stableReasonCode = stableReasonCode(text(envelope, "reason"));
         Set<String> newlyRegistered = new LinkedHashSet<>();
         ArrayNode decoratedItems = mapper.createArrayNode();
         for (JsonNode item : items) {
@@ -101,7 +117,7 @@ final class RunSourceRegistry {
             decoratedItems.add(decorated);
         }
         envelope.set("items", decoratedItems);
-        boolean truncated = false;
+        boolean truncated = envelope.path("truncated").asBoolean(false);
         while ((serializedLength(envelope) > maxChars
                 || ToolLifecycleInterceptor.estimateToolResultTokens(serialize(envelope)) > maxTokens
                 || sourceLimitExceeded(decoratedItems, newlyRegistered))
@@ -123,6 +139,18 @@ final class RunSourceRegistry {
                 identities.values().removeIf(referenceId::equals);
             }
         }
+        int resultPosition = 0;
+        for (JsonNode item : decoratedItems) {
+            resultPosition++;
+            String referenceId = text(item, "referenceId");
+            if (referenceId == null || !newlyRegistered.contains(referenceId)) {
+                continue;
+            }
+            AgentRetrievedSource source = sources.get(referenceId);
+            if (source != null && source.originToolCallId() == null && source.resultPosition() == null) {
+                sources.put(referenceId, withOrigin(source, toolCallId, resultPosition));
+            }
+        }
         if (truncated) {
             envelope.put("truncated", true);
         }
@@ -133,9 +161,28 @@ final class RunSourceRegistry {
                 provider,
                 decoratedItems.size(),
                 truncated,
-                "DEGRADED".equals(envelope.path("status").asText()),
+                resultStatus == AgentToolOutcomeDetail.ResultStatus.DEGRADED,
                 estimatedTokens,
-                estimatedTokens <= maxTokens);
+                estimatedTokens <= maxTokens,
+                resultStatus,
+                stableReasonCode,
+                Set.copyOf(newlyRegistered));
+    }
+
+    /**
+     * 工具结果在预算结算阶段被拒绝时撤销本次新登记来源；只有真正送入模型的结果才能进入历史来源。
+     * 已存在来源不受影响，避免一次失败工具调用抹掉前序调用的来源身份。
+     */
+    synchronized void rollback(Decoration decoration) {
+        if (decoration == null) {
+            return;
+        }
+        for (String referenceId : decoration.newlyRegisteredReferences()) {
+            if (sources.remove(referenceId) != null) {
+                citations.remove(referenceId);
+                identities.values().removeIf(referenceId::equals);
+            }
+        }
     }
 
     /** 从最终完整回答中按首次出现顺序核对精确 L/W 标记，未知 ID 不产生 Citation。 */
@@ -182,7 +229,7 @@ final class RunSourceRegistry {
                 text(item, "documentName"), text(item, "location")));
         sources.put(referenceId, new AgentLocalRetrievedSource(
                 referenceId, evidenceId, revisionId, text(item, "documentName"), text(item, "location"),
-                retrievedAt(item), "LOCAL_EVIDENCE", sourceExcerpt(item, "text")));
+                retrievedAt(item), "LOCAL_EVIDENCE", sourceExcerpt(item, "text"), null, null, null));
         return new Registration(referenceId, true);
     }
 
@@ -212,8 +259,49 @@ final class RunSourceRegistry {
                 text(item, "dateLabel"), retrievedAt));
         sources.put(referenceId, new AgentWebRetrievedSource(
                 referenceId, provider, title, url, site, text(item, "dateLabel"), retrievedAt,
-                "WEB_SEARCH_SUMMARY", sourceExcerpt(item, "snippet")));
+                "WEB_SEARCH_SUMMARY", sourceExcerpt(item, "snippet"), null, null,
+                positiveInteger(item, "providerRank")));
         return new Registration(referenceId, true);
+    }
+
+    private static AgentToolOutcomeDetail.ResultStatus resultStatus(ObjectNode envelope) {
+        String value = text(envelope, "status");
+        if (value == null) {
+            return null;
+        }
+        try {
+            return AgentToolOutcomeDetail.ResultStatus.valueOf(value);
+        } catch (IllegalArgumentException ex) {
+            return null;
+        }
+    }
+
+    private static String stableReasonCode(String value) {
+        return value != null && STABLE_REASON_CODES.contains(value) ? value : null;
+    }
+
+    private static Integer positiveInteger(JsonNode node, String field) {
+        JsonNode value = node == null ? null : node.get(field);
+        if (value == null || !value.isIntegralNumber() || !value.canConvertToInt()) {
+            return null;
+        }
+        int result = value.intValue();
+        return result > 0 ? result : null;
+    }
+
+    private static AgentRetrievedSource withOrigin(
+            AgentRetrievedSource source, String toolCallId, int resultPosition
+    ) {
+        return switch (source) {
+            case AgentLocalRetrievedSource local -> new AgentLocalRetrievedSource(
+                    local.referenceId(), local.evidenceId(), local.revisionId(), local.documentName(),
+                    local.location(), local.retrievedAt(), local.excerptKind(), local.sourceExcerpt(),
+                    toolCallId, resultPosition, null);
+            case AgentWebRetrievedSource web -> new AgentWebRetrievedSource(
+                    web.referenceId(), web.provider(), web.title(), web.url(), web.site(), web.dateLabel(),
+                    web.retrievedAt(), web.excerptKind(), web.sourceExcerpt(), toolCallId, resultPosition,
+                    web.providerRank());
+        };
     }
 
     private boolean sourceLimitExceeded(ArrayNode items, Set<String> newlyRegistered) {
@@ -340,8 +428,16 @@ final class RunSourceRegistry {
             boolean truncated,
             boolean degraded,
             long estimatedTokens,
-            boolean withinTokenBudget
+            boolean withinTokenBudget,
+            AgentToolOutcomeDetail.ResultStatus resultStatus,
+            String stableReasonCode,
+            Set<String> newlyRegisteredReferences
     ) {
+
+        /** 兼容旧测试名称；新事件使用 resultTruncated 语义。 */
+        boolean resultTruncated() {
+            return truncated;
+        }
     }
 
     private record Registration(String referenceId, boolean newlyRegistered) {

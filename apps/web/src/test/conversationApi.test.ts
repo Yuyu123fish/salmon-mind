@@ -86,6 +86,54 @@ describe('SSE event dispatch', () => {
 
     expect(listener.onAssistantCompleted).toHaveBeenCalledOnce()
   })
+
+  it('accepts optional tool request/outcome detail and source provenance', () => {
+    const listener = listenerStub()
+    dispatchRunEvent(
+      'tool_started',
+      {
+        runId: 'run-1',
+        toolCallId: 'call-1',
+        toolName: 'search_web_bocha',
+        safeSummary: 'salmon',
+        requestDetail: {
+          querySummary: 'salmon',
+          querySummaryTruncated: false,
+          freshness: 'any',
+          freshnessDefaulted: true,
+          count: 5,
+          countDefaulted: true,
+        },
+      },
+      listener,
+    )
+    dispatchRunEvent(
+      'tool_completed',
+      {
+        runId: 'run-1',
+        toolCallId: 'call-1',
+        toolName: 'search_web_bocha',
+        durationMillis: 4,
+        provider: 'BOCHA',
+        sourceCount: 1,
+        truncated: false,
+        degraded: false,
+        safeSummary: '已完成',
+        outcomeDetail: {
+          provider: 'BOCHA',
+          resultStatus: 'SUCCESS',
+          stableReasonCode: 'COMPLETE',
+          sourceCount: 1,
+          durationMillis: 4,
+          degraded: false,
+          resultTruncated: true,
+        },
+      },
+      listener,
+    )
+    expect(listener.onToolStarted).toHaveBeenCalledWith(expect.objectContaining({ requestDetail: expect.any(Object) }))
+    expect(listener.onToolCompleted).toHaveBeenCalledWith(expect.objectContaining({ outcomeDetail: expect.any(Object) }))
+  })
 })
 
 const conversation: Conversation = {

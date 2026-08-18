@@ -14,6 +14,8 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.CreateBucketRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetBucketVersioningRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadBucketRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.S3Exception;
@@ -99,6 +101,51 @@ class S3ObjectStorage implements ObjectStoragePort {
         } catch (RuntimeException ex) {
             // 双写失败时只尽力删除本次已知对象，不能扩大清理范围；清理失败必须可诊断。
             log.warn("Knowledge 孤儿原件清理失败，objectKey={}", objectKey, ex);
+        }
+    }
+
+    @Override
+    public void deleteStrict(String objectKey) {
+        if (!StringUtils.hasText(endpoint) || !StringUtils.hasText(accessKey)
+                || !StringUtils.hasText(secretKey) || !StringUtils.hasText(objectKey)) {
+            throw new KnowledgeException(KnowledgeException.Code.OBJECT_STORAGE_UNAVAILABLE,
+                    "原件存储未配置");
+        }
+        try {
+            S3Client current = client();
+            try {
+                String versioning = current.getBucketVersioning(GetBucketVersioningRequest.builder()
+                        .bucket(bucket).build()).statusAsString();
+                if (StringUtils.hasText(versioning) && !"OFF".equalsIgnoreCase(versioning)) {
+                    // 当前 Revision 没有保存 versionId；DeleteObject 在版本化 Bucket 中不能证明原件已消失。
+                    throw new KnowledgeException(KnowledgeException.Code.OBJECT_STORAGE_UNAVAILABLE,
+                            "原件 Bucket 启用了不受支持的 Versioning");
+                }
+            } catch (S3Exception ex) {
+                if (ex.statusCode() == 404) {
+                    // Bucket 已不存在，目标对象不可能仍可读取；按幂等删除收束。
+                    return;
+                }
+                throw ex;
+            }
+
+            current.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(objectKey).build());
+            try {
+                current.headObject(HeadObjectRequest.builder().bucket(bucket).key(objectKey).build());
+            } catch (S3Exception ex) {
+                if (ex.statusCode() == 404) {
+                    return;
+                }
+                throw ex;
+            }
+            throw new KnowledgeException(KnowledgeException.Code.OBJECT_STORAGE_UNAVAILABLE,
+                    "原件删除后仍可读取");
+        } catch (KnowledgeException ex) {
+            throw ex;
+        } catch (RuntimeException ex) {
+            log.warn("Knowledge 原件严格删除失败，objectKey={}", objectKey, ex);
+            throw new KnowledgeException(KnowledgeException.Code.OBJECT_STORAGE_UNAVAILABLE,
+                    "原件删除失败", ex);
         }
     }
 

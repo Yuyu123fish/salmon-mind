@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import type { RunTraceItem } from './conversationApi.ts'
+import { useId, useState } from 'react'
+import type { RunTraceItem, ToolOutcomeDetail, ToolRequestDetail } from './conversationApi.ts'
 
 type RunTracePanelProps = {
   trace: RunTraceItem[]
@@ -17,7 +17,9 @@ export function RunTracePanel({
   onToggle,
   onLayoutChange,
 }: RunTracePanelProps) {
+  const panelId = useId().replace(/:/g, '')
   const [localExpanded, setLocalExpanded] = useState(running)
+  const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({})
   if (trace.length === 0) return null
   const open = expanded ?? localExpanded
   const toggle = () => {
@@ -25,7 +27,15 @@ export function RunTracePanel({
     else setLocalExpanded((current) => !current)
     requestAnimationFrame(() => onLayoutChange?.())
   }
+  const toggleTool = (toolCallId: string) => {
+    setExpandedTools((current) => ({
+      ...current,
+      [toolCallId]: !(current[toolCallId] ?? false),
+    }))
+    requestAnimationFrame(() => onLayoutChange?.())
+  }
 
+  let toolNumber = 0
   return (
     <section className="run-trace" data-running={running}>
       <button type="button" className="trace-toggle" aria-expanded={open} onClick={toggle}>
@@ -42,23 +52,125 @@ export function RunTracePanel({
                 {item.truncated && <small>内容已按展示上限截断</small>}
               </li>
             ) : (
-              <li className="trace-tool" key={item.toolCallId} data-status={item.toolStatus}>
-                <span className="trace-kind">工具</span>
-                <div>
-                  <strong>{toolLabel(item.toolName)}</strong>
-                  <p>{item.safeSummary || '暂无安全摘要'}</p>
-                  <small>
-                    {statusLabel(item.toolStatus)}
-                    {item.stableErrorCode ? ` · ${item.stableErrorCode}` : ''}
-                    {item.truncated ? ' · 内容已截断' : ''}
-                  </small>
-                </div>
-              </li>
+              (() => {
+                toolNumber += 1
+                return (
+                  <ToolTraceRow
+                    key={item.toolCallId}
+                    item={item}
+                    panelId={panelId}
+                    toolNumber={toolNumber}
+                    expanded={expandedTools[item.toolCallId] ?? false}
+                    onToggle={() => toggleTool(item.toolCallId)}
+                  />
+                )
+              })()
             ),
           )}
         </ol>
       )}
     </section>
+  )
+}
+
+function ToolTraceRow({
+  item,
+  panelId,
+  toolNumber,
+  expanded,
+  onToggle,
+}: {
+  item: Extract<RunTraceItem, { kind: 'TOOL' }>
+  panelId: string
+  toolNumber: number
+  expanded: boolean
+  onToggle: () => void
+}) {
+  const detailId = `trace-tool-detail-${panelId}-${toolNumber}`
+  const hasDetail = (item.requestDetail !== null && item.requestDetail !== undefined) ||
+    (item.outcomeDetail !== null && item.outcomeDetail !== undefined)
+  return (
+    <li className="trace-tool" data-status={item.toolStatus}>
+      <button
+        type="button"
+        className="trace-tool-toggle"
+        aria-expanded={expanded}
+        aria-controls={detailId}
+        onClick={onToggle}
+      >
+        <span className="trace-kind">工具 #{toolNumber}</span>
+        <span className="trace-tool-summary">
+          <strong>{toolLabel(item.toolName)}</strong>
+          <span className="trace-tool-query">{item.safeSummary || '暂无安全摘要'}</span>
+          <small>
+            {statusLabel(item.toolStatus)}
+            {item.stableErrorCode ? ` · ${item.stableErrorCode}` : ''}
+            {item.truncated ? ' · 展示摘要已截断' : ''}
+          </small>
+        </span>
+        <span className="trace-tool-chevron" aria-hidden="true">{expanded ? '−' : '+'}</span>
+      </button>
+      {expanded && (
+        <div id={detailId} className="trace-tool-detail">
+          {hasDetail ? (
+            <>
+              {item.requestDetail ? <RequestDetail detail={item.requestDetail} /> : null}
+              {item.outcomeDetail ? <OutcomeDetail detail={item.outcomeDetail} /> : null}
+            </>
+          ) : (
+            <small>暂无更多安全详情</small>
+          )}
+        </div>
+      )}
+    </li>
+  )
+}
+
+function RequestDetail({ detail }: { detail: ToolRequestDetail }) {
+  return (
+    <dl className="tool-detail-list">
+      <div>
+        <dt>查询</dt>
+        <dd>
+          {detail.querySummary}
+          {detail.querySummaryTruncated ? '（展示已截断）' : ''}
+        </dd>
+      </div>
+      {detail.freshness !== null && detail.freshness !== undefined ? (
+        <div>
+          <dt>时间范围</dt>
+          <dd>{detail.freshness}{detail.freshnessDefaulted ? '（工具默认）' : ''}</dd>
+        </div>
+      ) : null}
+      {detail.count !== null && detail.count !== undefined ? (
+        <div>
+          <dt>请求数量</dt>
+          <dd>{detail.count}{detail.countDefaulted ? '（工具默认）' : ''}</dd>
+        </div>
+      ) : null}
+    </dl>
+  )
+}
+
+function OutcomeDetail({ detail }: { detail: ToolOutcomeDetail }) {
+  return (
+    <dl className="tool-detail-list tool-outcome-detail">
+      {detail.provider ? (
+        <div><dt>Provider</dt><dd>{detail.provider}</dd></div>
+      ) : null}
+      {detail.resultStatus ? (
+        <div><dt>结果状态</dt><dd>{resultStatusLabel(detail.resultStatus)}</dd></div>
+      ) : null}
+      {detail.stableReasonCode ? (
+        <div><dt>稳定原因</dt><dd>{detail.stableReasonCode}</dd></div>
+      ) : null}
+      {detail.sourceCount !== null && detail.sourceCount !== undefined ? (
+        <div><dt>来源数</dt><dd>{detail.sourceCount}</dd></div>
+      ) : null}
+      <div><dt>耗时</dt><dd>{detail.durationMillis} ms</dd></div>
+      <div><dt>降级</dt><dd>{detail.degraded ? '是' : '否'}</dd></div>
+      <div><dt>结果裁剪</dt><dd>{detail.resultTruncated ? '是' : '否'}</dd></div>
+    </dl>
   )
 }
 
@@ -73,4 +185,12 @@ function statusLabel(status: 'RUNNING' | 'COMPLETED' | 'FAILED'): string {
   if (status === 'RUNNING') return '进行中'
   if (status === 'COMPLETED') return '已完成'
   return '失败'
+}
+
+function resultStatusLabel(status: ToolOutcomeDetail['resultStatus']): string {
+  if (status === 'SUCCESS') return '成功'
+  if (status === 'DEGRADED') return '降级'
+  if (status === 'EMPTY') return '空结果'
+  if (status === 'UNAVAILABLE') return '不可用'
+  return ''
 }

@@ -21,6 +21,8 @@ import com.yuyu.salmonmind.conversation.api.WebCitationPayload;
 import com.yuyu.salmonmind.conversation.api.WebRetrievedSourcePayload;
 import com.yuyu.salmonmind.conversation.api.TokenUsage;
 import com.yuyu.salmonmind.conversation.api.TitlePayload;
+import com.yuyu.salmonmind.conversation.api.ToolOutcomeDetailPayload;
+import com.yuyu.salmonmind.conversation.api.ToolRequestDetailPayload;
 import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
 import com.yuyu.salmonmind.conversation.domain.ConversationHistory;
 import org.springframework.stereotype.Component;
@@ -327,6 +329,47 @@ class JsonlCodec {
         if (item.stableErrorCode() != null) {
             node.put("stableErrorCode", item.stableErrorCode());
         }
+        if (item.requestDetail() != null) {
+            node.set("requestDetail", encodeRequestDetail(item.requestDetail()));
+        }
+        if (item.outcomeDetail() != null) {
+            node.set("outcomeDetail", encodeOutcomeDetail(item.outcomeDetail()));
+        }
+        return node;
+    }
+
+    private ObjectNode encodeRequestDetail(ToolRequestDetailPayload detail) {
+        ObjectNode node = mapper.createObjectNode();
+        node.put("querySummary", detail.querySummary());
+        node.put("querySummaryTruncated", detail.querySummaryTruncated());
+        if (detail.freshness() != null) {
+            node.put("freshness", detail.freshness());
+        }
+        node.put("freshnessDefaulted", detail.freshnessDefaulted());
+        if (detail.count() != null) {
+            node.put("count", detail.count());
+        }
+        node.put("countDefaulted", detail.countDefaulted());
+        return node;
+    }
+
+    private ObjectNode encodeOutcomeDetail(ToolOutcomeDetailPayload detail) {
+        ObjectNode node = mapper.createObjectNode();
+        if (detail.provider() != null) {
+            node.put("provider", detail.provider());
+        }
+        if (detail.resultStatus() != null) {
+            node.put("resultStatus", detail.resultStatus().name().toLowerCase(java.util.Locale.ROOT));
+        }
+        if (detail.stableReasonCode() != null) {
+            node.put("stableReasonCode", detail.stableReasonCode());
+        }
+        if (detail.sourceCount() != null) {
+            node.put("sourceCount", detail.sourceCount());
+        }
+        node.put("durationMillis", detail.durationMillis());
+        node.put("degraded", detail.degraded());
+        node.put("resultTruncated", detail.resultTruncated());
         return node;
     }
 
@@ -338,6 +381,12 @@ class JsonlCodec {
         node.put("excerptKind", source.excerptKind());
         if (source.sourceExcerpt() != null) {
             node.put("sourceExcerpt", source.sourceExcerpt());
+        }
+        if (source.originToolCallId() != null) {
+            node.put("originToolCallId", source.originToolCallId());
+        }
+        if (source.resultPosition() != null) {
+            node.put("resultPosition", source.resultPosition());
         }
         switch (source) {
             case LocalRetrievedSourcePayload local -> {
@@ -353,6 +402,9 @@ class JsonlCodec {
                 node.put("site", web.site());
                 if (web.dateLabel() != null) {
                     node.put("dateLabel", web.dateLabel());
+                }
+                if (web.providerRank() != null) {
+                    node.put("providerRank", web.providerRank());
                 }
             }
         }
@@ -412,7 +464,9 @@ class JsonlCodec {
                 }
                 sources.add(new LocalRetrievedSourcePayload(
                         referenceId, evidenceId, revisionId, documentName, location, retrievedAt,
-                        excerptKind, optionalText(item, "sourceExcerpt")));
+                        excerptKind, optionalText(item, "sourceExcerpt"),
+                        optionalMetadataText(item, "originToolCallId"),
+                        optionalMetadataPositiveInteger(item, "resultPosition"), null));
             } else if ("web".equals(kind)) {
                 String provider = text(item, "provider");
                 String title = text(item, "title");
@@ -423,7 +477,10 @@ class JsonlCodec {
                 }
                 sources.add(new WebRetrievedSourcePayload(
                         referenceId, provider, title, url, site, optionalText(item, "dateLabel"),
-                        retrievedAt, excerptKind, optionalText(item, "sourceExcerpt")));
+                        retrievedAt, excerptKind, optionalText(item, "sourceExcerpt"),
+                        optionalMetadataText(item, "originToolCallId"),
+                        optionalMetadataPositiveInteger(item, "resultPosition"),
+                        optionalMetadataPositiveInteger(item, "providerRank")));
             } else {
                 throw corrupted("未知 Retrieved Source kind: " + kind);
             }
@@ -455,11 +512,58 @@ class JsonlCodec {
                         },
                         text(item, "safeSummary"),
                         optionalText(item, "stableErrorCode"),
+                        decodeRequestDetail(item.get("requestDetail")),
+                        decodeOutcomeDetail(item.get("outcomeDetail")),
                         truncated));
                 default -> throw corrupted("未知 Trace kind");
             }
         }
         return List.copyOf(trace);
+    }
+
+    /** 可选展示详情损坏时只丢弃详情，不能让整条 Assistant 历史失效。 */
+    private ToolRequestDetailPayload decodeRequestDetail(JsonNode node) {
+        if (node == null || node.isNull() || !node.isObject()) {
+            return null;
+        }
+        try {
+            String query = optionalText(node, "querySummary");
+            if (query == null || query.isBlank()) {
+                return null;
+            }
+            return new ToolRequestDetailPayload(
+                    query,
+                    optionalBoolean(node, "querySummaryTruncated", false),
+                    optionalText(node, "freshness"),
+                    optionalBoolean(node, "freshnessDefaulted", false),
+                    optionalPositiveInteger(node, "count"),
+                    optionalBoolean(node, "countDefaulted", false));
+        } catch (RuntimeException ex) {
+            return null;
+        }
+    }
+
+    /** 可选终态详情损坏时只丢弃详情，Trace 的稳定状态仍可展示。 */
+    private ToolOutcomeDetailPayload decodeOutcomeDetail(JsonNode node) {
+        if (node == null || node.isNull() || !node.isObject()) {
+            return null;
+        }
+        try {
+            Long duration = optionalLong(node, "durationMillis");
+            if (duration == null || duration < 0) {
+                return null;
+            }
+            String statusValue = optionalText(node, "resultStatus");
+            ToolOutcomeDetailPayload.ResultStatus status = statusValue == null
+                    ? null : ToolOutcomeDetailPayload.ResultStatus.valueOf(statusValue.toUpperCase(java.util.Locale.ROOT));
+            return new ToolOutcomeDetailPayload(
+                    optionalText(node, "provider"), status, optionalText(node, "stableReasonCode"),
+                    optionalNonNegativeInteger(node, "sourceCount"), duration,
+                    optionalBoolean(node, "degraded", false),
+                    optionalBoolean(node, "resultTruncated", false));
+        } catch (RuntimeException ex) {
+            return null;
+        }
     }
 
     // 解析整行：JSON 语法截断（EOF 未闭合）抛 TornTailException，其余解析错误视为损坏
@@ -534,6 +638,58 @@ class JsonlCodec {
             throw corrupted("字段不是布尔值: " + field);
         }
         return value.asBoolean();
+    }
+
+    private static Long optionalLong(JsonNode node, String field) {
+        JsonNode value = node.get(field);
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        if (!value.isIntegralNumber()) {
+            throw corrupted("字段不是整数: " + field);
+        }
+        return value.asLong();
+    }
+
+    private static Integer optionalPositiveInteger(JsonNode node, String field) {
+        Integer value = optionalNonNegativeInteger(node, field);
+        if (value != null && value < 1) {
+            throw corrupted("字段必须为正整数: " + field);
+        }
+        return value;
+    }
+
+    /** 新增来源展示元数据损坏时忽略该字段，保留可读的整条 Assistant Entry。 */
+    private static String optionalMetadataText(JsonNode node, String field) {
+        try {
+            return optionalText(node, field);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    /** 新增来源展示位次必须为正数；非法值只退化为缺省，不影响历史正文。 */
+    private static Integer optionalMetadataPositiveInteger(JsonNode node, String field) {
+        try {
+            return optionalPositiveInteger(node, field);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    private static Integer optionalNonNegativeInteger(JsonNode node, String field) {
+        JsonNode value = node.get(field);
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        if (!value.canConvertToInt() || !value.isIntegralNumber()) {
+            throw corrupted("字段不是整数: " + field);
+        }
+        int result = value.asInt();
+        if (result < 0) {
+            throw corrupted("字段不能为负数: " + field);
+        }
+        return result;
     }
 
     private static UUID uuid(JsonNode node, String field) {

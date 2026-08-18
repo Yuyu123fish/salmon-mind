@@ -19,6 +19,12 @@ public interface EvidenceIndexPort {
     /** 分页读取某个 Revision 的 Evidence；调用方保证文档已 READY。 */
     List<IndexedEvidence> pageForRevision(String indexName, UUID revisionId, int offset, int size);
 
+    /**
+     * 在指定物理索引中按 Revision 精确删除派生 Evidence，并刷新、验证目标 Revision 已归零。
+     * 物理索引不存在或目标 Revision 已不存在都视为幂等成功；不能创建索引或扩大删除范围。
+     */
+    void deleteForRevisions(String indexName, Collection<UUID> revisionIds);
+
     /** 在 READY Revision terms pre-filter 内执行 mapping-v1 的 BM25 文本召回。 */
     List<RankedEvidence> searchText(String indexName, String query, Collection<UUID> revisionIds, int limit);
 

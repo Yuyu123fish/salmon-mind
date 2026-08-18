@@ -27,6 +27,7 @@ import {
   type RetrievedSourcePayload,
   type Run,
   type RunStreamListener,
+  type RunTraceItem,
 } from './conversationApi.ts'
 
 type LoadState =
@@ -783,6 +784,7 @@ function App() {
                         isCurrentLeaf={entry.id === selectedDetail!.conversation.activeLeafEntryId}
                         continueDisabled={running}
                         onContinue={handleContinue}
+                        trace={entry.payload.trace ?? []}
                         traceExpanded={controlsCurrentRun ? selectedRun.traceExpanded : undefined}
                         traceRunning={controlsCurrentRun && running}
                         onTraceToggle={controlsCurrentRun ? toggleSelectedTrace : undefined}
@@ -876,6 +878,7 @@ function MessageEntry({
   isCurrentLeaf,
   continueDisabled,
   onContinue,
+  trace,
   traceExpanded,
   traceRunning = false,
   onTraceToggle,
@@ -885,6 +888,7 @@ function MessageEntry({
   isCurrentLeaf: boolean
   continueDisabled: boolean
   onContinue: () => void
+  trace: RunTraceItem[]
   traceExpanded?: boolean
   traceRunning?: boolean
   onTraceToggle?: () => void
@@ -917,6 +921,7 @@ function MessageEntry({
             entryId={entry.id}
             citations={entry.payload.citations ?? []}
             retrievedSources={entry.payload.retrievedSources ?? []}
+            trace={trace}
             onLayoutChange={onTraceLayoutChange}
           >
             {(activate) => (
@@ -956,22 +961,31 @@ function MessageEntry({
   return null
 }
 
+/**
+ * 管理回答底部的来源核验闭环：引用只负责打开目标来源，详情状态保持单一活动项，
+ * 来源展示只读取当前 Assistant Trace 的安全字段；内部定位失败时不改变消息区滚动权威。
+ */
 function AssistantEvidenceView({
   entryId,
   citations,
   retrievedSources,
+  trace,
   onLayoutChange,
   children,
 }: {
   entryId: string
   citations: CitationPayload[]
   retrievedSources: RetrievedSourcePayload[]
+  trace: RunTraceItem[]
   onLayoutChange: () => void
   children: (activate: (referenceId: string) => void) => ReactNode
 }) {
   const [expanded, setExpanded] = useState(false)
+  const [unreferencedExpanded, setUnreferencedExpanded] = useState(false)
+  const [activeSourceId, setActiveSourceId] = useState<string | null>(null)
   const [pendingFocus, setPendingFocus] = useState<string | null>(null)
   const cardRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const sourceScrollRef = useRef<HTMLDivElement>(null)
   const citedIds = new Set<string>()
   const uniqueCitations: CitationPayload[] = []
   for (const citation of citations) {
@@ -986,28 +1000,55 @@ function AssistantEvidenceView({
   const unreferenced = [...sourcesById.values()].filter((source) => !citedIds.has(source.referenceId))
   const hasDisclosure = uniqueCitations.length > 0 || sourcesById.size > 0
   const disclosureId = `source-disclosure-${entryId}`
+  // Retrieved Source 只通过 originToolCallId 关联同一 Trace 的工具序号、名称和白名单查询摘要。
+  const toolContexts = new Map<string, SourceToolContext>()
+  let toolNumber = 0
+  for (const item of trace) {
+    if (item.kind === 'TOOL') {
+      toolNumber += 1
+      const querySummary = item.requestDetail?.querySummary.trim() ?? ''
+      toolContexts.set(item.toolCallId, {
+        number: toolNumber,
+        name: sourceToolLabel(item.toolName),
+        querySummary: querySummary === '' ? null : querySummary,
+      })
+    }
+  }
 
   useEffect(() => {
     if (!expanded || pendingFocus === null) return
     const referenceId = pendingFocus
     const frame = requestAnimationFrame(() => {
       const card = cardRefs.current[referenceId]
-      if (card === null || card === undefined) return
-      card.focus()
-      card.scrollIntoView({ block: 'nearest' })
+      const scrollContainer = sourceScrollRef.current
+      if (card === null || card === undefined || scrollContainer === null) return
+      card.focus({ preventScroll: true })
+      scrollSourceCardIntoView(scrollContainer, card)
       setPendingFocus(null)
     })
     return () => cancelAnimationFrame(frame)
-  }, [expanded, pendingFocus])
+  }, [expanded, unreferencedExpanded, activeSourceId, pendingFocus])
 
   const activate = (referenceId: string) => {
+    if (!citedIds.has(referenceId)) return
     setExpanded(true)
+    setActiveSourceId(referenceId)
     setPendingFocus(referenceId)
     onLayoutChange()
   }
 
   const toggle = () => {
     setExpanded((current) => !current)
+    onLayoutChange()
+  }
+
+  const toggleUnreferenced = () => {
+    setUnreferencedExpanded((current) => !current)
+    onLayoutChange()
+  }
+
+  const toggleSource = (referenceId: string) => {
+    setActiveSourceId((current) => current === referenceId ? null : referenceId)
     onLayoutChange()
   }
 
@@ -1030,44 +1071,72 @@ function AssistantEvidenceView({
           </button>
           {expanded ? (
             <div id={disclosureId} className="source-disclosure-body">
-              {uniqueCitations.length > 0 ? (
-                <section aria-labelledby={`${disclosureId}-cited`}>
-                  <h4 id={`${disclosureId}-cited`}>回答已引用</h4>
-                  <div className="citation-list">
-                    {uniqueCitations.map((citation) => (
-                      <SourceCard
-                        key={citation.referenceId}
-                        citation={citation}
-                        source={sourcesById.get(citation.referenceId)}
-                        referenceId={citation.referenceId}
-                        entryId={entryId}
-                        cardRef={(card) => {
-                          cardRefs.current[citation.referenceId] = card
-                        }}
-                      />
-                    ))}
-                  </div>
-                </section>
-              ) : null}
-              {unreferenced.length > 0 ? (
-                <section aria-labelledby={`${disclosureId}-unreferenced`}>
-                  <h4 id={`${disclosureId}-unreferenced`}>本轮召回未引用</h4>
-                  <div className="citation-list">
-                    {unreferenced.map((source) => (
-                      <SourceCard
-                        key={source.referenceId}
-                        source={source}
-                        referenceId={source.referenceId}
-                        entryId={entryId}
-                        unreferenced
-                        cardRef={(card) => {
-                          cardRefs.current[source.referenceId] = card
-                        }}
-                      />
-                    ))}
-                  </div>
-                </section>
-              ) : null}
+              <div
+                ref={sourceScrollRef}
+                className="source-disclosure-scroll"
+                role="region"
+                aria-label="来源列表与详情"
+                tabIndex={0}
+              >
+                {uniqueCitations.length > 0 ? (
+                  <section aria-labelledby={`${disclosureId}-cited`}>
+                    <h4 id={`${disclosureId}-cited`}>回答已引用</h4>
+                    <div className="citation-list">
+                      {uniqueCitations.map((citation) => {
+                        const source = sourcesById.get(citation.referenceId)
+                        return (
+                          <SourceCard
+                            key={citation.referenceId}
+                            citation={citation}
+                            source={source}
+                            referenceId={citation.referenceId}
+                            entryId={entryId}
+                            active={activeSourceId === citation.referenceId}
+                            onToggle={() => toggleSource(citation.referenceId)}
+                            tool={source === undefined ? undefined : toolContexts.get(source.originToolCallId ?? '')}
+                            cardRef={(card) => {
+                              cardRefs.current[citation.referenceId] = card
+                            }}
+                          />
+                        )
+                      })}
+                    </div>
+                  </section>
+                ) : null}
+                {unreferenced.length > 0 ? (
+                  <section aria-labelledby={`${disclosureId}-unreferenced`}>
+                    <button
+                      type="button"
+                      className="source-group-toggle"
+                      aria-expanded={unreferencedExpanded}
+                      aria-controls={`${disclosureId}-unreferenced-body`}
+                      onClick={toggleUnreferenced}
+                    >
+                      <span id={`${disclosureId}-unreferenced`}>本轮召回未引用</span>
+                      <small>{unreferencedExpanded ? '收起' : `展开 · ${unreferenced.length}`}</small>
+                    </button>
+                    {unreferencedExpanded ? (
+                      <div id={`${disclosureId}-unreferenced-body`} className="citation-list">
+                        {unreferenced.map((source) => (
+                          <SourceCard
+                            key={source.referenceId}
+                            source={source}
+                            referenceId={source.referenceId}
+                            entryId={entryId}
+                            unreferenced
+                            active={activeSourceId === source.referenceId}
+                            onToggle={() => toggleSource(source.referenceId)}
+                            tool={toolContexts.get(source.originToolCallId ?? '')}
+                            cardRef={(card) => {
+                              cardRefs.current[source.referenceId] = card
+                            }}
+                          />
+                        ))}
+                      </div>
+                    ) : null}
+                  </section>
+                ) : null}
+              </div>
             </div>
           ) : null}
         </section>
@@ -1076,12 +1145,16 @@ function AssistantEvidenceView({
   )
 }
 
+/** 单条紧凑来源行及其唯一活动详情；缺失历史字段时只省略对应展示项。 */
 function SourceCard({
   citation,
   source,
   referenceId,
   entryId,
   unreferenced = false,
+  active,
+  onToggle,
+  tool,
   cardRef,
 }: {
   citation?: CitationPayload
@@ -1089,6 +1162,9 @@ function SourceCard({
   referenceId: string
   entryId: string
   unreferenced?: boolean
+  active: boolean
+  onToggle: () => void
+  tool?: SourceToolContext
   cardRef: (card: HTMLDivElement | null) => void
 }) {
   const local = source?.kind === 'local' ? source : citation?.kind === 'local' ? citation : null
@@ -1096,50 +1172,122 @@ function SourceCard({
   const safeUrl = web === null ? null : safeHttpUrl(web.url)
   const note = !unreferenced && citation?.citationNote?.trim() ? citation.citationNote : null
   const excerpt = source?.sourceExcerpt?.trim() ? source.sourceExcerpt : null
-  const excerptLabel = source?.kind === 'local' ? '本地证据摘录' : '搜索摘要'
+  const excerptLabel = local !== null ? '本地证据摘录' : '搜索摘要'
+  const detailId = `source-detail-${entryId}-${referenceId}`
+  const sourcePosition = source?.resultPosition !== null && source?.resultPosition !== undefined &&
+    source.resultPosition > 0 ? `结果位置 #${source.resultPosition}` : null
+  const providerRank = web !== null && source?.providerRank !== null && source?.providerRank !== undefined &&
+    source.providerRank > 0 ? `Provider 位次 #${source.providerRank}` : null
+  const recallSummary = [sourcePosition, providerRank].filter((value): value is string => value !== null).join(' · ')
+  const retrievedAt = source?.retrievedAt || web?.retrievedAt || null
 
   return (
     <div
       id={`source-card-${entryId}-${referenceId}`}
       ref={cardRef}
       className="citation-card"
+      data-active={active ? 'true' : 'false'}
       data-unreferenced={unreferenced ? 'true' : 'false'}
       tabIndex={-1}
     >
       <span className="citation-ref">[{referenceId}]</span>
-      <div>
-        {local !== null ? <strong>{local.documentName}</strong> : null}
-        {web !== null ? (
-          safeUrl === null ? (
-            <strong>{web.title}</strong>
-          ) : (
-            <a href={safeUrl} target="_blank" rel="noopener noreferrer">
-              {web.title}
-            </a>
-          )
-        ) : null}
+      <div className="citation-card-content">
+        <div className="citation-card-heading">
+          {local !== null ? <strong>{local.documentName}</strong> : null}
+          {web !== null ? (
+            safeUrl === null ? (
+              <strong>{web.title}</strong>
+            ) : (
+              <a href={safeUrl} target="_blank" rel="noopener noreferrer">
+                {web.title}
+              </a>
+            )
+          ) : null}
+          <button
+            type="button"
+            className="source-card-toggle"
+            aria-expanded={active}
+            aria-controls={detailId}
+            aria-label={`${active ? '收起' : '展开'}来源详情 [${referenceId}]`}
+            onClick={onToggle}
+          >
+            {active ? '收起详情' : '查看详情'}
+          </button>
+          </div>
         {local !== null ? <small>{local.location}</small> : null}
         {web !== null ? (
-          <small>
-            {web.provider} · {web.site}
-            {web.dateLabel ? ` · ${web.dateLabel}` : ''} · 检索于 {formatTime(web.retrievedAt)}
-          </small>
+          <small>{web.site} · {web.provider}</small>
         ) : null}
-        {note !== null ? (
-          <p className="source-note">
-            <b>Agent 相关性摘要</b>
-            {note}
-          </p>
-        ) : null}
-        {excerpt !== null ? (
-          <p className="source-excerpt">
-            <b>{excerptLabel}</b>
-            {excerpt}
-          </p>
+        {recallSummary !== '' ? <small className="source-provenance">{recallSummary}</small> : null}
+        {active ? (
+          <div id={detailId} className="source-card-details">
+            <dl className="source-detail-list">
+              {local !== null ? (
+                <>
+                  <div><dt>文档</dt><dd>{local.documentName}</dd></div>
+                  <div><dt>位置</dt><dd>{local.location}</dd></div>
+                </>
+              ) : null}
+              {web !== null ? (
+                <>
+                  <div><dt>标题</dt><dd>{web.title}</dd></div>
+                  <div><dt>站点</dt><dd>{web.site}</dd></div>
+                  <div><dt>Provider</dt><dd>{web.provider}</dd></div>
+                  {safeUrl !== null ? (
+                    <div><dt>链接</dt><dd><a href={safeUrl} target="_blank" rel="noopener noreferrer">{safeUrl}</a></dd></div>
+                  ) : null}
+                  {web.dateLabel ? <div><dt>日期</dt><dd>{web.dateLabel}</dd></div> : null}
+                </>
+              ) : null}
+              {tool !== undefined ? <div><dt>首次工具</dt><dd>工具 #{tool.number} · {tool.name}</dd></div> : null}
+              {tool?.querySummary !== null && tool?.querySummary !== undefined ? (
+                <div><dt>安全查询</dt><dd>{tool.querySummary}</dd></div>
+              ) : null}
+              {sourcePosition !== null ? <div><dt>结果位置</dt><dd>{sourcePosition}</dd></div> : null}
+              {providerRank !== null ? <div><dt>Provider 位次</dt><dd>{providerRank}</dd></div> : null}
+              {retrievedAt !== null ? <div><dt>检索时间</dt><dd>{formatTime(retrievedAt)}</dd></div> : null}
+            </dl>
+            {note !== null ? (
+              <p className="source-note">
+                <b>Agent 相关性摘要</b>
+                {note}
+              </p>
+            ) : null}
+            {excerpt !== null ? (
+              <p className="source-excerpt">
+                <b>{excerptLabel}</b>
+                {excerpt}
+              </p>
+            ) : null}
+          </div>
         ) : null}
       </div>
     </div>
   )
+}
+
+type SourceToolContext = {
+  number: number
+  name: string
+  querySummary: string | null
+}
+
+function sourceToolLabel(toolName: string): string {
+  if (toolName === 'search_web_bocha') return '博查网页搜索'
+  if (toolName === 'search_web_searchapi') return 'SearchApi.io 网页搜索'
+  if (toolName === 'search_local_knowledge') return '本地知识库检索'
+  return toolName || '工具调用'
+}
+
+/** 只调整来源内部容器，避免 Citation 定位把消息区或整页滚到末尾。 */
+function scrollSourceCardIntoView(container: HTMLElement, card: HTMLElement): void {
+  const containerRect = container.getBoundingClientRect()
+  const cardRect = card.getBoundingClientRect()
+  if (cardRect.top < containerRect.top) {
+    container.scrollTop -= containerRect.top - cardRect.top
+  } else if (cardRect.bottom > containerRect.bottom) {
+    container.scrollTop += cardRect.bottom - containerRect.bottom
+  }
 }
 
 function safeHttpUrl(value: string): string | null {

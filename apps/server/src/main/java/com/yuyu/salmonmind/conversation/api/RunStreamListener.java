@@ -35,25 +35,59 @@ public interface RunStreamListener {
     record ReasoningDelta(UUID runId, String delta) {
     }
 
-    /** 工具开始事件；不携带 query、正文或原始参数。 */
-    record ToolStarted(UUID runId, String toolCallId, String toolName, String safeSummary) {
-    }
-
-    /** 工具成功结束事件；来源状态只保留 Provider、数量和边界标记。 */
-    record ToolCompleted(
-            UUID runId, String toolCallId, String toolName, long durationMillis,
-            String provider, int sourceCount, boolean truncated, boolean degraded, String safeSummary
+    /** 工具开始事件；请求详情已经由 Agent 白名单投影，不携带原始参数。 */
+    record ToolStarted(
+            UUID runId,
+            String toolCallId,
+            String toolName,
+            String safeSummary,
+            ToolRequestDetailPayload requestDetail
     ) {
-        public ToolCompleted(UUID runId, String toolCallId, String toolName, long durationMillis) {
-            this(runId, toolCallId, toolName, durationMillis, null, 0, false, false, "工具执行完成");
+
+        /** 兼容没有请求详情的既有 SSE 事件。 */
+        public ToolStarted(UUID runId, String toolCallId, String toolName, String safeSummary) {
+            this(runId, toolCallId, toolName, safeSummary, null);
         }
     }
 
-    /** 工具失败事件；错误码稳定且不携带内部堆栈或工具结果。 */
+    /**
+     * 工具成功结束事件；保留旧的平铺字段供旧客户端使用，并以可选 Outcome Detail
+     * 承载新的结构化终态。两组字段由 Server 同步生成，前端新逻辑优先读取 detail。
+     */
+    record ToolCompleted(
+            UUID runId, String toolCallId, String toolName, long durationMillis,
+            String provider, int sourceCount, boolean truncated, boolean degraded, String safeSummary,
+            ToolOutcomeDetailPayload outcomeDetail
+    ) {
+
+        /** 兼容旧调用方；没有来源/Provider 证明时不伪造 Outcome Detail。 */
+        public ToolCompleted(UUID runId, String toolCallId, String toolName, long durationMillis) {
+            this(runId, toolCallId, toolName, durationMillis, null, 0, false, false, "工具执行完成", null);
+        }
+
+        /** 兼容既有九字段事件。 */
+        public ToolCompleted(
+                UUID runId, String toolCallId, String toolName, long durationMillis,
+                String provider, int sourceCount, boolean truncated, boolean degraded, String safeSummary
+        ) {
+            this(runId, toolCallId, toolName, durationMillis, provider, sourceCount, truncated, degraded,
+                    safeSummary, null);
+        }
+    }
+
+    /** 工具失败事件；错误码和 Outcome Detail 稳定且不携带内部堆栈或工具结果。 */
     record ToolFailed(
             UUID runId, String toolCallId, String toolName, long durationMillis,
-            String stableErrorCode, String safeMessage
+            String stableErrorCode, String safeMessage, ToolOutcomeDetailPayload outcomeDetail
     ) {
+
+        /** 兼容既有失败事件。 */
+        public ToolFailed(
+                UUID runId, String toolCallId, String toolName, long durationMillis,
+                String stableErrorCode, String safeMessage
+        ) {
+            this(runId, toolCallId, toolName, durationMillis, stableErrorCode, safeMessage, null);
+        }
     }
 
     /** assistant_completed：已持久化的 Assistant Entry，正文可以是自然完成或长度中断。 */

@@ -12,8 +12,26 @@ public record LocalRetrievedSourcePayload(
         String location,
         Instant retrievedAt,
         String excerptKind,
-        String sourceExcerpt
+        String sourceExcerpt,
+        String originToolCallId,
+        Integer resultPosition,
+        Integer providerRank
 ) implements RetrievedSourcePayload {
+
+    /** 兼容没有首次召回位置的既有来源。 */
+    public LocalRetrievedSourcePayload(
+            String referenceId,
+            UUID evidenceId,
+            UUID revisionId,
+            String documentName,
+            String location,
+            Instant retrievedAt,
+            String excerptKind,
+            String sourceExcerpt
+    ) {
+        this(referenceId, evidenceId, revisionId, documentName, location, retrievedAt, excerptKind,
+                sourceExcerpt, null, null, null);
+    }
 
     @Override
     public String kind() {

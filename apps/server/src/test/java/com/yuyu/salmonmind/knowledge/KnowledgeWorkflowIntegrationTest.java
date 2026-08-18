@@ -2,12 +2,15 @@ package com.yuyu.salmonmind.knowledge;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.fail;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.yuyu.salmonmind.knowledge.api.DocumentDetail;
 import com.yuyu.salmonmind.knowledge.api.DocumentSummary;
 import com.yuyu.salmonmind.knowledge.api.DocumentUpload;
 import com.yuyu.salmonmind.knowledge.api.EvidencePage;
 import com.yuyu.salmonmind.knowledge.api.KnowledgeService;
+import com.yuyu.salmonmind.knowledge.api.KnowledgeException;
+import com.yuyu.salmonmind.knowledge.application.port.EvidenceIndexPort;
 import com.yuyu.salmonmind.knowledge.application.port.KnowledgeMetadataPort;
 import com.yuyu.salmonmind.knowledge.application.port.ObjectStoragePort;
 import com.yuyu.salmonmind.model.embedding.EmbeddingException;
@@ -37,6 +40,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Collections;
+import java.util.List;
 import java.util.UUID;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -95,6 +99,9 @@ class KnowledgeWorkflowIntegrationTest {
 
     @Autowired
     private ObjectStoragePort objectStorage;
+
+    @Autowired
+    private EvidenceIndexPort evidenceIndex;
 
     @Autowired
     private WorkspaceRegistry workspaceRegistry;
@@ -181,6 +188,61 @@ class KnowledgeWorkflowIntegrationTest {
         assertThat(ready.jobs()).hasSize(2);
         assertThat(ready.jobs()).extracting(KnowledgeMetadataPort.StoredJob::attemptNumber)
                 .containsExactly(2, 1);
+    }
+
+    @Test
+    void deletesReadyDocumentAcrossPostgresElasticsearchAndRustFs() throws Exception {
+        DocumentSummary accepted = knowledge.upload(new DocumentUpload(
+                "delete-me.txt", "text/plain", new ByteArrayInputStream("需要完整删除的正文".getBytes(StandardCharsets.UTF_8))));
+        KnowledgeMetadataPort.StoredDocument ready = awaitReady(accepted.id());
+        KnowledgeMetadataPort.RetrievalScope before = metadata.currentRetrievalScope(
+                workspaceRegistry.current().id(), 512);
+        String physicalIndex = before.physicalIndex();
+        UUID revisionId = ready.revision().id();
+        String objectKey = ready.revision().objectKey();
+
+        knowledge.delete(accepted.id());
+
+        assertThat(metadata.find(workspaceRegistry.current().id(), accepted.id())).isNull();
+        assertThat(knowledge.list()).noneMatch(document -> document.id().equals(accepted.id()));
+        assertThat(evidenceIndex.countForRevision(physicalIndex, revisionId)).isZero();
+        KnowledgeMetadataPort.RetrievalScope after = metadata.currentRetrievalScope(
+                workspaceRegistry.current().id(), 512);
+        assertThat(after == null ? List.<UUID>of() : after.readyRevisionIds()).doesNotContain(revisionId);
+        assertThatThrownBy(() -> knowledge.detail(accepted.id()))
+                .isInstanceOf(KnowledgeException.class)
+                .extracting(error -> ((KnowledgeException) error).code())
+                .isEqualTo(KnowledgeException.Code.DOCUMENT_NOT_FOUND);
+
+        Path downloaded = Files.createTempFile("salmon-knowledge-deleted-", ".bin");
+        try {
+            assertThatThrownBy(() -> objectStorage.download(objectKey, downloaded))
+                    .isInstanceOf(KnowledgeException.class)
+                    .extracting(error -> ((KnowledgeException) error).code())
+                    .isEqualTo(KnowledgeException.Code.OBJECT_STORAGE_UNAVAILABLE);
+        } finally {
+            Files.deleteIfExists(downloaded);
+        }
+    }
+
+    @Test
+    void failedDocumentWithNoEvidenceCanBeDeletedAndCannotCrossWorkspace() throws Exception {
+        embedding.failNext(2);
+        DocumentSummary failed = knowledge.upload(new DocumentUpload(
+                "failed-delete.txt", "text/plain", new ByteArrayInputStream("删除失败文档".getBytes(StandardCharsets.UTF_8))));
+        KnowledgeMetadataPort.StoredDocument stored = awaitState(failed.id(), "FAILED");
+        assertThat(stored.evidenceCount()).isZero();
+
+        UUID otherWorkspace = UUID.randomUUID();
+        assertThatThrownBy(() -> metadata.markDeleting(otherWorkspace, failed.id()))
+                .isInstanceOf(KnowledgeException.class)
+                .extracting(error -> ((KnowledgeException) error).code())
+                .isEqualTo(KnowledgeException.Code.DOCUMENT_NOT_FOUND);
+        assertThat(metadata.find(workspaceRegistry.current().id(), failed.id())).isNotNull();
+
+        knowledge.delete(failed.id());
+
+        assertThat(metadata.find(workspaceRegistry.current().id(), failed.id())).isNull();
     }
 
     private void assertReady(String fileName, String mediaType, byte[] content) throws Exception {

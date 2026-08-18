@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yuyu.salmonmind.agent.api.AgentCitation;
+import com.yuyu.salmonmind.agent.api.AgentWebRetrievedSource;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
@@ -114,6 +115,58 @@ class RunSourceRegistryTest {
         assertThat(registry.citationsFor("依据 [W33]")).isEmpty();
     }
 
+    @Test
+    void freezesFirstOriginAndFinalPositionAfterDuplicateAndTailTrim() throws Exception {
+        RunSourceRegistry registry = new RunSourceRegistry(mapper);
+        String firstCall = twoWebEnvelope();
+        RunSourceRegistry.Decoration first = registry.decorate(firstCall, 10_000, Long.MAX_VALUE, "call-1");
+        assertThat(first.sourceCount()).isEqualTo(2);
+        assertThat(registry.retrievedSources())
+                .extracting("originToolCallId", "resultPosition")
+                .containsExactly(
+                        org.assertj.core.groups.Tuple.tuple("call-1", 1),
+                        org.assertj.core.groups.Tuple.tuple("call-1", 2));
+        assertThat(registry.retrievedSources()).element(0)
+                .isInstanceOf(AgentWebRetrievedSource.class)
+                .extracting("providerRank").isEqualTo(4);
+
+        String duplicateAndNew = "{\"status\":\"SUCCESS\",\"reason\":\"NONE\",\"sourceKind\":\"WEB\","
+                + "\"provider\":\"BOCHA\",\"items\":["
+                + "{\"title\":\"again\",\"url\":\"https://example.com/a\",\"site\":\"example\","
+                + "\"snippet\":\"snippet\",\"retrievedAt\":\"2026-08-17T00:00:00Z\",\"providerRank\":99},"
+                + "{\"title\":\"new\",\"url\":\"https://example.com/c\",\"site\":\"example\","
+                + "\"snippet\":\"snippet\",\"retrievedAt\":\"2026-08-17T00:00:00Z\",\"providerRank\":3}]}";
+        registry.decorate(duplicateAndNew, 10_000, Long.MAX_VALUE, "call-2");
+
+        assertThat(registry.retrievedSources()).extracting("referenceId", "originToolCallId", "resultPosition")
+                .containsExactly(
+                        org.assertj.core.groups.Tuple.tuple("W1", "call-1", 1),
+                        org.assertj.core.groups.Tuple.tuple("W2", "call-1", 2),
+                        org.assertj.core.groups.Tuple.tuple("W3", "call-2", 2));
+
+        int oneItemLimit = new RunSourceRegistry(mapper)
+                .decorate(webEnvelope("BOCHA", "https://example.com/z", "z"), 10_000).result().length() + 5;
+        RunSourceRegistry trimmedRegistry = new RunSourceRegistry(mapper);
+        RunSourceRegistry.Decoration trimmed = trimmedRegistry.decorate(
+                duplicateWebEnvelope(), oneItemLimit, Long.MAX_VALUE, "call-trim");
+        assertThat(trimmed.truncated()).isTrue();
+        assertThat(trimmedRegistry.retrievedSources()).extracting("referenceId", "resultPosition")
+                .containsExactly(org.assertj.core.groups.Tuple.tuple("W1", 1));
+    }
+
+    @Test
+    void rollsBackNewSourcesWhenBoundResultIsRejected() {
+        RunSourceRegistry registry = new RunSourceRegistry(mapper);
+        RunSourceRegistry.Decoration decoration = registry.decorate(
+                webEnvelope("BOCHA", "https://example.com/rollback", "rollback"),
+                10_000, Long.MAX_VALUE, "call-rollback");
+
+        registry.rollback(decoration);
+
+        assertThat(registry.retrievedSources()).isEmpty();
+        assertThat(registry.citationsFor("依据 [W1]")).isEmpty();
+    }
+
     private String envelope(String kind, String provider, String item) {
         return "{\"status\":\"SUCCESS\",\"reason\":\"NONE\",\"sourceKind\":\""
                 + kind + "\",\"provider\":\"" + provider + "\",\"items\":[" + item + "]}";
@@ -125,6 +178,15 @@ class RunSourceRegistryTest {
                 + "\"title\":\"" + title + "\",\"url\":\"" + url + "\","
                 + "\"site\":\"example\",\"snippet\":\"snippet\","
                 + "\"retrievedAt\":\"" + Instant.parse("2026-08-17T00:00:00Z") + "\"}]}";
+    }
+
+    private String twoWebEnvelope() {
+        return """
+                {"status":"SUCCESS","reason":"NONE","sourceKind":"WEB","provider":"BOCHA","items":[
+                  {"title":"a","url":"https://example.com/a","site":"example","snippet":"snippet","retrievedAt":"2026-08-17T00:00:00Z","providerRank":4},
+                  {"title":"b","url":"https://example.com/b","site":"example","snippet":"snippet","retrievedAt":"2026-08-17T00:00:00Z","providerRank":7}
+                ]}
+                """;
     }
 
     private String duplicateWebEnvelope() {

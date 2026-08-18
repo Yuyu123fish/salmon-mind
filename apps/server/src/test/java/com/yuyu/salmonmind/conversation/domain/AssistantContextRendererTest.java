@@ -8,6 +8,8 @@ import com.yuyu.salmonmind.conversation.api.CitationPayload;
 import com.yuyu.salmonmind.conversation.api.LocalCitationPayload;
 import com.yuyu.salmonmind.conversation.api.LocalRetrievedSourcePayload;
 import com.yuyu.salmonmind.conversation.api.RunTraceItemPayload;
+import com.yuyu.salmonmind.conversation.api.ToolOutcomeDetailPayload;
+import com.yuyu.salmonmind.conversation.api.ToolRequestDetailPayload;
 import com.yuyu.salmonmind.conversation.api.WebCitationPayload;
 import org.junit.jupiter.api.Test;
 
@@ -26,9 +28,13 @@ class AssistantContextRendererTest {
                         RunTraceItemPayload.reasoning("不可进入模型的推理", false),
                         RunTraceItemPayload.tool(
                                 "call-1", "search", RunTraceItemPayload.ToolStatus.COMPLETED,
-                                "不可进入模型的工具摘要", null, false)));
+                                "不可进入模型的工具摘要", null,
+                                new ToolRequestDetailPayload("不可进入模型的查询", false, "week", false, 3, false),
+                                new ToolOutcomeDetailPayload("BOCHA", ToolOutcomeDetailPayload.ResultStatus.SUCCESS,
+                                        "COMPLETE", 2, 12, false, true), false)));
 
-        assertThat(AssistantContextRenderer.render(payload)).isEqualTo("普通回答");
+        assertThat(AssistantContextRenderer.render(payload)).isEqualTo("普通回答")
+                .doesNotContain("不可进入模型的查询", "BOCHA", "COMPLETE", "resultTruncated");
     }
 
     @Test

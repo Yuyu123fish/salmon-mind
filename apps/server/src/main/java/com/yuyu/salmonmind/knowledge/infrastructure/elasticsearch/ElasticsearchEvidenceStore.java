@@ -8,6 +8,8 @@ import co.elastic.clients.elasticsearch._types.Refresh;
 import co.elastic.clients.elasticsearch._types.SortOrder;
 import co.elastic.clients.elasticsearch.core.SearchResponse;
 import co.elastic.clients.elasticsearch.core.search.Hit;
+import co.elastic.clients.elasticsearch.core.DeleteByQueryResponse;
+import co.elastic.clients.elasticsearch._types.ElasticsearchException;
 import co.elastic.clients.elasticsearch.indices.IndexSettings;
 import co.elastic.clients.json.jackson.JacksonJsonpMapper;
 import co.elastic.clients.transport.rest_client.RestClientTransport;
@@ -157,6 +159,49 @@ class ElasticsearchEvidenceStore implements EvidenceIndexPort {
         } catch (Exception ex) {
             throw new KnowledgeException(KnowledgeException.Code.KNOWLEDGE_INDEX_UNAVAILABLE,
                     "Evidence 读取失败", ex);
+        }
+    }
+
+    @Override
+    public void deleteForRevisions(String indexName, Collection<UUID> revisionIds) {
+        if (revisionIds == null || revisionIds.isEmpty()) {
+            return;
+        }
+        try {
+            if (!client().indices().exists(request -> request.index(indexName)).value()) {
+                return;
+            }
+            DeleteByQueryResponse response = client().deleteByQuery(request -> request
+                    .index(indexName)
+                    .query(revisionFilter(revisionIds))
+                    // 让下一次 count 与后续检索都看到本次删除；默认 version conflict 不继续吞错。
+                    .refresh(true));
+            if (Boolean.TRUE.equals(response.timedOut())
+                    || (response.versionConflicts() != null && response.versionConflicts() > 0)
+                    || (response.failures() != null && !response.failures().isEmpty())) {
+                throw new KnowledgeException(KnowledgeException.Code.KNOWLEDGE_INDEX_UNAVAILABLE,
+                        "Evidence 删除未完成");
+            }
+            client().indices().refresh(request -> request.index(indexName));
+            long remaining = client().count(request -> request
+                    .index(indexName)
+                    .query(revisionFilter(revisionIds))).count();
+            if (remaining != 0) {
+                throw new KnowledgeException(KnowledgeException.Code.KNOWLEDGE_INDEX_UNAVAILABLE,
+                        "Evidence 删除后仍有残留");
+            }
+        } catch (KnowledgeException ex) {
+            throw ex;
+        } catch (ElasticsearchException ex) {
+            if (ex.status() == 404) {
+                // 物理索引在两次重试之间被移除，目标已经不可见，按幂等删除收束。
+                return;
+            }
+            throw new KnowledgeException(KnowledgeException.Code.KNOWLEDGE_INDEX_UNAVAILABLE,
+                    "Evidence 删除失败", ex);
+        } catch (Exception ex) {
+            throw new KnowledgeException(KnowledgeException.Code.KNOWLEDGE_INDEX_UNAVAILABLE,
+                    "Evidence 删除失败", ex);
         }
     }
 

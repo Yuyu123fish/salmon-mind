@@ -8,7 +8,9 @@ import com.yuyu.salmonmind.agent.api.AgentRunTraceItem.ToolStatus;
 import com.yuyu.salmonmind.agent.api.AgentStreamListener;
 import com.yuyu.salmonmind.agent.api.AgentToolCompleted;
 import com.yuyu.salmonmind.agent.api.AgentToolFailed;
+import com.yuyu.salmonmind.agent.api.AgentToolOutcomeDetail;
 import com.yuyu.salmonmind.agent.api.AgentToolStarted;
+import com.yuyu.salmonmind.agent.api.AgentToolRequestDetail;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -118,7 +120,7 @@ final class RunTraceCollector implements AgentStreamListener {
         if (index < 0) {
             index = addItem(AgentRunTraceItem.tool(
                     event.toolCallId(), event.toolName(), ToolStatus.RUNNING,
-                    summary.text(), null, summary.truncated()));
+                    summary.text(), null, event.requestDetail(), null, summary.truncated()));
             if (index >= 0) {
                 toolIndexes.put(event.toolCallId(), index);
             }
@@ -184,7 +186,9 @@ final class RunTraceCollector implements AgentStreamListener {
         long started = toolStartedAtNanos.getOrDefault(toolCallId, System.nanoTime());
         long durationMillis = Math.max(0L, (System.nanoTime() - started) / 1_000_000L);
         onToolFailed(new AgentToolFailed(
-                toolCallId, toolName, durationMillis,
+                toolCallId, toolName,
+                ToolLifecycleInterceptor.outcomeDetail(
+                        toolName, durationMillis, ToolLifecycleInterceptor.TOOL_EXECUTION_TIMEOUT, null, false),
                 ToolLifecycleInterceptor.TOOL_EXECUTION_TIMEOUT, "工具执行超时"));
     }
 
@@ -222,13 +226,13 @@ final class RunTraceCollector implements AgentStreamListener {
                 AgentToolCompleted completed = event.completed();
                 TextBound summary = boundSummary(completed.safeSummary(), "工具执行完成");
                 upsertTool(completed.toolCallId(), completed.toolName(), ToolStatus.COMPLETED,
-                        summary.text(), null, completed.truncated() || summary.truncated());
+                        summary.text(), null, null, completed.outcomeDetail(), summary.truncated());
                 delegate.onToolCompleted(completed);
             } else {
                 AgentToolFailed failed = event.failed();
                 TextBound summary = boundSummary(failed.safeMessage(), "工具执行失败");
                 upsertTool(failed.toolCallId(), failed.toolName(), ToolStatus.FAILED,
-                        summary.text(), failed.stableErrorCode(), summary.truncated());
+                        summary.text(), failed.stableErrorCode(), null, failed.outcomeDetail(), summary.truncated());
                 delegate.onToolFailed(failed);
             }
         }
@@ -251,11 +255,22 @@ final class RunTraceCollector implements AgentStreamListener {
             ToolStatus status,
             String summary,
             String errorCode,
+            AgentToolRequestDetail requestDetail,
+            AgentToolOutcomeDetail outcomeDetail,
             boolean truncated
     ) {
         int index = indexOfTool(toolCallId);
+        AgentToolRequestDetail preservedRequest = requestDetail;
+        String preservedQuerySummary = summary;
+        if (preservedRequest == null && index >= 0) {
+            preservedRequest = items.get(index).requestDetail();
+        }
+        if (preservedRequest != null && index >= 0) {
+            preservedQuerySummary = items.get(index).safeSummary();
+        }
         AgentRunTraceItem next = AgentRunTraceItem.tool(
-                toolCallId, toolName, status, summary, errorCode, truncated);
+                toolCallId, toolName, status, preservedQuerySummary, errorCode,
+                preservedRequest, outcomeDetail, truncated);
         if (index >= 0) {
             items.set(index, next);
             return;
@@ -301,7 +316,7 @@ final class RunTraceCollector implements AgentStreamListener {
         } else {
             items.set(index, AgentRunTraceItem.tool(
                     item.toolCallId(), item.toolName(), item.toolStatus(), item.safeSummary(),
-                    item.stableErrorCode(), true));
+                    item.stableErrorCode(), item.requestDetail(), item.outcomeDetail(), true));
         }
     }
 

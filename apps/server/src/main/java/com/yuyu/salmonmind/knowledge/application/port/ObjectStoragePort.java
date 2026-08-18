@@ -13,4 +13,10 @@ public interface ObjectStoragePort {
 
     /** 仅清理由当前提交产生的已知孤儿对象，失败必须可诊断且不得扩大范围。 */
     void deleteBestEffort(String objectKey);
+
+    /**
+     * 严格删除一个已由 PostgreSQL 冻结的 Object Key，并确认删除后不可读取；
+     * 对象不存在视为成功，连接、鉴权和版本化存储语义不明确时必须失败。
+     */
+    void deleteStrict(String objectKey);
 }

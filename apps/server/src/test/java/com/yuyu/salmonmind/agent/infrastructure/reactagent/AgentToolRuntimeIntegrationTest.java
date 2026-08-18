@@ -19,6 +19,7 @@ import com.yuyu.salmonmind.agent.api.AgentRunTraceItem;
 import com.yuyu.salmonmind.agent.api.AgentStreamListener;
 import com.yuyu.salmonmind.agent.api.AgentToolCompleted;
 import com.yuyu.salmonmind.agent.api.AgentToolFailed;
+import com.yuyu.salmonmind.agent.api.AgentToolOutcomeDetail;
 import com.yuyu.salmonmind.agent.api.AgentToolStarted;
 import com.yuyu.salmonmind.agent.api.CheckpointPolicy;
 import com.yuyu.salmonmind.model.chat.ChatModelHandle;
@@ -142,6 +143,40 @@ class AgentToolRuntimeIntegrationTest {
     }
 
     @Test
+    void projectsArgumentsBeforeStartedAndKeepsCanaryOutsideDisplayEvents() {
+        String arguments = "{\"query\":\" salmon \\t\",\"freshness\":\"week\",\"count\":3,"
+                + "\"secret\":\"canary-secret\"}";
+        var tool = new RecordingSearchTool("search_web_bocha", false, "网页结果");
+        var model = new ToolCallingChatModel("已完成网页核验。", "search_web_bocha", arguments);
+        var adapter = newAdapter(model, List.of(tool), 200_000);
+        var events = new RecordingListener();
+
+        AgentResult result = completeSync(adapter, events, new AgentRequest(
+                "request-detail-gate-thread", null, UUID.randomUUID(),
+                userList("核对网页"), CheckpointPolicy.REUSE_IF_MATCH));
+
+        assertThat(tool.calls).containsExactly(arguments);
+        assertThat(events.started).singleElement().satisfies(event -> {
+            assertThat(event.toolCallId()).isEqualTo(ToolCallingChatModel.TOOL_CALL_ID);
+            assertThat(event.safeQuerySummary()).isEqualTo("salmon");
+            assertThat(event.requestDetail()).isNotNull().satisfies(detail -> {
+                assertThat(detail.querySummary()).isEqualTo("salmon");
+                assertThat(detail.freshness()).isEqualTo("week");
+                assertThat(detail.count()).isEqualTo(3);
+                assertThat(detail.freshnessDefaulted()).isFalse();
+                assertThat(detail.countDefaulted()).isFalse();
+            });
+            assertThat(event.toString()).doesNotContain("canary-secret", arguments);
+        });
+        assertThat(result.trace()).filteredOn(item -> item.kind() == AgentRunTraceItem.Kind.TOOL)
+                .singleElement().satisfies(item -> {
+            assertThat(item.safeSummary()).isEqualTo("salmon");
+            assertThat(item.requestDetail()).isNotNull();
+            assertThat(item.toString()).doesNotContain("canary-secret", arguments);
+        });
+    }
+
+    @Test
     void toolExceptionProducesSingleFailedAndSingleTerminal() {
         var tool = new RecordingSearchTool(true);
         var model = new ToolCallingChatModel();
@@ -245,10 +280,19 @@ class AgentToolRuntimeIntegrationTest {
         assertThat(result.citations().get(0).citationNote()).contains("回答依据");
         assertThat(result.retrievedSources()).hasSize(1)
                 .singleElement()
-                .satisfies(retrieved -> assertThat(retrieved.sourceExcerpt()).isEqualTo("摘要"));
+                .satisfies(retrieved -> {
+                    assertThat(retrieved.sourceExcerpt()).isEqualTo("摘要");
+                    assertThat(retrieved.originToolCallId()).isEqualTo(ToolCallingChatModel.TOOL_CALL_ID);
+                    assertThat(retrieved.resultPosition()).isEqualTo(1);
+                    assertThat(retrieved.providerRank()).isNull();
+                });
         assertThat(events.completed).singleElement().satisfies(event -> {
             assertThat(event.provider()).isEqualTo("BOCHA");
             assertThat(event.sourceCount()).isEqualTo(1);
+            assertThat(event.outcomeDetail().resultStatus())
+                    .isEqualTo(AgentToolOutcomeDetail.ResultStatus.SUCCESS);
+            assertThat(event.outcomeDetail().stableReasonCode()).isEqualTo("NONE");
+            assertThat(event.outcomeDetail().resultTruncated()).isFalse();
         });
     }
 
@@ -414,6 +458,43 @@ class AgentToolRuntimeIntegrationTest {
     }
 
     @Test
+    void matchesRequestDetailsToConcurrentToolCallIdsAndCallbackArguments() throws Exception {
+        String leftArguments = "{\"query\":\"left query\",\"count\":2}";
+        String rightArguments = "{\"query\":\"right query\",\"freshness\":\"day\"}";
+        var tools = new ParallelGateTool("search_web_bocha", "search_web_searchapi");
+        var model = new ParallelCallingChatModel(
+                "search_web_bocha", "search_web_searchapi", leftArguments, rightArguments);
+        var adapter = newAdapter(model, List.of(tools.left, tools.right), 200_000);
+        var events = new RecordingListener();
+        AgentResult[] result = new AgentResult[1];
+
+        Thread run = new Thread(() -> result[0] = completeSync(adapter, events, new AgentRequest(
+                "parallel-request-detail-thread", null, UUID.randomUUID(), userList("并行核对"),
+                CheckpointPolicy.REUSE_IF_MATCH)));
+        run.start();
+        assertThat(tools.entered.await(5, TimeUnit.SECONDS)).isTrue();
+        tools.allowRight.countDown();
+        assertThat(tools.right.returned.await(5, TimeUnit.SECONDS)).isTrue();
+        tools.allowLeft.countDown();
+        run.join(5_000);
+
+        assertThat(run.isAlive()).isFalse();
+        assertThat(result[0]).isNotNull();
+        assertThat(tools.left.arguments).containsExactly(leftArguments);
+        assertThat(tools.right.arguments).containsExactly(rightArguments);
+        assertThat(events.started).extracting(AgentToolStarted::toolCallId)
+                .containsExactlyInAnyOrder("parallel-call-left", "parallel-call-right");
+        assertThat(events.started).filteredOn(event -> event.toolCallId().equals("parallel-call-left"))
+                .singleElement().satisfies(event -> assertThat(event.requestDetail()).isNotNull()
+                        .extracting("querySummary", "count", "countDefaulted")
+                        .containsExactly("left query", 2, false));
+        assertThat(events.started).filteredOn(event -> event.toolCallId().equals("parallel-call-right"))
+                .singleElement().satisfies(event -> assertThat(event.requestDetail()).isNotNull()
+                        .extracting("querySummary", "freshness", "freshnessDefaulted")
+                        .containsExactly("right query", "day", false));
+    }
+
+    @Test
     void frameworkToolTimeoutProducesOneStableFailureAndSuppressesLateCompletion() throws Exception {
         var tool = new BlockingTool();
         var model = new SingleBlockingToolModel();
@@ -557,12 +638,23 @@ class AgentToolRuntimeIntegrationTest {
         final CountDownLatch allowLeft = new CountDownLatch(1);
         final CountDownLatch allowRight = new CountDownLatch(1);
         final List<String> completionOrder = new CopyOnWriteArrayList<>();
-        final GateTool left = new GateTool("parallel_left", allowLeft);
-        final GateTool right = new GateTool("parallel_right", allowRight);
+        final GateTool left;
+        final GateTool right;
+
+        ParallelGateTool() {
+            this("parallel_left", "parallel_right");
+        }
+
+        ParallelGateTool(String leftName, String rightName) {
+            left = new GateTool(leftName, allowLeft);
+            right = new GateTool(rightName, allowRight);
+        }
 
         private final class GateTool implements ParallelSafeToolCallback {
             private final String name;
             private final CountDownLatch permit;
+            final CountDownLatch returned = new CountDownLatch(1);
+            final List<String> arguments = new CopyOnWriteArrayList<>();
 
             private GateTool(String name, CountDownLatch permit) {
                 this.name = name;
@@ -578,6 +670,7 @@ class AgentToolRuntimeIntegrationTest {
 
             @Override
             public String call(String input) {
+                arguments.add(input);
                 entered.countDown();
                 try {
                     if (!permit.await(5, TimeUnit.SECONDS)) {
@@ -588,7 +681,11 @@ class AgentToolRuntimeIntegrationTest {
                     throw new IllegalStateException("并行 Gate 被中断", ex);
                 }
                 completionOrder.add(name);
-                return name + " result";
+                try {
+                    return name + " result";
+                } finally {
+                    returned.countDown();
+                }
             }
         }
     }
@@ -648,6 +745,23 @@ class AgentToolRuntimeIntegrationTest {
 
     private static final class ParallelCallingChatModel implements ChatModel {
         final List<List<Message>> calls = new CopyOnWriteArrayList<>();
+        private final String leftName;
+        private final String rightName;
+        private final String leftArguments;
+        private final String rightArguments;
+
+        ParallelCallingChatModel() {
+            this("parallel_left", "parallel_right", "{}", "{}");
+        }
+
+        ParallelCallingChatModel(
+                String leftName, String rightName, String leftArguments, String rightArguments
+        ) {
+            this.leftName = leftName;
+            this.rightName = rightName;
+            this.leftArguments = leftArguments;
+            this.rightArguments = rightArguments;
+        }
 
         @Override
         public ChatResponse call(Prompt prompt) {
@@ -658,9 +772,9 @@ class AgentToolRuntimeIntegrationTest {
                 AssistantMessage toolCalls = AssistantMessage.builder()
                         .toolCalls(List.of(
                                 new AssistantMessage.ToolCall("parallel-call-left", "function",
-                                        "parallel_left", "{}"),
+                                        leftName, leftArguments),
                                 new AssistantMessage.ToolCall("parallel-call-right", "function",
-                                        "parallel_right", "{}")))
+                                        rightName, rightArguments)))
                         .build();
                 return new ChatResponse(List.of(new Generation(toolCalls)));
             }
@@ -876,18 +990,24 @@ class AgentToolRuntimeIntegrationTest {
 
         private final String finalAnswer;
         private final String toolName;
+        private final String toolArguments;
 
         ToolCallingChatModel() {
-            this(FINAL_ANSWER);
+            this(FINAL_ANSWER, RecordingSearchTool.NAME, "{\"query\":\"salmon\"}");
         }
 
         ToolCallingChatModel(String finalAnswer) {
-            this(finalAnswer, RecordingSearchTool.NAME);
+            this(finalAnswer, RecordingSearchTool.NAME, "{\"query\":\"salmon\"}");
         }
 
         ToolCallingChatModel(String finalAnswer, String toolName) {
+            this(finalAnswer, toolName, "{\"query\":\"salmon\"}");
+        }
+
+        ToolCallingChatModel(String finalAnswer, String toolName, String toolArguments) {
             this.finalAnswer = finalAnswer;
             this.toolName = toolName;
+            this.toolArguments = toolArguments;
         }
 
         private final List<List<Message>> calls = new CopyOnWriteArrayList<>();
@@ -904,7 +1024,7 @@ class AgentToolRuntimeIntegrationTest {
             if (!sawToolResult) {
                 var toolCallMessage = AssistantMessage.builder()
                         .toolCalls(List.of(new AssistantMessage.ToolCall(
-                                TOOL_CALL_ID, "function", toolName, "{\"query\":\"salmon\"}")))
+                                TOOL_CALL_ID, "function", toolName, toolArguments)))
                         .properties(Map.of("reasoningContent", "需要先查询资料。"))
                         .build();
                 return new ChatResponse(List.of(new Generation(toolCallMessage)));

@@ -19,4 +19,12 @@ public interface AgentStreamSession {
     default boolean requiresProjectionRebuild() {
         return false;
     }
+
+    /**
+     * 返回当前 Agent 的固定输入与工具消息预算；实现不得在读取该值时初始化外部依赖。
+     * 没有工具的测试替身返回 {@link AgentContextBudget#ZERO}，保持旧的 usage 锚点语义。
+     */
+    default AgentContextBudget contextBudget() {
+        return AgentContextBudget.ZERO;
+    }
 }

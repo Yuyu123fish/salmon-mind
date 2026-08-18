@@ -31,6 +31,11 @@ salmon:
       gl: cn
       hl: zh-cn
       safe: active
+  agent:
+    # 可选：一次主调用内所有工具结果的累计 token 上限；默认 32768，修改后重启后端生效
+    max-tool-result-tokens-per-run: 32768
+    # 可选：一次 Agent Loop 的模型调用硬上限；默认 32，修改后重启后端生效
+    max-steps: 32
   redis:
     # 本地 Redis 无密码时留空
     password:

@@ -1,6 +1,6 @@
 # Feature 003 Stage 03 Plan：本地混合检索、精排与 Agent Tool
 
-Status: Implemented
+Status: Accepted
 
 ## 1. Stage 目标
 

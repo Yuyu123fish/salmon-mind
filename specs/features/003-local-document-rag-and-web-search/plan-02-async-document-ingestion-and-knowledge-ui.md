@@ -1,6 +1,6 @@
 # Feature 003 Stage 02 Plan：异步文档入库与 Knowledge 可视化
 
-Status: Implemented
+Status: Accepted
 
 ## 1. Stage 目标
 

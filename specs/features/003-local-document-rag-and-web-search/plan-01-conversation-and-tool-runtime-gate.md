@@ -1,6 +1,6 @@
 # Feature 003 Stage 01 Plan：Conversation 一致性修复与 Tool Runtime 硬 Gate
 
-Status: Draft
+Status: Accepted
 
 ## 1. Stage 目标
 

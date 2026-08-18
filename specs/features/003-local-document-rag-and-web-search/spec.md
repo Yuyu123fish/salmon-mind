@@ -1,6 +1,6 @@
-# Feature 003：本地文档知识库、混合 RAG 与网页搜索工具
+# Feature 003：本地文档知识库、混合 RAG 与双网页搜索工具
 
-Status: Specified
+Status: Accepted
 
 ## Problem Statement
 
@@ -20,7 +20,7 @@ Conversation 侧还有两个需要在引入工具前收口的问题：当前“�
 - 原件写入 RustFS；PostgreSQL 保存 Source、Revision、异步处理状态和可修复索引元数据；Elasticsearch 保存可重建的文本切片、BM25 字段和 2560 维向量。Elasticsearch 与 Redis 都不是原始文档权威。
 - 上传请求只完成校验、原件与元数据落地、Redis Stream 入队，随后返回异步状态；Server 内 Spring 管理的有界后台线程以 Consumer Group 消费并执行 Apache Tika 解析、结构化切片、批量嵌入和索引发布。
 - 本地检索使用 Elasticsearch BM25 与向量召回，应用层采用 RRF（Reciprocal Rank Fusion）融合，再统一调用硅基流动 `Qwen/Qwen3-Reranker-4B` 精排。嵌入统一调用硅基流动 `Qwen/Qwen3-Embedding-4B`，输出维数固定为 2560。
-- Agent 只注册两个只读工具：`search_local_knowledge` 与 `search_web`。网页搜索使用博查原始 Web Search API；网页结果只服务当前 Run，不抓取全文、不写入知识库。
+- Agent 只注册三个只读工具：`search_local_knowledge`、`search_web_bocha` 与 `search_web_searchapi`。两个网页工具分别使用博查原始 Web Search API 与 SearchApi.io Google Search API；网页结果只服务当前 Run，不抓取全文、不写入知识库。
 - Agent 可以根据问题自主选择本地知识库、网页搜索、两者组合或完全不调用工具。没有检索依据时仍允许使用模型自身知识回答，但不得把模型知识伪装成本地文档依据或实时网页验证结果。
 - 最终 Assistant Entry 持久化回答文本和经过校验的结构化引用；大块原始工具结果只在当前 Run 中存在。工具启用后的主 Agent 每轮都从 JSONL Active Path 重建模型上下文，避免 Redis Checkpoint 保存了 JSONL 无法恢复的工具中间消息。
 - “新对话”先进入前端未持久化草稿状态，只有用户首次发送非空消息时才依次创建 Conversation 并发送；Run 的数据库事务只包含元数据一致性更新，所有 SSE 事件在事务提交后发送。
@@ -57,7 +57,7 @@ Conversation 侧还有两个需要在引入工具前收口的问题：当前“�
 
 ### Web Search Result
 
-博查在一次 Agent Run 中返回的外部搜索观察，包含标题、URL、站点、摘要、可能的发布时间和本次检索时间。它不是 Knowledge Source，也不会自动转化为 Source Revision 或 Evidence。
+博查或 SearchApi.io 在一次 Agent Run 中返回的外部搜索观察，包含提供方、标题、URL、站点、摘要、可能的发布时间和本次检索时间。它不是 Knowledge Source，也不会自动转化为 Source Revision 或 Evidence。
 
 ### Model Knowledge
 
@@ -65,7 +65,7 @@ Chat 模型自身已有知识。没有本地或网页结果时允许据此回答
 
 ### Citation
 
-最终 Assistant Entry 中与回答一起持久化的结构化来源引用。Local Citation 指向 Source Revision、Evidence 与位置；Web Citation 保存标题、URL、站点、发布时间和检索时间。只有能映射到本 Run 实际工具结果的引用才能进入结构化引用列表。
+最终 Assistant Entry 中与回答一起持久化的结构化来源引用。Local Citation 指向 Source Revision、Evidence 与位置；Web Citation 保存提供方、标题、URL、站点、发布时间和检索时间。只有能映射到本 Run 实际工具结果的引用才能进入结构化引用列表。
 
 ### Run-local Tool Result
 
@@ -83,13 +83,13 @@ Chat 模型自身已有知识。没有本地或网页结果时允许据此回答
 8. 作为用户，我希望用一个查询测试知识库召回，并查看 BM25、向量、RRF 和精排后的顺序。
 9. 作为用户，我希望只有处理完成且处于当前有效索引中的文档参与问答。
 10. 作为用户，我希望询问“根据我的文档”时，Agent 自动检索本地知识库并引用具体文档位置。
-11. 作为用户，我希望询问实时新闻、近期版本或当前外部事实时，Agent 可以自动调用博查网页搜索。
+11. 作为用户，我希望询问实时新闻、近期版本或当前外部事实时，Agent 可以自动调用博查或 SearchApi.io 网页搜索。
 12. 作为用户，我希望一个问题同时涉及我的文档和外部最新信息时，Agent 可以组合两类来源。
 13. 作为用户，我希望普通稳定知识问题无需强制搜索，避免不必要的延迟和外部调用。
 14. 作为用户，我希望本地检索没有足够内容时，Agent 仍可用模型已有知识补充回答。
 15. 作为用户，我希望模型知识、本地文档引用和网页引用具有清楚边界，不把无来源内容包装成 Evidence。
 16. 作为用户，我明确要求“根据知识库”但未命中时，希望系统说明知识库未提供依据，并仍可给出标明边界的一般性回答。
-17. 作为用户，我希望网页搜索失败时对话仍可继续，并能知道实时信息没有被验证。
+17. 作为用户，我希望一个网页搜索提供方失败时对话仍可继续；必要时 Agent 可以尝试另一个提供方，并清楚说明哪些实时信息尚未验证。
 18. 作为用户，我希望网页搜索结果带有可点击 URL 和检索时间，而不是无法追溯的摘要。
 19. 作为用户，我希望网页搜索内容不会在我不知情的情况下沉淀到本地知识库。
 20. 作为用户，我希望可以看到 Agent 正在检索本地知识或网页，但不会在聊天流中收到大段内部工具 JSON。
@@ -100,7 +100,7 @@ Chat 模型自身已有知识。没有本地或网页结果时允许据此回答
 25. 作为用户，我希望客户端在成功回答提交后断流时，刷新仍能看到成功结果，而不会把成功 Run 变成失败。
 26. 作为维护者，我希望 Redis Stream 承担高频队列读写，PostgreSQL 只保存少量业务状态和恢复指针。
 27. 作为维护者，我希望消费者至少一次投递下重复执行仍然幂等，不产生重复 Evidence 或混合索引。
-28. 作为维护者，我希望模型、Redis、RustFS、Elasticsearch或博查未配置时应用仍可启动，只有使用对应能力时出现稳定错误。
+28. 作为维护者，我希望模型、Redis、RustFS、Elasticsearch、博查或 SearchApi.io 未配置时应用仍可启动，只有使用对应能力时出现稳定错误。
 
 ## Behavior and Failure Semantics
 
@@ -195,19 +195,21 @@ RRF(d) = Σ 1 / (60 + rank_i(d))
 
 ### Agent 工具与触发策略
 
-本 Feature 只增加以下两个只读工具，不建立通用 Tool Marketplace，也不开放写文件、Shell、任意 HTTP 请求或网页全文抓取能力：
+本 Feature 只增加以下三个只读工具，不建立通用 Tool Marketplace，也不开放写文件、Shell、任意 HTTP 请求或网页全文抓取能力：
 
 - `search_local_knowledge(query)`：调用 Knowledge 公开检索接口，返回带稳定引用 ID 的 Local Evidence。
-- `search_web(query, freshness?, count?)`：调用 Web Search 公开接口，返回带稳定引用 ID 的 Web Search Result。
+- `search_web_bocha(query, freshness?, count?)`：通过 Web Search 公开接口调用博查，返回带稳定引用 ID 的 Web Search Result。
+- `search_web_searchapi(query, freshness?, count?)`：通过同一公开接口调用 SearchApi.io Google Search，返回带稳定引用 ID 的 Web Search Result。
 
 Agent 在系统策略约束下自主选择：
 
 - 用户询问自己的文档、笔记内容或明确要求“根据知识库”时，优先调用本地工具。
-- 用户明确要求联网、问题涉及新闻、价格、版本、政策、人物职位或其他时效事实时，调用博查。
-- 本地依据不足且外部信息能实质补全时，可以继续调用博查。
-- 问题同时要求本地材料与外部现状时，可以顺序调用两个工具。
+- 用户明确要求联网、问题涉及新闻、价格、版本、政策、人物职位或其他时效事实时，调用一个网页工具；用户指定提供方时遵从指定。
+- 中文或中国互联网信息默认优先博查；明确要求 Google、国际网页或英文检索时默认优先 SearchApi.io。首个提供方为空或不可用时，可以在预算允许时尝试另一个。
+- 本地依据不足且外部信息能实质补全时，可以继续调用一个网页工具。
+- 问题同时要求本地材料与外部现状时，可以顺序调用本地工具和一个网页工具；只有用户要求交叉核验、首个提供方不足或高时效事实确需第二来源时才调用两个网页工具，不为每个问题重复付费搜索。
 - 稳定的一般知识、创作或无需来源的问题可以不调用工具，直接使用模型知识。
-- 用户明确要求不联网时不得调用博查；用户明确要求只根据知识库时不得用网页结果冒充本地依据，但仍可在清楚分隔后给出模型一般知识。
+- 用户明确要求不联网时不得调用任一网页工具；用户明确要求只根据知识库时不得用网页结果冒充本地依据，但仍可在清楚分隔后给出模型一般知识。
 
 默认每个 Run 最多 4 次工具调用，首版顺序执行。达到次数、时间或上下文预算后，工具返回有界错误，Agent 应基于已有内容完成回答；不得进入无限搜索循环。
 
@@ -216,24 +218,26 @@ Agent 在系统策略约束下自主选择：
 - 本地文档是用户材料的来源权威；网页结果用于当前外部信息；模型知识用于一般补充。三者可以共同出现在一个答案中，但引用和措辞必须可区分。
 - 没有任何工具结果时仍允许模型回答，不显示虚假 Citation，也不使用“根据你的知识库”“联网查到”等表述。
 - 用户明确要求根据知识库而本地无命中时，回答先说明本地知识库没有提供依据，再视问题给出明确标为一般知识的补充。
-- 时效问题的博查调用失败时，可以提供不依赖实时性的背景知识，但必须说明当前状态未经联网验证。
+- 时效问题的网页调用失败且没有其他网页结果时，可以提供不依赖实时性的背景知识，但必须说明当前状态未经联网验证。
 - Local Evidence 与 Web Search Result 都是不受信任的数据内容，只能作为资料，不能覆盖 system prompt、工具权限、数据边界或用户意图；文档或网页中的提示注入文本不得被当作指令执行。
 
-### 博查 Web Search
+### 双提供方 Web Search
 
-- 使用博查原始 `POST https://api.bochaai.com/v1/web-search`，而不是 AI Search 生成式答案，使 SalmonMind Agent 保持最终回答和来源组合权。
-- 请求默认 `summary=true`、`count=5`，允许 Agent 指定 freshness；`count` 上限为 10，即使提供方支持更多也不放大当前上下文。
-- 工具结果只保留标题、URL、站点、摘要、可能的发布时间、检索时间和提供方追踪 ID；不得把网页摘要当作已经读取网页全文。
+- 博查工具使用原始 `POST https://api.bochaai.com/v1/web-search`，而不是 AI Search 生成式答案，使 SalmonMind Agent 保持最终回答和来源组合权；请求固定 `summary=true`。
+- SearchApi.io 工具使用 `GET https://www.searchapi.io/api/v1/search?engine=google`，首版只读取 `organic_results`，不把 Answer Box、AI Overview、广告、购物或其他垂直卡片混入普通网页来源。API Key 使用 `Authorization: Bearer` Header，不放进查询 URL。
+- 两个工具对 Agent 公开相同的 `query`、`freshness` 与 `count` 语义。默认返回 5 条，上限 10 条；博查把数量发送给上游，SearchApi.io 不发送已经失效的 `num` 参数，只在固定第一页结果中本地截断。
+- `freshness` 使用平台拥有的不限、一天、一周、一月、一年枚举，由 Adapter 分别映射为博查 `noLimit/oneDay/oneWeek/oneMonth/oneYear` 与 SearchApi.io `time_period`；不能把某一提供方的原始枚举泄漏进公共接口。
+- 工具结果统一保留提供方、标题、合法 HTTP(S) URL、站点、摘要、提供方给出的可选发布时间、检索时间和非敏感追踪 ID；不得把网页摘要当作已经读取网页全文，也不得把相对日期推断成伪造的精确时间。
 - 本 Feature 不跟随 URL、不下载页面、不绕过登录或 robots 约束，也不把结果写入 RustFS、PostgreSQL Knowledge 表或 Elasticsearch。
-- Bocha API Key 延迟校验。未配置、超时、限流、鉴权失败和提供方错误都映射为稳定工具失败，让 Agent 决定使用已有结果或 Model Knowledge；应用和普通聊天仍可启动。
-- 搜索查询会发送到外部服务，配置说明和 Knowledge/聊天界面需要提示这一隐私边界；日志不得记录 API Key。
+- 两个 API Key 都延迟校验。未配置、超时、限流、鉴权失败、非法响应和提供方错误映射为带 provider 的稳定工具失败；不在 HTTP Adapter 内做隐藏重试或自动切换，Agent 才能在统一工具预算中决定是否调用另一个提供方。
+- 搜索查询会发送到所选外部服务。配置说明和聊天界面需要提示这一隐私边界；Agent 生成查询时应避免无必要地带出本地文档正文或个人信息，日志不得记录 API Key、完整鉴权 URL 或未经裁剪的搜索内容。
 
 ### Tool、引用与多轮持久化
 
-- Tool result 使用当前 Run 内稳定短标识，例如 `L1`、`L2`、`W1`；模型只能引用当前实际存在的标识。
+- Tool result 使用当前 Run 内稳定短标识，例如 `L1`、`L2`、`W1`；两个网页提供方共享 Run 内单调递增的 `W` 序列但每条结果保留 provider，模型只能引用当前实际存在的标识。
 - Server 从最终回答中提取引用标识并与本 Run 工具结果核对，只把合法引用对应的最小结构化 Citation 写入 Assistant payload。未知标识不生成可点击来源。
 - Assistant 正文、模型信息、usage 和结构化 Citation 进入 JSONL；完整 Tool schema、tool call、tool result、RRF 候选明细和网页摘要集合不进入长期 JSONL。
-- 前端把结构化 Citation 渲染为来源卡片；Local Citation 展示文档名和位置，Web Citation 展示标题、站点、URL、发布时间和检索时间。本地绝对路径、RustFS Object Key、Redis Key 和提供方凭据不得暴露。
+- 前端把结构化 Citation 渲染为来源卡片；Local Citation 展示文档名和位置，Web Citation 展示提供方、标题、站点、URL、发布时间和检索时间。本地绝对路径、RustFS Object Key、Redis Key 和提供方凭据不得暴露。
 - 后续轮次从之前的 Assistant 正文和引用摘要理解对话；如果需要原始资料，Agent 重新调用工具。
 - 由于 RedisSaver 可能保存当前 Run 的工具中间消息，而 JSONL 不保存这些消息，工具启用后的每次主 Agent Run 都必须先释放旧 Checkpoint，并从 JSONL Active Path 重建。Redis 不得成为比 JSONL 更丰富且无法恢复的长期上下文权威。
 - 工具定义、工具参数、当前 Run 的 tool result、system prompt、历史投影和预计回答输出全部计入工作上下文预算。每个结果和每 Run 总结果均设置字符/token 上限，超出时按完整 Evidence/Result 边界裁剪，不切断引用身份。
@@ -299,6 +303,9 @@ Knowledge 页面至少提供：
 - `RERANK_MODEL_NOT_CONFIGURED`
 - `RERANK_FAILED`
 - `WEB_SEARCH_NOT_CONFIGURED`
+- `WEB_SEARCH_AUTH_FAILED`
+- `WEB_SEARCH_RATE_LIMITED`
+- `WEB_SEARCH_TIMEOUT`
 - `WEB_SEARCH_FAILED`
 - `TOOL_BUDGET_EXCEEDED`
 
@@ -326,9 +333,9 @@ flowchart LR
 ```
 
 - `knowledge::api` 提供上传、列表、详情、重试和诊断检索用例；`knowledge::retrieval` 只公开 Agent 需要的有界检索合同。Tika、RustFS、Elasticsearch、Redis Stream 和数据库 Adapter 留在 Knowledge 内部。
-- `websearch::api` 只公开结构化搜索能力；博查 HTTP、鉴权、限流和响应映射留在 WebSearch 内部。
+- `websearch::api` 只公开提供方枚举和统一结构化搜索能力；博查/SearchApi.io 的 HTTP、鉴权、限流和响应映射留在 WebSearch 内部。
 - `agent` 拥有 Spring AI ToolCallback Adapter 和工具选择系统策略，依赖 Knowledge/WebSearch 的小接口；Knowledge 与 WebSearch 不依赖 Agent 或 Conversation。
-- `conversation` 仍只编排 `agent::api`，不直接调用 Elasticsearch、Embedding、Rerank 或博查。
+- `conversation` 仍只编排 `agent::api`，不直接调用 Elasticsearch、Embedding、Rerank、博查或 SearchApi.io。
 - `model` 增加独立的 `embedding` 与 `rerank` Named Interface 及硅基流动 Adapter；业务模块不直接拼接提供方 HTTP 请求。
 - Redis 客户端与连接配置形成 `persistence::redis` 聚焦技术能力，同时服务 Agent Checkpoint 和 Knowledge Stream；两个消费者使用独立命名空间，业务消息语义仍留在各自模块。
 - 不创建根级 `tools`、`common`、通用队列框架或空的未来来源模块。
@@ -356,7 +363,7 @@ Knowledge HTTP 根资源使用 `/api/knowledge/documents`，至少提供：
 ### 配置与凭据
 
 - Embedding/Rerank 使用独立模型名和超时配置，但可以共享硅基流动 base URL 与 API Key。默认模型分别为 `Qwen/Qwen3-Embedding-4B`、`Qwen/Qwen3-Reranker-4B`，Embedding 维数固定 2560。
-- Bocha 使用独立 base URL、API Key、连接/读取超时和结果上限。
+- 博查与 SearchApi.io 分别使用独立 base URL、API Key、连接/读取超时；SearchApi.io 的 Google `gl`、`hl` 和 SafeSearch 由 Server 配置固定，不由模型任意注入。
 - API Key 只来自不入库的开发配置或环境变量，响应、SSE、日志和前端构建产物不得泄露。
 - 外部能力全部延迟初始化；配置缺失不会阻止 Spring Context 启动。
 
@@ -366,7 +373,7 @@ Knowledge HTTP 根资源使用 `/api/knowledge/documents`，至少提供：
 
 后续 Plan 的第一个实施 Stage 必须用最小真实框架测试证明：
 
-- 两个 ToolCallback 可以被模型调用并把结果送回同一次 Agent Loop。
+- 三个 ToolCallback 可以按策略被模型调用并把结果送回同一次 Agent Loop。
 - 工具事件能被稳定观察并映射为平台事件，不依赖脆弱的字符串解析。
 - 工具失败不会造成双终态，最终 usage/finish reason 仍可获取。
 - 每轮释放并从 JSONL 投影重建 Checkpoint 后，不携带上一轮 Run-local tool result。
@@ -380,7 +387,7 @@ Knowledge HTTP 根资源使用 `/api/knowledge/documents`，至少提供：
 
 - Knowledge 主要通过 `knowledge::api` 与 HTTP 测试上传、状态、恢复、检索和可视化所需结果，不分别为薄 Controller、Mapper 和 DTO 建大量重复测试。
 - 异步处理使用真实 Redis、PostgreSQL、RustFS 兼容对象存储和 Elasticsearch 的聚焦集成测试，模型端使用可控的 Embedding/Rerank Stub；至少一次真实 SiliconFlow Smoke Test 需单独取得开发者授权。
-- Tool Runtime 通过 `agent::api` 使用确定性 ToolCallback 与可控 ChatModel 验证调用循环、事件和 Checkpoint，不把博查或付费模型混入确定性测试。
+- Tool Runtime 通过 `agent::api` 使用确定性 ToolCallback 与可控 ChatModel 验证调用循环、事件和 Checkpoint，不把博查、SearchApi.io 或付费模型混入确定性测试。
 - Conversation 继续通过现有模块/HTTP 测试验证持久化与 SSE 顺序，只补工具事件、成功后断流和懒创建新对话的新增行为。
 - 前端用现有构建与少量高价值交互测试覆盖 Knowledge 页面、草稿态新对话、状态刷新和引用渲染；不为纯样式堆叠测试。
 
@@ -392,7 +399,7 @@ Knowledge HTTP 根资源使用 `/api/knowledge/documents`，至少提供：
 - 某 Revision 全量可见后才进入 READY；部分 Elasticsearch 写入不会参与检索；重复消费不产生重复 Evidence。
 - 2560 维映射、文档/查询嵌入维数一致和模型/维数变化时 Generation 隔离。
 - BM25 与向量候选、RRF 公式和去重、RRF Top 20、Qwen Rerank Top 5，以及向量/精排失败时的显式降级。
-- Agent 对本地问题、时效问题、组合问题和普通问题分别选择正确工具或不调用工具；用户禁止联网时不调用博查。
+- Agent 对本地问题、时效问题、指定提供方、首提供方失败、组合问题和普通问题分别选择正确工具或不调用工具；用户禁止联网时不调用任何网页工具。
 - 本地/网页均无结果时仍能使用 Model Knowledge 回答，且不会生成虚假 Citation；时效搜索失败会说明未验证。
 - Tool result 引用校验、结构化 Citation 持久化、非法引用不生成来源卡片、网页结果不进入 Knowledge 存储。
 - 每轮从 JSONL 重建后不含上一轮原始 tool result；Compaction 计量包括 Tool schema 和当前结果。
@@ -401,8 +408,8 @@ Knowledge HTTP 根资源使用 `/api/knowledge/documents`，至少提供：
 
 ### 真实验证边界
 
-- 自动化测试不得调用付费的 SiliconFlow 或博查 API。
-- 真实 SiliconFlow Embedding/Rerank、博查搜索、真实文档集合召回质量和浏览器端多轮 RAG Smoke Test 在实现完成后由实际执行 Agent先征得开发者允许，再运行并报告费用/凭据边界。
+- 自动化测试不得调用付费的 SiliconFlow、博查或 SearchApi.io API。
+- 真实 SiliconFlow Embedding/Rerank、博查/SearchApi.io 搜索、真实文档集合召回质量和浏览器端多轮 RAG Smoke Test 在实现完成后由实际执行 Agent先征得开发者允许，再运行并报告费用/凭据边界。
 - 不为了测试删除开发者已有 Docker 容器或数据卷；需要隔离时使用独立测试容器、索引前缀、Bucket 和 Redis Key 前缀。
 - 同一代码版本已有可信报告的测试不得由接手 Agent重复运行，只补代码变化或验收证据缺口。
 
@@ -434,22 +441,23 @@ Knowledge HTTP 根资源使用 `/api/knowledge/documents`，至少提供：
 9. 诊断检索能展示 BM25 Top 40、向量 Top 40、`k=60` 的 RRF 融合、RRF Top 20 和 `Qwen/Qwen3-Reranker-4B` 最终 Top 5 的可追溯结果。
 10. 向量或精排服务失败时检索显式标记降级；不得把 BM25-only 或 RRF-only 结果描述为完整混合精排。
 11. Agent 能根据文档问题调用 `search_local_knowledge`，答案引用真实 Source Revision/Evidence/位置。
-12. Agent 能根据时效问题调用博查 `search_web`，答案引用真实标题、URL 和检索时间；网页结果不出现在 Knowledge Source 或索引中。
+12. Agent 能根据时效问题调用 `search_web_bocha` 或 `search_web_searchapi`，可在首提供方为空/失败时有界尝试另一个；答案引用真实 provider、标题、URL 和检索时间，网页结果不出现在 Knowledge Source 或索引中。
 13. 普通知识问题可以不调用工具；本地和网页都无依据时仍可用 Model Knowledge 回答，并且不伪造来源。
 14. 用户要求只根据知识库但未命中时，答案明确区分“知识库未提供依据”和后续一般知识；实时搜索失败时不声称已联网验证。
 15. 工具事件只展示状态和数量，不把大段结果写进 SSE；最终合法 Citation 随 Assistant Entry 持久化并在刷新后可见。
 16. 下一轮开始前从 JSONL Active Path 重建 Agent Context，不携带无法由 JSONL 恢复的上一轮原始 tool result；需要资料时可重新检索。
 17. Tool schema、当前 tool result、历史和输出预留共同受上下文预算约束，超过预算时有界裁剪或结束工具调用，不出现无限循环。
 18. Assistant Entry 与 SUCCEEDED Run 提交后发生 SSE 断流，刷新仍显示成功回答；持久化成功状态不得被传输异常降级为 FAILED。
-19. 模型、Redis、RustFS、Elasticsearch或博查缺少配置时应用仍能启动，并只在相应能力被使用时返回稳定错误。
-20. Spring Modulith 测试确认新增模块和 Named Interface 符合依赖图，没有 Conversation 直连 Knowledge/Bocha、Knowledge 反向依赖 Agent 或根级通用 tools 模块。
+19. 模型、Redis、RustFS、Elasticsearch、博查或 SearchApi.io 缺少配置时应用仍能启动，并只在相应能力被使用时返回稳定错误。
+20. Spring Modulith 测试确认新增模块和 Named Interface 符合依赖图，没有 Conversation 直连 Knowledge/博查/SearchApi.io、Knowledge 反向依赖 Agent 或根级通用 tools 模块。
 21. 开发者验收时能够获得并理解上传、Redis Stream、后台处理、Tika、RustFS/PostgreSQL/Elasticsearch 权威边界、混合召回、Agent Tool、引用、Checkpoint 重建和 SSE 失败路径的完整说明。
 
 ## Further Notes
 
-- 后续 Plan 应拆成五个可独立验收的 Stage：① Conversation 懒创建与 SSE/Tool Runtime 硬 Gate；② Redis Stream + Tika 异步入库与 Knowledge UI；③ 本地混合召回、精排和本地工具；④ 博查工具、网页引用、失败与隐私；⑤ 多来源多轮 Agent、上下文、Checkpoint 和端到端收口。每个 Stage 仍需单独确认 Plan 和实施授权。
+- 本 Feature 已按五个可独立验收的 Stage 完成：① Conversation 懒创建与 SSE/Tool Runtime 硬 Gate；② Redis Stream + Tika 异步入库与 Knowledge UI；③ 本地混合召回、精排和本地工具；④ 博查 + SearchApi.io 双网页工具、可验证引用、失败与隐私；⑤ 多来源多轮 Agent、上下文、Checkpoint 和端到端收口。
 - Apache Tika 3.3.2 官方文档：<https://tika.apache.org/3.3.2/>；格式支持：<https://tika.apache.org/3.3.2/formats.html>。
 - 硅基流动 Embedding API：<https://docs.siliconflow.cn/cn/api-reference/embeddings/create-embeddings>；Rerank API：<https://docs.siliconflow.cn/cn/api-reference/rerank/create-rerank>。官方文档确认 Qwen3-Embedding-4B 支持 2560 维、Qwen3-Reranker-4B 支持 rerank 请求。
 - 博查开放平台：<https://open.bochaai.com/>。本 Feature 使用其原始 Web Search API，不使用 AI Search 代替 SalmonMind Agent 生成答案。
+- SearchApi.io Google Search API：<https://www.searchapi.io/docs/google>。本 Feature 固定 `engine=google` 并只消费普通自然搜索结果；其 `num` 参数已由 Google 侧淘汰，首版不发送该参数。
 - Elasticsearch `dense_vector` 官方限制为最多 4096 维，理论上覆盖 2560 维；仍必须在仓库固定的 Elasticsearch 8.13 镜像上完成真实 mapping 与 kNN Gate：<https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/dense-vector/>。
-- 本文件已由开发者确认并进入 `Specified`。`Specified` 不代表允许生成 Plan、修改业务代码、调用付费外部 API、提交或推送。
+- 本 Feature 已由开发者完成最终验收并进入 `Accepted`。真实付费外部 API 调用、提交与推送仍分别遵守独立授权边界。

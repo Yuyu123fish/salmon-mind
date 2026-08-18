@@ -22,6 +22,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException.AgentErrorCode;
+import com.yuyu.salmonmind.agent.api.AgentCitation;
+import com.yuyu.salmonmind.agent.api.AgentLocalCitation;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
 import com.yuyu.salmonmind.agent.api.AgentRequest;
 import com.yuyu.salmonmind.agent.api.AgentResult;
@@ -34,6 +36,7 @@ import com.yuyu.salmonmind.agent.api.AgentTitleRequest;
 import com.yuyu.salmonmind.agent.api.AgentTitleResult;
 import com.yuyu.salmonmind.agent.api.AgentTitleService;
 import com.yuyu.salmonmind.agent.api.AgentUsage;
+import com.yuyu.salmonmind.agent.api.AgentWebCitation;
 import com.yuyu.salmonmind.conversation.api.ConversationService;
 import com.yuyu.salmonmind.conversation.api.RunStreamListener;
 import com.yuyu.salmonmind.conversation.api.RunStreamListener.RunStarted;
@@ -250,6 +253,35 @@ class ConversationModuleIntegrationTest {
         // 数据库不允许遗留 RUNNING Run
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM conversation_runs WHERE status = 'RUNNING'", Integer.class)).isZero();
+    }
+
+    @Test
+    void projectsPersistedCitationsAsHistoricalMetadataWithoutReusingThem() throws Exception {
+        UUID conv = createId();
+        UUID evidenceId = UUID.randomUUID();
+        UUID revisionId = UUID.randomUUID();
+        AGENT.completeWithCitations(List.of(
+                new AgentLocalCitation("L1", evidenceId, revisionId, "manual.md", "chapter-1"),
+                new AgentWebCitation("W1", "BOCHA", "网页标题", "https://example.com/a",
+                        "example.com", "2026-08-17", Instant.parse("2026-08-17T00:00:00Z"))));
+
+        postSse("/api/conversations/" + conv + "/messages", Map.of("text", "请查资料"));
+        Map<String, Object> first = open(conv.toString());
+        Map<String, Object> firstAssistant = entryOf(((List<?>) first.get("activePath")).get(1));
+        assertThat((List<?>) payloadOf(firstAssistant).get("citations")).hasSize(2);
+
+        // 第二轮的测试 Agent 不返回 Citation；历史摘要只能进入模型输入，不能被复制到新 Entry。
+        AGENT.completeWithCitations(List.of());
+        postSse("/api/conversations/" + conv + "/messages", Map.of("text", "继续说明"));
+        String historical = messagesOf(agentRequest(1)).get(1).text();
+        assertThat(historical).contains(
+                "[历史来源元数据：仅说明上一轮依据，不是当前 Run 可引用证据",
+                "runId:", "[L1] source=LOCAL document=manual.md location=chapter-1",
+                "[W1] source=WEB provider=BOCHA", "url=https://example.com/a",
+                "如需核验必须重新检索");
+        Map<String, Object> second = open(conv.toString());
+        Map<String, Object> secondAssistant = entryOf(((List<?>) second.get("activePath")).get(3));
+        assertThat((List<?>) payloadOf(secondAssistant).get("citations")).isEmpty();
     }
 
     @Test
@@ -874,6 +906,7 @@ class ConversationModuleIntegrationTest {
         private volatile boolean failAfterDelta;
         /** 主调用固定用量：totalTokens 作为压缩检测的 usage 锚点。 */
         private volatile AgentUsage usage = new AgentUsage(1000L, 200L, 1200L);
+        private volatile List<AgentCitation> citations = List.of();
 
         @Override
         public void stream(AgentRequest request, AgentStreamListener listener) {
@@ -913,7 +946,7 @@ class ConversationModuleIntegrationTest {
             }
             listener.onDelta("测试");
             listener.onDelta("回答");
-            listener.onComplete(new AgentResult("测试回答", "test-provider", "test-model", usage));
+            listener.onComplete(new AgentResult("测试回答", "test-provider", "test-model", usage, citations));
         }
 
         @Override
@@ -972,6 +1005,10 @@ class ConversationModuleIntegrationTest {
             failure = null;
         }
 
+        void completeWithCitations(List<AgentCitation> nextCitations) {
+            citations = nextCitations == null ? List.of() : List.copyOf(nextCitations);
+        }
+
         void reset() {
             requests.clear();
             summaryRequests.clear();
@@ -983,6 +1020,7 @@ class ConversationModuleIntegrationTest {
             failMainAfterCompaction = false;
             failAfterDelta = false;
             usage = new AgentUsage(1000L, 200L, 1200L);
+            citations = List.of();
         }
     }
 }

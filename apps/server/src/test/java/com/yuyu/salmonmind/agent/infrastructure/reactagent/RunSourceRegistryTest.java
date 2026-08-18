@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.yuyu.salmonmind.agent.api.AgentCitation;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
@@ -67,13 +68,32 @@ class RunSourceRegistryTest {
         assertThat(registry.citationsFor("依据 [W1]")).hasSize(1);
     }
 
+    @Test
+    void tokenBoundRemovesWholeSourceItemsAndOnlySurvivorsCanBeCited() throws Exception {
+        String single = webEnvelope("BOCHA", "https://example.com/a", "first");
+        RunSourceRegistry oneItemRegistry = new RunSourceRegistry(mapper);
+        long oneItemTokens = oneItemRegistry.decorate(single, 10_000).estimatedTokens();
+        RunSourceRegistry registry = new RunSourceRegistry(mapper);
+
+        RunSourceRegistry.Decoration decoration = registry.decorate(
+                duplicateWebEnvelope(), 10_000, oneItemTokens + 32);
+        JsonNode bounded = mapper.readTree(decoration.result());
+
+        assertThat(decoration.withinTokenBudget()).isTrue();
+        assertThat(decoration.estimatedTokens()).isLessThanOrEqualTo(oneItemTokens + 32);
+        assertThat(bounded.path("items").isArray()).isTrue();
+        assertThat(bounded.path("items")).hasSize(1);
+        assertThat(registry.citationsFor("依据 [W1] [W2]")).extracting(AgentCitation::referenceId)
+                .containsExactly("W1");
+    }
+
     private String envelope(String kind, String provider, String item) {
         return "{\"status\":\"SUCCESS\",\"reason\":\"NONE\",\"sourceKind\":\""
                 + kind + "\",\"provider\":\"" + provider + "\",\"items\":[" + item + "]}";
     }
 
     private String webEnvelope(String provider, String url, String title) {
-        return "{\"status\":\"SUCCESS\",\"reason\":\"NONE\",\"sourceKind\":\"WEB\",
+        return "{\"status\":\"SUCCESS\",\"reason\":\"NONE\",\"sourceKind\":\"WEB\","
                 + "\"provider\":\"" + provider + "\",\"items\":[{"
                 + "\"title\":\"" + title + "\",\"url\":\"" + url + "\","
                 + "\"site\":\"example\",\"snippet\":\"snippet\","

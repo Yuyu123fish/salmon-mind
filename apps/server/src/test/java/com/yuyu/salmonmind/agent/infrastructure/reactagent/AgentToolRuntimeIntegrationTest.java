@@ -171,6 +171,43 @@ class AgentToolRuntimeIntegrationTest {
     }
 
     @Test
+    void cumulativeToolResultBudgetStopsProviderBeforeNextCall() {
+        var tool = new RecordingSearchTool(false, "x".repeat(1_000));
+        var model = new BudgetCallingChatModel();
+        // 第一条结果约 508 token；第二次调用前剩余空间不足最小结构化结果，不能执行工具。
+        var adapter = newAdapter(model, List.of(tool), 200_000, 550, 32);
+        var events = new RecordingListener();
+
+        AgentResult result = completeSync(adapter, events, new AgentRequest(
+                "context-budget-thread", null, UUID.randomUUID(),
+                userList("连续搜索"), CheckpointPolicy.REUSE_IF_MATCH));
+
+        assertThat(tool.calls).hasSize(1);
+        assertThat(events.failed).singleElement()
+                .extracting(AgentToolFailed::stableErrorCode)
+                .isEqualTo("TOOL_CONTEXT_BUDGET_EXCEEDED");
+        assertThat(result.text()).isEqualTo(BudgetCallingChatModel.FINAL_ANSWER);
+    }
+
+    @Test
+    void modelCallLimitHookHardStopsARepeatedToolLoop() {
+        var tool = new RecordingSearchTool();
+        var model = new LoopingToolChatModel();
+        var adapter = newAdapter(model, List.of(tool), 200_000, 32_768, 2);
+        var events = new RecordingListener();
+
+        adapter.stream(new AgentRequest(
+                "max-steps-thread", null, UUID.randomUUID(), userList("持续调用工具"),
+                CheckpointPolicy.REUSE_IF_MATCH), events);
+
+        assertThat(events.result()).isNull();
+        assertThat(events.error()).isNotNull();
+        assertThat(events.error().code()).isEqualTo(AgentExecutionException.AgentErrorCode.AGENT_LOOP_LIMIT_REACHED);
+        assertThat(model.calls).hasSize(2);
+        assertThat(tool.calls).hasSize(2);
+    }
+
+    @Test
     void decoratesSourceResultAndReturnsOnlyReferencedCitation() {
         String source = """
                 {"status":"SUCCESS","reason":"NONE","sourceKind":"WEB","provider":"BOCHA","items":[{"title":"官方页面","url":"https://example.com","site":"example.com","snippet":"摘要","retrievedAt":"2026-08-17T00:00:00Z"}]}
@@ -232,9 +269,17 @@ class AgentToolRuntimeIntegrationTest {
     }
 
     private ReactAgentSessionAdapter newAdapter(ToolCallingChatModel model, List<ToolCallback> tools, int maxResultChars) {
+        return newAdapter(model, tools, maxResultChars, 32_768, 32);
+    }
+
+    private ReactAgentSessionAdapter newAdapter(
+            ChatModel model, List<ToolCallback> tools, int maxResultChars,
+            int maxResultTokens, int maxSteps
+    ) {
         var adapter = new ReactAgentSessionAdapter(
                 (ChatModelProvider) () -> new ChatModelHandle(model, "test-provider", "test-model"),
-                redisUrl, "", 65_432, 32_768, 0.1, maxResultChars, tools);
+                redisUrl, "", 65_432, 32_768, 0.1, maxResultChars, tools,
+                maxResultTokens, maxSteps);
         adapters.add(adapter);
         return adapter;
     }
@@ -443,6 +488,66 @@ class AgentToolRuntimeIntegrationTest {
         @Override
         public reactor.core.publisher.Flux<ChatResponse> stream(Prompt prompt) {
             // 锁定框架的 LLM 节点经 ChatClient 走 stream 通道，确定性模型以单响应 Flux 实现
+            return reactor.core.publisher.Flux.just(call(prompt));
+        }
+    }
+
+    /** 第二次工具请求在累计结果预算耗尽后仍可被模型收束为普通回答。 */
+    static final class BudgetCallingChatModel implements ChatModel {
+
+        static final String FINAL_ANSWER = "工具上下文已受限，我使用已有信息回答。";
+        private final List<List<Message>> calls = new CopyOnWriteArrayList<>();
+
+        @Override
+        public ChatResponse call(Prompt prompt) {
+            List<Message> instructions = new ArrayList<>(prompt.getInstructions());
+            calls.add(instructions);
+            long resultCount = instructions.stream().filter(ToolResponseMessage.class::isInstance).count();
+            if (resultCount < 2) {
+                String id = "budget-call-" + (resultCount + 1);
+                return new ChatResponse(List.of(new Generation(AssistantMessage.builder()
+                        .toolCalls(List.of(new AssistantMessage.ToolCall(
+                                id, "function", RecordingSearchTool.NAME, "{\"query\":\"salmon\"}")))
+                        .build())));
+            }
+            return new ChatResponse(List.of(new Generation(
+                    AssistantMessage.builder().content(FINAL_ANSWER).build())));
+        }
+
+        @Override
+        public org.springframework.ai.chat.prompt.ChatOptions getDefaultOptions() {
+            return OpenAiChatOptions.builder().build();
+        }
+
+        @Override
+        public reactor.core.publisher.Flux<ChatResponse> stream(Prompt prompt) {
+            return reactor.core.publisher.Flux.just(call(prompt));
+        }
+    }
+
+    /** 忽略工具结果、持续请求工具的确定性模型，用于证明公开 max-steps 硬上限。 */
+    static final class LoopingToolChatModel implements ChatModel {
+
+        private final List<List<Message>> calls = new CopyOnWriteArrayList<>();
+
+        @Override
+        public ChatResponse call(Prompt prompt) {
+            List<Message> instructions = new ArrayList<>(prompt.getInstructions());
+            calls.add(instructions);
+            String id = "loop-call-" + calls.size();
+            return new ChatResponse(List.of(new Generation(AssistantMessage.builder()
+                    .toolCalls(List.of(new AssistantMessage.ToolCall(
+                            id, "function", RecordingSearchTool.NAME, "{\"query\":\"loop\"}")))
+                    .build())));
+        }
+
+        @Override
+        public org.springframework.ai.chat.prompt.ChatOptions getDefaultOptions() {
+            return OpenAiChatOptions.builder().build();
+        }
+
+        @Override
+        public reactor.core.publisher.Flux<ChatResponse> stream(Prompt prompt) {
             return reactor.core.publisher.Flux.just(call(prompt));
         }
     }

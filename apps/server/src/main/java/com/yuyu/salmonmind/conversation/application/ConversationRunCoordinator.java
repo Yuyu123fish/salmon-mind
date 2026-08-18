@@ -3,6 +3,7 @@ package com.yuyu.salmonmind.conversation.application;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException.AgentErrorCode;
 import com.yuyu.salmonmind.agent.api.AgentCitation;
+import com.yuyu.salmonmind.agent.api.AgentContextBudget;
 import com.yuyu.salmonmind.agent.api.AgentLocalCitation;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
 import com.yuyu.salmonmind.agent.api.AgentRequest;
@@ -39,6 +40,7 @@ import com.yuyu.salmonmind.conversation.application.port.ConversationMetadataRep
 import com.yuyu.salmonmind.conversation.domain.ConversationCompactionPolicy;
 import com.yuyu.salmonmind.conversation.domain.ConversationHistory;
 import com.yuyu.salmonmind.conversation.domain.ConversationTitle;
+import com.yuyu.salmonmind.conversation.domain.AssistantContextRenderer;
 import com.yuyu.salmonmind.conversation.domain.TitleTemplate;
 import com.yuyu.salmonmind.workspace.api.WorkspaceRegistry;
 import org.slf4j.Logger;
@@ -60,9 +62,10 @@ import java.util.UUID;
  * 1. 以 JSONL 为权威恢复并校验 Conversation，再追加用户 Entry 并强制刷盘；
  * 2. 数据库事务创建 RUNNING Run 并推进活动叶子（Agent 调用绝不在事务内）；
  * 3. durable 状态成立后发出 run_started；
- * 4. 主 LLM 前压缩检测：usage 锚点 + 本次 User 参与计量，达到 196,712 阈值时生成
- *    摘要、追加 Compaction、推进叶子与压缩三元组并使旧 Checkpoint 失效，随后主调用
- *    从「Summary + Retained Tail + Compaction 后消息」的新投影重建；
+ * 4. 主 LLM 前压缩检测：生产工具路径按 Agent 报告的静态/动态预算与当前 JSONL 投影
+ *    完整计量；兼容路径可使用有效 usage 锚点。达到 196,712 阈值时生成摘要、追加
+ *    Compaction、推进叶子与压缩三元组并使旧 Checkpoint 失效，随后主调用从
+ *    「Summary + Retained Tail + Compaction 后消息」的新投影重建；
  * 5. 流式主回答：delta 只在内存/SSE 中累积，只有模型成功且文本非空才追加一个完整
  *    Assistant Entry；模型成功前失败不写 Assistant；
  * 6. 成功提交点：Assistant JSONL 刷盘后，在同一数据库事务把 Run 更新为 SUCCEEDED
@@ -73,7 +76,8 @@ import java.util.UUID;
  * 8. run_started 之后、成功提交点之前的一切失败通过 run_failed 收束为唯一终态。
  *
  * <p>上下文投影规则：路径上最后一个 Compaction 之前的内容全部被摘要或 Tail 覆盖；
- * 投影只展开最新 Compaction 的 Summary 与 Retained Tail 原文，再加其后的新消息。
+ * 投影只展开最新 Compaction 的 Summary 与 Retained Tail 原文，再加其后的新消息，
+ * Assistant 的历史 Citation 由统一渲染器转换为有界元数据。
  * 每次主调用前期望 Checkpoint 叶子 = 活动叶子（Compaction 时强制重建，否则复用
  * 到叶子之前的上下文节点），使压缩后的旧 Checkpoint 在结构上失效。
  */
@@ -304,18 +308,27 @@ class ConversationRunCoordinator {
         String previousSummary = lastCompactionIndex >= 0
                 ? ((CompactionPayload) path.get(lastCompactionIndex).payload()).summary() : null;
 
-        // usage 锚点：最新 Compaction 之后的最近 Assistant，且 totalTokens 非空；
-        // 锚点已包含 system prompt 与既有输入，后续内容用保守估算补足
+        AgentContextBudget agentBudget = agentStream.contextBudget();
+        if (agentBudget == null) {
+            agentBudget = AgentContextBudget.ZERO;
+        }
+        long effectiveStaticInputTokens = Math.max(systemPromptTokens, agentBudget.staticInputTokens());
+        long dynamicToolInputTokens = agentBudget.dynamicInputTokens();
+
+        // 生产工具结果不会写入 JSONL，上一轮 usage 可能包含不可恢复的 tool message；
+        // 这条路径必须以当前 Active Path 加历史 Citation 摘要为唯一计量基础。
         Long anchorTokens = null;
         int anchorIndex = -1;
-        for (int i = path.size() - 1; i > lastCompactionIndex; i--) {
-            Entry entry = path.get(i);
-            if (entry.type() == EntryType.ASSISTANT_MESSAGE) {
-                TokenUsage usage = ((AssistantMessagePayload) entry.payload()).usage();
-                if (usage != null && usage.totalTokens() != null) {
-                    anchorTokens = usage.totalTokens();
-                    anchorIndex = i;
-                    break;
+        if (!agentStream.requiresProjectionRebuild()) {
+            for (int i = path.size() - 1; i > lastCompactionIndex; i--) {
+                Entry entry = path.get(i);
+                if (entry.type() == EntryType.ASSISTANT_MESSAGE) {
+                    TokenUsage usage = ((AssistantMessagePayload) entry.payload()).usage();
+                    if (usage != null && usage.totalTokens() != null) {
+                        anchorTokens = usage.totalTokens();
+                        anchorIndex = i;
+                        break;
+                    }
                 }
             }
         }
@@ -332,7 +345,8 @@ class ConversationRunCoordinator {
                 }
             }
             estimated = compactionPolicy.estimateNextInputTokens(
-                    budgets, estimator, systemPromptTokens, previousSummary, List.of(), anchorTokens, afterAnchor);
+                    budgets, estimator, effectiveStaticInputTokens, previousSummary, List.of(), anchorTokens, afterAnchor)
+                    + dynamicToolInputTokens;
         } else {
             List<Entry> projected = new ArrayList<>();
             for (Entry entry : path) {
@@ -341,7 +355,8 @@ class ConversationRunCoordinator {
                 }
             }
             estimated = compactionPolicy.estimateNextInputTokens(
-                    budgets, estimator, systemPromptTokens, previousSummary, projected, null, List.of());
+                    budgets, estimator, effectiveStaticInputTokens + dynamicToolInputTokens,
+                    previousSummary, projected, null, List.of());
         }
 
         if (!force && !compactionPolicy.shouldCompact(estimated, budgets)) {
@@ -410,7 +425,8 @@ class ConversationRunCoordinator {
 
         // 压缩后重计量：Summary + Retained Tail + Compaction 后消息；仍超限则明确失败
         long reestimated = compactionPolicy.reestimateAfterCompaction(
-                budgets, estimator, systemPromptTokens, summary, plan.retainedTail(), List.of());
+                budgets, estimator, effectiveStaticInputTokens + dynamicToolInputTokens,
+                summary, plan.retainedTail(), List.of());
         if (compactionPolicy.shouldCompact(reestimated, budgets)) {
             throw new ConversationException(
                     ConversationErrorCode.CONTEXT_LIMIT_REACHED, "压缩后仍超过工作输入预算，请创建新的 Conversation");
@@ -722,7 +738,8 @@ class ConversationRunCoordinator {
             case USER_MESSAGE -> new AgentMessage(
                     AgentMessage.Role.USER, ((UserMessagePayload) entry.payload()).text());
             case ASSISTANT_MESSAGE -> new AgentMessage(
-                    AgentMessage.Role.ASSISTANT, ((AssistantMessagePayload) entry.payload()).text());
+                    AgentMessage.Role.ASSISTANT,
+                    AssistantContextRenderer.render((AssistantMessagePayload) entry.payload()));
             default -> throw new IllegalArgumentException("投影只能包含用户与助手消息: " + entry.id());
         };
     }

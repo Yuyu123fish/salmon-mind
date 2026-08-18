@@ -11,17 +11,19 @@ import com.yuyu.salmonmind.agent.api.AgentToolCompleted;
 import com.yuyu.salmonmind.agent.api.AgentToolFailed;
 import com.yuyu.salmonmind.agent.api.AgentToolStarted;
 
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 平台拥有的工具生命周期拦截器：把 Spring AI Alibaba 的 ToolInterceptor 钩子映射为
- * {@code agent::api} 的 started/completed/failed 平台事件，并在此处完成两个 Gate 控制点：
+ * {@code agent::api} 的 started/completed/failed 平台事件，并在此处完成调用次数、结果大小
+ * 与累计上下文三类 Gate 控制点：
  *
  * <ul>
  *   <li>每个 Tool Call 的 started 后至多一次 completed 或 failed：结果以
  *       {@link ToolCallResponse#isError()} 与异常为失败依据，二者互斥。</li>
  *   <li>工具结果在回到模型上下文前按 {@code maxToolResultChars} 有界截断，
- *       不允许超长原始结果直接进入下一轮模型 Prompt。</li>
+ *       不允许超长原始结果直接进入下一轮模型 Prompt；当前 Run 还共享一个 token 总预算。</li>
  * </ul>
  *
  * <p>拦截器通过 {@link #LISTENER_METADATA_KEY} 从 RunnableConfig metadata 中取出
@@ -45,10 +47,19 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
 
     /** 每次 Agent stream 独立的工具预算 metadata 键。 */
     static final String INVOCATION_BUDGET_METADATA_KEY = "salmon:agent:tool-budget";
+    static final String RESULT_BUDGET_METADATA_KEY = "salmon:agent:tool-result-budget";
     static final String WEB_SEARCH_ALLOWED_METADATA_KEY = "salmon:agent:web-search-allowed";
-    static final String TOOL_BUDGET_EXCEEDED = "TOOL_BUDGET_EXCEEDED";
-    private static final String TOOL_BUDGET_RESULT =
-            "{\"status\":\"UNAVAILABLE\",\"reason\":\"TOOL_BUDGET_EXCEEDED\","
+    static final String TOOL_CALL_BUDGET_EXCEEDED = "TOOL_CALL_BUDGET_EXCEEDED";
+    static final String TOOL_CONTEXT_BUDGET_EXCEEDED = "TOOL_CONTEXT_BUDGET_EXCEEDED";
+    /** 保留旧包内命名，调用次数预算的稳定语义已单独命名。 */
+    static final String TOOL_BUDGET_EXCEEDED = TOOL_CALL_BUDGET_EXCEEDED;
+    private static final long MIN_TOOL_RESULT_TOKENS = 64L;
+    private static final long TOOL_MESSAGE_OVERHEAD = 8L;
+    private static final String TOOL_CALL_BUDGET_RESULT =
+            "{\"status\":\"UNAVAILABLE\",\"reason\":\"TOOL_CALL_BUDGET_EXCEEDED\","
+                    + "\"sourceKind\":\"UNKNOWN\",\"items\":[]}";
+    private static final String TOOL_CONTEXT_BUDGET_RESULT =
+            "{\"status\":\"UNAVAILABLE\",\"reason\":\"TOOL_CONTEXT_BUDGET_EXCEEDED\","
                     + "\"sourceKind\":\"UNKNOWN\",\"items\":[]}";
 
     private final int maxToolResultChars;
@@ -82,10 +93,10 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             if (listener != null) {
                 listener.onToolFailed(new AgentToolFailed(
                         request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
-                        TOOL_BUDGET_EXCEEDED, "已达到本轮工具调用上限"));
+                        TOOL_CALL_BUDGET_EXCEEDED, "已达到本轮工具调用上限"));
             }
             // 预算耗尽仍返回可被模型理解的结构化结果；不抛异常，避免工具失败制造 Run 双终态。
-            return ToolCallResponse.error(request.getToolCallId(), request.getToolName(), TOOL_BUDGET_RESULT);
+            return ToolCallResponse.error(request.getToolCallId(), request.getToolName(), TOOL_CALL_BUDGET_RESULT);
         }
         if (isWebTool(request.getToolName()) && !webSearchAllowed(request)) {
             if (listener != null) {
@@ -96,8 +107,41 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             return ToolCallResponse.error(request.getToolCallId(), request.getToolName(),
                     disabledWebSearchResult(request.getToolName()));
         }
+        ToolResultBudget resultBudget = resultBudgetOf(request);
+        ToolResultBudget.Reservation reservation = resultBudget == null ? null : resultBudget.reserve();
+        if (resultBudget != null && reservation == null) {
+            if (listener != null) {
+                listener.onToolFailed(new AgentToolFailed(
+                        request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
+                        TOOL_CONTEXT_BUDGET_EXCEEDED, "已达到本轮工具结果上下文预算"));
+            }
+            // 预算不足时不执行 handler，外部 Provider 不会被访问。
+            return ToolCallResponse.error(request.getToolCallId(), request.getToolName(),
+                    TOOL_CONTEXT_BUDGET_RESULT);
+        }
         try {
-            BoundResult bounded = boundResultSize(handler.call(request), request);
+            BoundResult bounded = boundResultSize(handler.call(request), request, resultBudget, reservation);
+            if (bounded.budgetExceeded()) {
+                if (resultBudget != null) {
+                    resultBudget.cancel(reservation);
+                }
+                if (listener != null) {
+                    listener.onToolFailed(new AgentToolFailed(
+                            request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
+                            TOOL_CONTEXT_BUDGET_EXCEEDED, "工具结果超过本轮上下文预算"));
+                }
+                return ToolCallResponse.error(request.getToolCallId(), request.getToolName(),
+                        TOOL_CONTEXT_BUDGET_RESULT);
+            }
+            if (resultBudget != null && !resultBudget.commit(reservation, bounded.estimatedTokens())) {
+                if (listener != null) {
+                    listener.onToolFailed(new AgentToolFailed(
+                            request.getToolCallId(), request.getToolName(), elapsedMillis(startedNanos),
+                            TOOL_CONTEXT_BUDGET_EXCEEDED, "工具结果超过本轮上下文预算"));
+                }
+                return ToolCallResponse.error(request.getToolCallId(), request.getToolName(),
+                        TOOL_CONTEXT_BUDGET_RESULT);
+            }
             ToolCallResponse response = bounded.response();
             RunSourceRegistry.Decoration source = bounded.decoration();
             long durationMillis = elapsedMillis(startedNanos);
@@ -115,6 +159,9 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             }
             return response;
         } catch (RuntimeException ex) {
+            if (resultBudget != null) {
+                resultBudget.cancel(reservation);
+            }
             // 与框架 ToolErrorInterceptor 同款模式：异常转错误结果，保持循环单终态
             if (listener != null) {
                 listener.onToolFailed(new AgentToolFailed(
@@ -162,29 +209,72 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
     }
 
     /** 工具结果进入模型上下文前的有界控制点；来源结果必须按完整 item 边界裁剪。 */
-    private BoundResult boundResultSize(ToolCallResponse response, ToolCallRequest request) {
+    private BoundResult boundResultSize(
+            ToolCallResponse response,
+            ToolCallRequest request,
+            ToolResultBudget resultBudget,
+            ToolResultBudget.Reservation reservation
+    ) {
         String result = response.getResult();
         RunSourceRegistry registry = sourceRegistryOf(request);
+        long tokenLimit = resultBudget == null
+                ? Long.MAX_VALUE : resultBudget.availableForCurrent(reservation);
         if (registry != null) {
-            RunSourceRegistry.Decoration decoration = registry.decorate(result, maxToolResultChars);
+            RunSourceRegistry.Decoration decoration = registry.decorate(result, maxToolResultChars, tokenLimit);
             if (decoration != null) {
-                return new BoundResult(rebuild(response, decoration.result()), decoration);
+                return new BoundResult(rebuild(response, decoration.result()), decoration,
+                        decoration.estimatedTokens(), !decoration.withinTokenBudget());
             }
         }
-        if (result == null || result.length() <= maxToolResultChars) {
-            return new BoundResult(response, null);
+        if (result == null) {
+            return new BoundResult(response, null, estimateToolResultTokens(""), false);
+        }
+        String bounded = result.length() <= maxToolResultChars
+                ? result : result.substring(0, maxToolResultChars);
+        long estimatedTokens = estimateToolResultTokens(bounded);
+        if (estimatedTokens > tokenLimit) {
+            bounded = truncateToTokens(bounded, tokenLimit);
+            estimatedTokens = estimateToolResultTokens(bounded);
+            if (estimatedTokens > tokenLimit) {
+                return new BoundResult(response, null, estimatedTokens, true);
+            }
+        }
+        if (bounded.equals(result)) {
+            return new BoundResult(response, null, estimatedTokens, false);
         }
         ToolCallResponse.Builder builder = ToolCallResponse.builder()
                 .toolCallId(response.getToolCallId())
                 .toolName(response.getToolName())
-                .content(result.substring(0, maxToolResultChars));
+                .content(bounded);
         if (response.getStatus() != null) {
             builder.status(response.getStatus());
         }
         if (response.getMetadata() != null) {
             builder.metadata(response.getMetadata());
         }
-        return new BoundResult(builder.build(), null);
+        return new BoundResult(builder.build(), null, estimatedTokens, false);
+    }
+
+    private static String truncateToTokens(String value, long tokenLimit) {
+        if (tokenLimit <= TOOL_MESSAGE_OVERHEAD) {
+            return "";
+        }
+        long contentLimit = tokenLimit - TOOL_MESSAGE_OVERHEAD;
+        int low = 0;
+        int high = value.length();
+        while (low < high) {
+            int middle = low + (high - low + 1) / 2;
+            String candidate = value.substring(0, middle);
+            if (estimateTextTokens(candidate) <= contentLimit) {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        if (low > 0 && low < value.length() && Character.isHighSurrogate(value.charAt(low - 1))) {
+            low--;
+        }
+        return value.substring(0, low);
     }
 
     private static ToolCallResponse rebuild(ToolCallResponse response, String content) {
@@ -248,8 +338,33 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                 .orElse(null);
     }
 
+    private static ToolResultBudget resultBudgetOf(ToolCallRequest request) {
+        return request.getExecutionContext()
+                .flatMap(context -> context.config().metadata(RESULT_BUDGET_METADATA_KEY))
+                .filter(ToolResultBudget.class::isInstance)
+                .map(ToolResultBudget.class::cast)
+                .orElse(null);
+    }
 
-    private record BoundResult(ToolCallResponse response, RunSourceRegistry.Decoration decoration) {
+
+    private record BoundResult(
+            ToolCallResponse response,
+            RunSourceRegistry.Decoration decoration,
+            long estimatedTokens,
+            boolean budgetExceeded
+    ) {
+    }
+
+    static long estimateToolResultTokens(String text) {
+        return estimateTextTokens(text) + TOOL_MESSAGE_OVERHEAD;
+    }
+
+    private static long estimateTextTokens(String text) {
+        if (text == null || text.isEmpty()) {
+            return 1L;
+        }
+        long bytes = text.getBytes(StandardCharsets.UTF_8).length;
+        return Math.max(1L, (bytes + 1L) / 2L);
     }
 
     /** 网页工具事件只报告能力名称，不把完整用户查询写入 SSE。 */
@@ -289,6 +404,83 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                 if (used.compareAndSet(current, current + 1)) {
                     return true;
                 }
+            }
+        }
+    }
+
+    /**
+     * 一个主 Agent Run 独立的工具结果 token 预算。reserve 只允许至少容纳一个最小结果的
+     * 调用进入 handler；实际结果返回后再按送入模型的序列化文本结算。
+     */
+    static final class ToolResultBudget {
+        private final long maximum;
+        private long used;
+
+        ToolResultBudget(long maximum) {
+            if (maximum < MIN_TOOL_RESULT_TOKENS) {
+                throw new IllegalArgumentException("工具结果预算不足以容纳最小结构化结果");
+            }
+            this.maximum = maximum;
+        }
+
+        synchronized Reservation reserve() {
+            if (maximum - used < MIN_TOOL_RESULT_TOKENS) {
+                return null;
+            }
+            used += MIN_TOOL_RESULT_TOKENS;
+            return new Reservation(MIN_TOOL_RESULT_TOKENS);
+        }
+
+        synchronized long availableForCurrent(Reservation reservation) {
+            if (reservation == null) {
+                return maximum - used;
+            }
+            if (!reservation.active()) {
+                return maximum - used;
+            }
+            return maximum - (used - reservation.minimum());
+        }
+
+        synchronized boolean commit(Reservation reservation, long actualTokens) {
+            if (reservation == null || actualTokens < 0 || !reservation.active()) {
+                return true;
+            }
+            long prior = used - reservation.minimum();
+            if (prior + actualTokens > maximum) {
+                used = prior;
+                reservation.deactivate();
+                return false;
+            }
+            used = prior + actualTokens;
+            reservation.deactivate();
+            return true;
+        }
+
+        synchronized void cancel(Reservation reservation) {
+            if (reservation != null && reservation.active()) {
+                used = Math.max(0, used - reservation.minimum());
+                reservation.deactivate();
+            }
+        }
+
+        static final class Reservation {
+            private final long minimum;
+            private boolean active = true;
+
+            Reservation(long minimum) {
+                this.minimum = minimum;
+            }
+
+            long minimum() {
+                return minimum;
+            }
+
+            boolean active() {
+                return active;
+            }
+
+            void deactivate() {
+                active = false;
             }
         }
     }

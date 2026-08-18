@@ -1,6 +1,6 @@
 # Feature 003 Stage 04 Plan：博查 + SearchApi.io 双网页工具与可验证引用
 
-Status: Implemented
+Status: Accepted
 
 ## 1. Stage 目标
 

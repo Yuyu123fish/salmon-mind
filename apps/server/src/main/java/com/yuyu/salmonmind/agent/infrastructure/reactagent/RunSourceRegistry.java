@@ -26,6 +26,7 @@ import java.util.regex.Pattern;
 /**
  * 一个 Agent Run 独有的来源注册表。工具结果在进入模型前登记来源并获得 L/W 标记，
  * 注册表不写入 Redis 或 JSONL；流结束时只按最终正文中的精确标记取出 Citation。
+ * 结果超出字符或累计 token 预算时只保留完整 item，未存活的本轮来源不会成为 Citation。
  */
 final class RunSourceRegistry {
 
@@ -48,6 +49,15 @@ final class RunSourceRegistry {
      * 原有字符边界；生产来源工具始终得到合法 JSON，超限时从尾部删除完整 item。
      */
     synchronized Decoration decorate(String result, int maxChars) {
+        return decorate(result, maxChars, Long.MAX_VALUE);
+    }
+
+    /**
+     * 登记来源并同时执行单结果字符上限与当前 Run 剩余 token 上限。两种上限都只能删除
+     * 尾部完整 item；如果连不带 item 的 envelope 也放不进剩余预算，调用方会返回有界
+     * 工具失败，刚登记但未存活的来源在本方法末尾被撤销。
+     */
+    synchronized Decoration decorate(String result, int maxChars, long maxTokens) {
         if (result == null || result.isBlank()) {
             return null;
         }
@@ -86,7 +96,9 @@ final class RunSourceRegistry {
         }
         envelope.set("items", decoratedItems);
         boolean truncated = false;
-        while (serializedLength(envelope) > maxChars && decoratedItems.size() > 0) {
+        while ((serializedLength(envelope) > maxChars
+                || ToolLifecycleInterceptor.estimateToolResultTokens(serialize(envelope)) > maxTokens)
+                && decoratedItems.size() > 0) {
             decoratedItems.remove(decoratedItems.size() - 1);
             truncated = true;
         }
@@ -107,12 +119,15 @@ final class RunSourceRegistry {
             envelope.put("truncated", true);
         }
         String serialized = serialize(envelope);
+        long estimatedTokens = ToolLifecycleInterceptor.estimateToolResultTokens(serialized);
         return new Decoration(
                 serialized,
                 provider,
                 decoratedItems.size(),
                 truncated,
-                "DEGRADED".equals(envelope.path("status").asText()));
+                "DEGRADED".equals(envelope.path("status").asText()),
+                estimatedTokens,
+                estimatedTokens <= maxTokens);
     }
 
     /** 从最终完整回答中按首次出现顺序核对精确 L/W 标记，未知 ID 不产生 Citation。 */
@@ -250,7 +265,15 @@ final class RunSourceRegistry {
         }
     }
 
-    record Decoration(String result, String provider, int sourceCount, boolean truncated, boolean degraded) {
+    record Decoration(
+            String result,
+            String provider,
+            int sourceCount,
+            boolean truncated,
+            boolean degraded,
+            long estimatedTokens,
+            boolean withinTokenBudget
+    ) {
     }
 
     private record Registration(String referenceId, boolean newlyRegistered) {

@@ -64,12 +64,12 @@ salmon:
       model-name: ${MODEL_RERANK_NAME:Qwen/Qwen3-Reranker-4B}
       instruction: ${MODEL_RERANK_INSTRUCTION:rerank-v1}
   agent:
+    # ReactAgent 公开的 ModelCallLimitHook 硬步数上限；不是模型自觉停止的提示。
     max-steps: ${AGENT_MAX_STEPS:32}
     max-tool-result-chars: ${AGENT_MAX_TOOL_RESULT_CHARS:200000}
-    max-prompt-chars: ${AGENT_MAX_PROMPT_CHARS:262144}
-    max-model-response-chars: ${AGENT_MAX_MODEL_RESPONSE_CHARS:65536}
-    max-tools: ${AGENT_MAX_TOOLS:64}
     max-tool-calls-per-run: ${AGENT_MAX_TOOL_CALLS_PER_RUN:4}
+    # 一次主调用内所有工具消息的总 token 预算；工具结果在返回模型前按完整 item/文本边界裁剪。
+    max-tool-result-tokens-per-run: ${AGENT_MAX_TOOL_RESULT_TOKENS_PER_RUN:32768}
   websearch:
     connect-timeout: ${WEB_SEARCH_CONNECT_TIMEOUT:5s}
     read-timeout: ${WEB_SEARCH_READ_TIMEOUT:15s}
@@ -95,7 +95,7 @@ salmon:
     retained-tail-target: ${COMPACTION_RETAINED_TAIL_TARGET:65536}
     summary-max-output-tokens: ${COMPACTION_SUMMARY_MAX_OUTPUT_TOKENS:32768}
     summary-temperature: ${COMPACTION_SUMMARY_TEMPERATURE:0.1}
-    # 无 usage 锚点时参与首次计量的 system prompt 保守估算（覆盖 Agent 提示与框架注入开销）
+    # Agent 报告的实际 system/tool schema 开销下限；256 不是完整 system/tool token 数
     system-prompt-tokens: ${COMPACTION_SYSTEM_PROMPT_TOKENS:256}
   conversation:
     # 权威会话历史目录，Server 容器必须显式挂载；不与 infra/data/ 混用

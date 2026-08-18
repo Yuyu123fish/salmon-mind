@@ -27,6 +27,8 @@ public class AgentExecutionException extends RuntimeException {
         CHAT_MODEL_FAILED,
         /** 提供方明确返回上下文溢出（如 context length exceeded）；主回答未输出 delta 时可据此压缩重试一次。 */
         CONTEXT_OVERFLOW,
+        /** ReactAgent 的公开 ModelCallLimitHook 达到本轮硬步数上限。 */
+        AGENT_LOOP_LIMIT_REACHED,
         REDIS_UNAVAILABLE
     }
 }

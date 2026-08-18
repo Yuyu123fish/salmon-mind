@@ -38,4 +38,66 @@ describe('RunTracePanel', () => {
     render(<RunTracePanel trace={trace} />)
     expect(screen.queryByText('先判断问题')).toBeNull()
   })
+
+  it('folds each tool independently and shows safe request/outcome details on demand', () => {
+    const detailedTrace: RunTraceItem[] = [
+      {
+        kind: 'TOOL',
+        toolCallId: 'call-web',
+        toolName: 'search_web_bocha',
+        toolStatus: 'COMPLETED',
+        safeSummary: 'salmon',
+        stableErrorCode: null,
+        truncated: false,
+        requestDetail: {
+          querySummary: 'salmon',
+          querySummaryTruncated: false,
+          freshness: 'any',
+          freshnessDefaulted: true,
+          count: 5,
+          countDefaulted: true,
+        },
+        outcomeDetail: {
+          provider: 'BOCHA',
+          resultStatus: 'DEGRADED',
+          stableReasonCode: 'RERANK_UNAVAILABLE',
+          sourceCount: 2,
+          durationMillis: 18,
+          degraded: true,
+          resultTruncated: true,
+        },
+      },
+      {
+        kind: 'TOOL',
+        toolCallId: 'call-failed',
+        toolName: 'search_local_knowledge',
+        toolStatus: 'FAILED',
+        safeSummary: '本地检索失败',
+        stableErrorCode: 'RETRIEVAL_UNAVAILABLE',
+        truncated: false,
+        outcomeDetail: {
+          provider: 'LOCAL',
+          resultStatus: 'UNAVAILABLE',
+          stableReasonCode: 'INDEX_UNAVAILABLE',
+          sourceCount: null,
+          durationMillis: 9,
+          degraded: false,
+          resultTruncated: false,
+        },
+      },
+    ]
+    render(<RunTracePanel trace={detailedTrace} expanded />)
+
+    expect(screen.queryByText('工具默认')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /工具 #1/ }))
+    expect(screen.getByText('时间范围')).toBeVisible()
+    expect(screen.getAllByText(/工具默认/)).toHaveLength(2)
+    expect(screen.getByText('RERANK_UNAVAILABLE')).toBeVisible()
+    expect(screen.getAllByText('是')).toHaveLength(2)
+    expect(screen.queryByText('INDEX_UNAVAILABLE')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /工具 #2/ }))
+    expect(screen.getByText('INDEX_UNAVAILABLE')).toBeVisible()
+    expect(screen.getByText(/RETRIEVAL_UNAVAILABLE/)).toBeVisible()
+  })
 })

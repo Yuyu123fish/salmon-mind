@@ -15,7 +15,9 @@ public record AgentRunTraceItem(
         String toolName,
         ToolStatus toolStatus,
         String safeSummary,
-        String stableErrorCode
+        String stableErrorCode,
+        AgentToolRequestDetail requestDetail,
+        AgentToolOutcomeDetail outcomeDetail
 ) {
 
     public AgentRunTraceItem {
@@ -34,10 +36,10 @@ public record AgentRunTraceItem(
     /** 创建一段可展示 reasoning；连续段是否合并由 Agent 内部收集器决定。 */
     public static AgentRunTraceItem reasoning(String text, boolean truncated) {
         return new AgentRunTraceItem(
-                Kind.REASONING, text, truncated, null, null, null, null, null);
+                Kind.REASONING, text, truncated, null, null, null, null, null, null, null);
     }
 
-    /** 创建一个按 Tool Call ID 更新的工具轨迹项。 */
+    /** 创建没有新增详情的兼容工具轨迹项。 */
     public static AgentRunTraceItem tool(
             String toolCallId,
             String toolName,
@@ -46,8 +48,24 @@ public record AgentRunTraceItem(
             String stableErrorCode,
             boolean truncated
     ) {
+        return tool(toolCallId, toolName, status, safeSummary, stableErrorCode,
+                null, null, truncated);
+    }
+
+    /** 创建带请求/终态详情的工具轨迹项；详情只用于展示与历史核验。 */
+    public static AgentRunTraceItem tool(
+            String toolCallId,
+            String toolName,
+            ToolStatus status,
+            String safeSummary,
+            String stableErrorCode,
+            AgentToolRequestDetail requestDetail,
+            AgentToolOutcomeDetail outcomeDetail,
+            boolean truncated
+    ) {
         return new AgentRunTraceItem(
-                Kind.TOOL, null, truncated, toolCallId, toolName, status, safeSummary, stableErrorCode);
+                Kind.TOOL, null, truncated, toolCallId, toolName, status, safeSummary, stableErrorCode,
+                requestDetail, outcomeDetail);
     }
 
     public enum Kind {

@@ -113,6 +113,60 @@ describe('run state reducer', () => {
     const explicitlyExpanded = reduceActiveRun(folded, { type: 'toggle_trace' })
     expect(reduceActiveRun(explicitlyExpanded, { type: 'run_completed' }).traceExpanded).toBe(true)
   })
+
+  it('preserves request detail and keeps result truncation separate from trace truncation', () => {
+    let state = startedState()
+    state = reduceActiveRun(state, {
+      type: 'tool_started',
+      following: true,
+      event: {
+        runId: RUN_ID,
+        toolCallId: 'call-detail',
+        toolName: 'search_web_bocha',
+        safeSummary: 'salmon',
+        requestDetail: {
+          querySummary: 'salmon',
+          querySummaryTruncated: false,
+          freshness: 'any',
+          freshnessDefaulted: true,
+          count: 5,
+          countDefaulted: true,
+        },
+      },
+    })
+    state = reduceActiveRun(state, {
+      type: 'tool_completed',
+      following: true,
+      event: {
+        runId: RUN_ID,
+        toolCallId: 'call-detail',
+        toolName: 'search_web_bocha',
+        durationMillis: 12,
+        provider: 'BOCHA',
+        sourceCount: 1,
+        truncated: false,
+        degraded: false,
+        safeSummary: '已完成',
+        outcomeDetail: {
+          provider: 'BOCHA',
+          resultStatus: 'SUCCESS',
+          stableReasonCode: 'COMPLETE',
+          sourceCount: 1,
+          durationMillis: 12,
+          degraded: false,
+          resultTruncated: true,
+        },
+      },
+    })
+
+    const tool = state.trace.find((item) => item.kind === 'TOOL')
+    expect(tool).toMatchObject({
+      toolCallId: 'call-detail',
+      truncated: false,
+      requestDetail: { querySummary: 'salmon', countDefaulted: true },
+      outcomeDetail: { resultTruncated: true },
+    })
+  })
 })
 
 function reasoning(state: ActiveRunState, delta: string, following: boolean): ActiveRunState {

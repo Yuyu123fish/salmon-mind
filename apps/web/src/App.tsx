@@ -27,6 +27,7 @@ import {
   type RetrievedSourcePayload,
   type Run,
   type RunStreamListener,
+  type RunTraceItem,
 } from './conversationApi.ts'
 
 type LoadState =
@@ -783,6 +784,7 @@ function App() {
                         isCurrentLeaf={entry.id === selectedDetail!.conversation.activeLeafEntryId}
                         continueDisabled={running}
                         onContinue={handleContinue}
+                        trace={entry.payload.trace ?? []}
                         traceExpanded={controlsCurrentRun ? selectedRun.traceExpanded : undefined}
                         traceRunning={controlsCurrentRun && running}
                         onTraceToggle={controlsCurrentRun ? toggleSelectedTrace : undefined}
@@ -876,6 +878,7 @@ function MessageEntry({
   isCurrentLeaf,
   continueDisabled,
   onContinue,
+  trace,
   traceExpanded,
   traceRunning = false,
   onTraceToggle,
@@ -885,6 +888,7 @@ function MessageEntry({
   isCurrentLeaf: boolean
   continueDisabled: boolean
   onContinue: () => void
+  trace: RunTraceItem[]
   traceExpanded?: boolean
   traceRunning?: boolean
   onTraceToggle?: () => void
@@ -917,6 +921,7 @@ function MessageEntry({
             entryId={entry.id}
             citations={entry.payload.citations ?? []}
             retrievedSources={entry.payload.retrievedSources ?? []}
+            trace={trace}
             onLayoutChange={onTraceLayoutChange}
           >
             {(activate) => (
@@ -960,16 +965,20 @@ function AssistantEvidenceView({
   entryId,
   citations,
   retrievedSources,
+  trace,
   onLayoutChange,
   children,
 }: {
   entryId: string
   citations: CitationPayload[]
   retrievedSources: RetrievedSourcePayload[]
+  trace: RunTraceItem[]
   onLayoutChange: () => void
   children: (activate: (referenceId: string) => void) => ReactNode
 }) {
   const [expanded, setExpanded] = useState(false)
+  const [unreferencedExpanded, setUnreferencedExpanded] = useState(false)
+  const [expandedSources, setExpandedSources] = useState<Record<string, boolean>>({})
   const [pendingFocus, setPendingFocus] = useState<string | null>(null)
   const cardRefs = useRef<Record<string, HTMLDivElement | null>>({})
   const citedIds = new Set<string>()
@@ -986,6 +995,14 @@ function AssistantEvidenceView({
   const unreferenced = [...sourcesById.values()].filter((source) => !citedIds.has(source.referenceId))
   const hasDisclosure = uniqueCitations.length > 0 || sourcesById.size > 0
   const disclosureId = `source-disclosure-${entryId}`
+  const toolNumbers = new Map<string, number>()
+  let toolNumber = 0
+  for (const item of trace) {
+    if (item.kind === 'TOOL') {
+      toolNumber += 1
+      toolNumbers.set(item.toolCallId, toolNumber)
+    }
+  }
 
   useEffect(() => {
     if (!expanded || pendingFocus === null) return
@@ -998,16 +1015,33 @@ function AssistantEvidenceView({
       setPendingFocus(null)
     })
     return () => cancelAnimationFrame(frame)
-  }, [expanded, pendingFocus])
+  }, [expanded, unreferencedExpanded, expandedSources, pendingFocus])
 
   const activate = (referenceId: string) => {
+    if (!citedIds.has(referenceId)) return
+    const targetIsUnreferenced = unreferenced.some((source) => source.referenceId === referenceId)
     setExpanded(true)
+    if (targetIsUnreferenced) setUnreferencedExpanded(true)
+    setExpandedSources((current) => ({ ...current, [referenceId]: true }))
     setPendingFocus(referenceId)
     onLayoutChange()
   }
 
   const toggle = () => {
     setExpanded((current) => !current)
+    onLayoutChange()
+  }
+
+  const toggleUnreferenced = () => {
+    setUnreferencedExpanded((current) => !current)
+    onLayoutChange()
+  }
+
+  const toggleSource = (referenceId: string) => {
+    setExpandedSources((current) => ({
+      ...current,
+      [referenceId]: !(current[referenceId] ?? false),
+    }))
     onLayoutChange()
   }
 
@@ -1041,6 +1075,9 @@ function AssistantEvidenceView({
                         source={sourcesById.get(citation.referenceId)}
                         referenceId={citation.referenceId}
                         entryId={entryId}
+                        expanded={expandedSources[citation.referenceId] ?? false}
+                        onToggle={() => toggleSource(citation.referenceId)}
+                        toolNumber={toolNumbers.get(sourcesById.get(citation.referenceId)?.originToolCallId ?? '')}
                         cardRef={(card) => {
                           cardRefs.current[citation.referenceId] = card
                         }}
@@ -1051,21 +1088,35 @@ function AssistantEvidenceView({
               ) : null}
               {unreferenced.length > 0 ? (
                 <section aria-labelledby={`${disclosureId}-unreferenced`}>
-                  <h4 id={`${disclosureId}-unreferenced`}>本轮召回未引用</h4>
-                  <div className="citation-list">
-                    {unreferenced.map((source) => (
-                      <SourceCard
-                        key={source.referenceId}
-                        source={source}
-                        referenceId={source.referenceId}
-                        entryId={entryId}
-                        unreferenced
-                        cardRef={(card) => {
-                          cardRefs.current[source.referenceId] = card
-                        }}
-                      />
-                    ))}
-                  </div>
+                  <button
+                    type="button"
+                    className="source-group-toggle"
+                    aria-expanded={unreferencedExpanded}
+                    aria-controls={`${disclosureId}-unreferenced-body`}
+                    onClick={toggleUnreferenced}
+                  >
+                    <span id={`${disclosureId}-unreferenced`}>本轮召回未引用</span>
+                    <small>{unreferencedExpanded ? '收起' : `展开 · ${unreferenced.length}`}</small>
+                  </button>
+                  {unreferencedExpanded ? (
+                    <div id={`${disclosureId}-unreferenced-body`} className="citation-list">
+                      {unreferenced.map((source) => (
+                        <SourceCard
+                          key={source.referenceId}
+                          source={source}
+                          referenceId={source.referenceId}
+                          entryId={entryId}
+                          unreferenced
+                          expanded={expandedSources[source.referenceId] ?? false}
+                          onToggle={() => toggleSource(source.referenceId)}
+                          toolNumber={toolNumbers.get(source.originToolCallId ?? '')}
+                          cardRef={(card) => {
+                            cardRefs.current[source.referenceId] = card
+                          }}
+                        />
+                      ))}
+                    </div>
+                  ) : null}
                 </section>
               ) : null}
             </div>
@@ -1082,6 +1133,9 @@ function SourceCard({
   referenceId,
   entryId,
   unreferenced = false,
+  expanded,
+  onToggle,
+  toolNumber,
   cardRef,
 }: {
   citation?: CitationPayload
@@ -1089,6 +1143,9 @@ function SourceCard({
   referenceId: string
   entryId: string
   unreferenced?: boolean
+  expanded: boolean
+  onToggle: () => void
+  toolNumber?: number
   cardRef: (card: HTMLDivElement | null) => void
 }) {
   const local = source?.kind === 'local' ? source : citation?.kind === 'local' ? citation : null
@@ -1097,6 +1154,12 @@ function SourceCard({
   const note = !unreferenced && citation?.citationNote?.trim() ? citation.citationNote : null
   const excerpt = source?.sourceExcerpt?.trim() ? source.sourceExcerpt : null
   const excerptLabel = source?.kind === 'local' ? '本地证据摘录' : '搜索摘要'
+  const detailId = `source-detail-${entryId}-${referenceId}`
+  const sourcePosition = source?.resultPosition !== null && source?.resultPosition !== undefined &&
+    source.resultPosition > 0 ? `结果位置 #${source.resultPosition}` : null
+  const origin = toolNumber === undefined ? null : `首次召回：工具调用 #${toolNumber}`
+  const providerRank = web !== null && source?.providerRank !== null && source?.providerRank !== undefined &&
+    source.providerRank > 0 ? `Provider 位次 #${source.providerRank}` : null
 
   return (
     <div
@@ -1107,17 +1170,29 @@ function SourceCard({
       tabIndex={-1}
     >
       <span className="citation-ref">[{referenceId}]</span>
-      <div>
-        {local !== null ? <strong>{local.documentName}</strong> : null}
-        {web !== null ? (
-          safeUrl === null ? (
-            <strong>{web.title}</strong>
-          ) : (
-            <a href={safeUrl} target="_blank" rel="noopener noreferrer">
-              {web.title}
-            </a>
-          )
-        ) : null}
+      <div className="citation-card-content">
+        <div className="citation-card-heading">
+          {local !== null ? <strong>{local.documentName}</strong> : null}
+          {web !== null ? (
+            safeUrl === null ? (
+              <strong>{web.title}</strong>
+            ) : (
+              <a href={safeUrl} target="_blank" rel="noopener noreferrer">
+                {web.title}
+              </a>
+            )
+          ) : null}
+          <button
+            type="button"
+            className="source-card-toggle"
+            aria-expanded={expanded}
+            aria-controls={detailId}
+            aria-label={`${expanded ? '收起' : '展开'}来源详情 [${referenceId}]`}
+            onClick={onToggle}
+          >
+            {expanded ? '收起详情' : '查看详情'}
+          </button>
+        </div>
         {local !== null ? <small>{local.location}</small> : null}
         {web !== null ? (
           <small>
@@ -1125,17 +1200,27 @@ function SourceCard({
             {web.dateLabel ? ` · ${web.dateLabel}` : ''} · 检索于 {formatTime(web.retrievedAt)}
           </small>
         ) : null}
-        {note !== null ? (
-          <p className="source-note">
-            <b>Agent 相关性摘要</b>
-            {note}
-          </p>
+        {origin !== null || sourcePosition !== null || providerRank !== null ? (
+          <small className="source-provenance">
+            {[origin, sourcePosition, providerRank].filter((value): value is string => value !== null).join(' · ')}
+          </small>
         ) : null}
-        {excerpt !== null ? (
-          <p className="source-excerpt">
-            <b>{excerptLabel}</b>
-            {excerpt}
-          </p>
+        {expanded ? (
+          <div id={detailId} className="source-card-details">
+            {note !== null ? (
+              <p className="source-note">
+                <b>Agent 相关性摘要</b>
+                {note}
+              </p>
+            ) : null}
+            {excerpt !== null ? (
+              <p className="source-excerpt">
+                <b>{excerptLabel}</b>
+                {excerpt}
+              </p>
+            ) : null}
+            {note === null && excerpt === null ? <small>暂无更多来源摘录</small> : null}
+          </div>
         ) : null}
       </div>
     </div>

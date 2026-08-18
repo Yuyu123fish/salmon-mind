@@ -43,6 +43,8 @@ import com.yuyu.salmonmind.agent.api.AgentUsage;
 import com.yuyu.salmonmind.agent.api.AgentWebCitation;
 import com.yuyu.salmonmind.agent.api.AgentToolCompleted;
 import com.yuyu.salmonmind.agent.api.AgentToolFailed;
+import com.yuyu.salmonmind.agent.api.AgentToolOutcomeDetail;
+import com.yuyu.salmonmind.agent.api.AgentToolRequestDetail;
 import com.yuyu.salmonmind.agent.api.AgentToolStarted;
 import com.yuyu.salmonmind.conversation.api.ConversationService;
 import com.yuyu.salmonmind.conversation.api.RunStreamListener;
@@ -229,7 +231,10 @@ class ConversationModuleIntegrationTest {
                 AgentRunTraceItem.reasoning("先确定检索范围。", false),
                 AgentRunTraceItem.tool(
                         "call-1", "search_local_knowledge", AgentRunTraceItem.ToolStatus.COMPLETED,
-                        "命中 2 条资料", null, false),
+                        "命中 2 条资料", null,
+                        new AgentToolRequestDetail("salmon", false, null, false, null, false),
+                        new AgentToolOutcomeDetail("LOCAL", AgentToolOutcomeDetail.ResultStatus.SUCCESS,
+                                "COMPLETE", 2, 1, false, true), false),
                 AgentRunTraceItem.reasoning("资料足够，组织回答。", false)));
 
         List<SseEvent> events = postSse(
@@ -255,14 +260,22 @@ class ConversationModuleIntegrationTest {
                 .containsEntry("text", "先确定检索范围。");
         assertThat(entryOf(persistedTrace.get(1))).containsEntry("kind", "TOOL")
                 .containsEntry("toolCallId", "call-1")
-                .containsEntry("toolStatus", "COMPLETED");
+                .containsEntry("toolStatus", "COMPLETED")
+                .containsKey("requestDetail")
+                .containsKey("outcomeDetail");
+        assertThat((Map<String, Object>) events.stream().filter(e -> e.event.equals("tool_started"))
+                .findFirst().orElseThrow().data.get("requestDetail"))
+                .containsEntry("querySummary", "salmon");
+        assertThat((Map<String, Object>) events.stream().filter(e -> e.event.equals("tool_completed"))
+                .findFirst().orElseThrow().data.get("outcomeDetail"))
+                .containsEntry("resultTruncated", true);
 
         // 下一轮只看 durable 回答和 Citation 投影，展示 Trace 不回灌标题、摘要或主模型。
         AGENT.completeWithTrace(List.of());
         postSse("/api/conversations/" + conv + "/messages", Map.of("text", "继续"));
         assertThat(messagesOf(agentRequest(1)).get(1).text())
                 .isEqualTo("测试回答")
-                .doesNotContain("先确定检索范围", "命中 2 条资料");
+                .doesNotContain("先确定检索范围", "命中 2 条资料", "salmon", "COMPLETE", "resultTruncated");
         assertThat(Files.readAllLines(fileOf(conv)).stream()
                 .filter(line -> line.contains("\"type\":\"title\"")).count()).isEqualTo(1);
     }
@@ -1109,16 +1122,32 @@ class ConversationModuleIntegrationTest {
                     listener.onReasoningDelta(item.text());
                     continue;
                 }
-                listener.onToolStarted(new AgentToolStarted(
-                        item.toolCallId(), item.toolName(), item.safeSummary()));
-                if (item.toolStatus() == AgentRunTraceItem.ToolStatus.FAILED) {
-                    listener.onToolFailed(new AgentToolFailed(
-                            item.toolCallId(), item.toolName(), 1,
-                            item.stableErrorCode(), item.safeSummary()));
+                if (item.requestDetail() == null) {
+                    listener.onToolStarted(new AgentToolStarted(
+                            item.toolCallId(), item.toolName(), item.safeSummary()));
                 } else {
-                    listener.onToolCompleted(new AgentToolCompleted(
-                            item.toolCallId(), item.toolName(), 1,
-                            "TEST", 2, item.truncated(), false));
+                    listener.onToolStarted(new AgentToolStarted(
+                            item.toolCallId(), item.toolName(), item.safeSummary(), item.requestDetail()));
+                }
+                if (item.toolStatus() == AgentRunTraceItem.ToolStatus.FAILED) {
+                    if (item.outcomeDetail() == null) {
+                        listener.onToolFailed(new AgentToolFailed(
+                                item.toolCallId(), item.toolName(), 1,
+                                item.stableErrorCode(), item.safeSummary()));
+                    } else {
+                        listener.onToolFailed(new AgentToolFailed(
+                                item.toolCallId(), item.toolName(), item.outcomeDetail(),
+                                item.stableErrorCode(), item.safeSummary()));
+                    }
+                } else {
+                    if (item.outcomeDetail() == null) {
+                        listener.onToolCompleted(new AgentToolCompleted(
+                                item.toolCallId(), item.toolName(), 1,
+                                "TEST", 2, item.truncated(), false));
+                    } else {
+                        listener.onToolCompleted(new AgentToolCompleted(
+                                item.toolCallId(), item.toolName(), item.outcomeDetail(), item.safeSummary()));
+                    }
                 }
             }
             List<AgentResult> scripted = scriptedResults;

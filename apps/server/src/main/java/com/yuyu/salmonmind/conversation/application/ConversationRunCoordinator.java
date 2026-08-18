@@ -20,6 +20,8 @@ import com.yuyu.salmonmind.agent.api.AgentSummaryService;
 import com.yuyu.salmonmind.agent.api.AgentTitleRequest;
 import com.yuyu.salmonmind.agent.api.AgentTitleResult;
 import com.yuyu.salmonmind.agent.api.AgentTitleService;
+import com.yuyu.salmonmind.agent.api.AgentToolOutcomeDetail;
+import com.yuyu.salmonmind.agent.api.AgentToolRequestDetail;
 import com.yuyu.salmonmind.agent.api.AgentUsage;
 import com.yuyu.salmonmind.agent.api.AgentWebCitation;
 import com.yuyu.salmonmind.agent.api.AgentWebRetrievedSource;
@@ -53,6 +55,8 @@ import com.yuyu.salmonmind.conversation.api.RunStreamListener.ToolStarted;
 import com.yuyu.salmonmind.conversation.api.RunTraceItemPayload;
 import com.yuyu.salmonmind.conversation.api.TitlePayload;
 import com.yuyu.salmonmind.conversation.api.TokenUsage;
+import com.yuyu.salmonmind.conversation.api.ToolOutcomeDetailPayload;
+import com.yuyu.salmonmind.conversation.api.ToolRequestDetailPayload;
 import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
 import com.yuyu.salmonmind.conversation.api.WebCitationPayload;
 import com.yuyu.salmonmind.conversation.api.WebRetrievedSourcePayload;
@@ -623,7 +627,8 @@ class ConversationRunCoordinator {
             @Override
             public void onToolStarted(com.yuyu.salmonmind.agent.api.AgentToolStarted event) {
                 listener.onToolStarted(new RunStreamListener.ToolStarted(
-                        running.id(), event.toolCallId(), event.toolName(), event.safeQuerySummary()));
+                        running.id(), event.toolCallId(), event.toolName(), event.safeQuerySummary(),
+                        mapRequestDetail(event.requestDetail())));
             }
 
             @Override
@@ -631,14 +636,14 @@ class ConversationRunCoordinator {
                 listener.onToolCompleted(new RunStreamListener.ToolCompleted(
                         running.id(), event.toolCallId(), event.toolName(), event.durationMillis(),
                         event.provider(), event.sourceCount(), event.truncated(), event.degraded(),
-                        event.safeSummary()));
+                        event.safeSummary(), mapOutcomeDetail(event.outcomeDetail())));
             }
 
             @Override
             public void onToolFailed(com.yuyu.salmonmind.agent.api.AgentToolFailed event) {
                 listener.onToolFailed(new RunStreamListener.ToolFailed(
                         running.id(), event.toolCallId(), event.toolName(), event.durationMillis(),
-                        event.stableErrorCode(), event.safeMessage()));
+                        event.stableErrorCode(), event.safeMessage(), mapOutcomeDetail(event.outcomeDetail())));
             }
         });
 
@@ -1082,10 +1087,12 @@ class ConversationRunCoordinator {
             case AgentLocalRetrievedSource local -> new LocalRetrievedSourcePayload(
                     local.referenceId(), local.evidenceId(), local.revisionId(),
                     local.documentName(), local.location(), local.retrievedAt(),
-                    local.excerptKind(), local.sourceExcerpt());
+                    local.excerptKind(), local.sourceExcerpt(), local.originToolCallId(),
+                    local.resultPosition(), local.providerRank());
             case AgentWebRetrievedSource web -> new WebRetrievedSourcePayload(
                     web.referenceId(), web.provider(), web.title(), web.url(), web.site(),
-                    web.dateLabel(), web.retrievedAt(), web.excerptKind(), web.sourceExcerpt());
+                    web.dateLabel(), web.retrievedAt(), web.excerptKind(), web.sourceExcerpt(),
+                    web.originToolCallId(), web.resultPosition(), web.providerRank());
         }).map(RetrievedSourcePayload.class::cast).toList();
     }
 
@@ -1103,8 +1110,31 @@ class ConversationRunCoordinator {
                         case COMPLETED -> RunTraceItemPayload.ToolStatus.COMPLETED;
                         case FAILED -> RunTraceItemPayload.ToolStatus.FAILED;
                     },
-                    item.safeSummary(), item.stableErrorCode(), item.truncated());
+                    item.safeSummary(), item.stableErrorCode(), mapRequestDetail(item.requestDetail()),
+                    mapOutcomeDetail(item.outcomeDetail()), item.truncated());
         }).toList();
+    }
+
+    /** 把 Agent 已完成白名单投影的请求详情原样映射为可选 Conversation Payload。 */
+    private static ToolRequestDetailPayload mapRequestDetail(AgentToolRequestDetail detail) {
+        if (detail == null) {
+            return null;
+        }
+        return new ToolRequestDetailPayload(
+                detail.querySummary(), detail.querySummaryTruncated(), detail.freshness(),
+                detail.freshnessDefaulted(), detail.count(), detail.countDefaulted());
+    }
+
+    /** 把 Agent 已确认的终态字段映射为 SSE/JSONL 共用的展示 Payload。 */
+    private static ToolOutcomeDetailPayload mapOutcomeDetail(AgentToolOutcomeDetail detail) {
+        if (detail == null) {
+            return null;
+        }
+        ToolOutcomeDetailPayload.ResultStatus status = detail.resultStatus() == null
+                ? null : ToolOutcomeDetailPayload.ResultStatus.valueOf(detail.resultStatus().name());
+        return new ToolOutcomeDetailPayload(
+                detail.provider(), status, detail.stableReasonCode(), detail.sourceCount(),
+                detail.durationMillis(), detail.degraded(), detail.resultTruncated());
     }
 
     /** 手动继续时只保留新模型结果相对旧 Assistant 的新增后缀。 */

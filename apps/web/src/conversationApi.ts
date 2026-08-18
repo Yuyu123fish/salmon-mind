@@ -71,6 +71,27 @@ export type WebCitation = {
 
 export type CitationPayload = LocalCitation | WebCitation
 
+export type ToolResultStatus = 'SUCCESS' | 'DEGRADED' | 'EMPTY' | 'UNAVAILABLE'
+
+export type ToolRequestDetail = {
+  querySummary: string
+  querySummaryTruncated: boolean
+  freshness: string | null
+  freshnessDefaulted: boolean
+  count: number | null
+  countDefaulted: boolean
+}
+
+export type ToolOutcomeDetail = {
+  provider: string | null
+  resultStatus: ToolResultStatus | null
+  stableReasonCode: string | null
+  sourceCount: number | null
+  durationMillis: number
+  degraded: boolean
+  resultTruncated: boolean
+}
+
 export type LocalRetrievedSource = {
   kind: 'local'
   referenceId: string
@@ -81,6 +102,9 @@ export type LocalRetrievedSource = {
   retrievedAt: string
   excerptKind: string
   sourceExcerpt?: string | null
+  originToolCallId?: string | null
+  resultPosition?: number | null
+  providerRank?: number | null
 }
 
 export type WebRetrievedSource = {
@@ -94,6 +118,9 @@ export type WebRetrievedSource = {
   retrievedAt: string
   excerptKind: string
   sourceExcerpt?: string | null
+  originToolCallId?: string | null
+  resultPosition?: number | null
+  providerRank?: number | null
 }
 
 export type RetrievedSourcePayload = LocalRetrievedSource | WebRetrievedSource
@@ -112,6 +139,8 @@ export type ToolTraceItem = {
   toolStatus: 'RUNNING' | 'COMPLETED' | 'FAILED'
   safeSummary: string
   stableErrorCode: string | null
+  requestDetail?: ToolRequestDetail | null
+  outcomeDetail?: ToolOutcomeDetail | null
 }
 
 export type RunTraceItem = ReasoningTraceItem | ToolTraceItem
@@ -186,6 +215,7 @@ export type ToolStartedEvent = {
   toolCallId: string
   toolName: string
   safeSummary: string
+  requestDetail?: ToolRequestDetail | null
 }
 
 export type ToolCompletedEvent = {
@@ -198,6 +228,7 @@ export type ToolCompletedEvent = {
   truncated: boolean
   degraded: boolean
   safeSummary: string
+  outcomeDetail?: ToolOutcomeDetail | null
 }
 
 export type ToolFailedEvent = {
@@ -207,6 +238,7 @@ export type ToolFailedEvent = {
   durationMillis: number
   stableErrorCode: string
   safeMessage: string
+  outcomeDetail?: ToolOutcomeDetail | null
 }
 
 export type AssistantCompletedEvent = {
@@ -519,6 +551,7 @@ function validateKnownRunEvent(
     case 'tool_started':
       requireToolIdentity(value)
       requireString(value, 'safeSummary')
+      requireOptionalRequestDetail(value.requestDetail)
       return
     case 'tool_completed':
       requireToolIdentity(value)
@@ -528,12 +561,14 @@ function validateKnownRunEvent(
       requireBoolean(value, 'truncated')
       requireBoolean(value, 'degraded')
       requireString(value, 'safeSummary')
+      requireOptionalOutcomeDetail(value.outcomeDetail)
       return
     case 'tool_failed':
       requireToolIdentity(value)
       requireNumber(value, 'durationMillis')
       requireString(value, 'stableErrorCode')
       requireString(value, 'safeMessage')
+      requireOptionalOutcomeDetail(value.outcomeDetail)
       return
     case 'assistant_completed':
       requireString(value, 'conversationId')
@@ -834,8 +869,51 @@ function requireTrace(raw: unknown): void {
       requireEnum(item, 'toolStatus', ['RUNNING', 'COMPLETED', 'FAILED'])
       requireString(item, 'safeSummary')
       requireNullableString(item, 'stableErrorCode')
+      requireOptionalRequestDetail(item.requestDetail)
+      requireOptionalOutcomeDetail(item.outcomeDetail)
     }
   }
+}
+
+function requireOptionalRequestDetail(raw: unknown): void {
+  if (raw === undefined || raw === null) return
+  const detail = objectValue(raw)
+  requireString(detail, 'querySummary')
+  requireBoolean(detail, 'querySummaryTruncated')
+  if (detail.freshness !== undefined) requireNullableString(detail, 'freshness')
+  requireBoolean(detail, 'freshnessDefaulted')
+  if (detail.count !== undefined) requireNullableNumber(detail, 'count')
+  requireBoolean(detail, 'countDefaulted')
+  const count = detail.count
+  if (count !== null && count !== undefined) {
+    if (typeof count !== 'number' || !Number.isInteger(count) || count < 1) {
+      throw new ApiError('BAD_SSE_FRAME', '工具请求数量必须为正整数', 0)
+    }
+  }
+}
+
+function requireOptionalOutcomeDetail(raw: unknown): void {
+  if (raw === undefined || raw === null) return
+  const detail = objectValue(raw)
+  if (detail.provider !== undefined) requireNullableString(detail, 'provider')
+  if (detail.resultStatus !== undefined) {
+    if (detail.resultStatus !== null) {
+      requireEnum(detail, 'resultStatus', ['SUCCESS', 'DEGRADED', 'EMPTY', 'UNAVAILABLE'])
+    }
+  }
+  if (detail.stableReasonCode !== undefined) requireNullableString(detail, 'stableReasonCode')
+  if (detail.sourceCount !== undefined) {
+    requireNullableNumber(detail, 'sourceCount')
+    const sourceCount = detail.sourceCount
+    if (sourceCount !== null && sourceCount !== undefined) {
+      if (typeof sourceCount !== 'number' || !Number.isInteger(sourceCount) || sourceCount < 0) {
+        throw new ApiError('BAD_SSE_FRAME', '工具来源数必须为非负整数', 0)
+      }
+    }
+  }
+  requireNumber(detail, 'durationMillis')
+  requireBoolean(detail, 'degraded')
+  requireBoolean(detail, 'resultTruncated')
 }
 
 function requireCitations(raw: unknown): void {
@@ -874,6 +952,25 @@ function requireRetrievedSources(raw: unknown): void {
     requireString(source, 'retrievedAt')
     requireString(source, 'excerptKind')
     if (source.sourceExcerpt !== undefined) requireNullableString(source, 'sourceExcerpt')
+    if (source.originToolCallId !== undefined) requireNullableString(source, 'originToolCallId')
+    if (source.resultPosition !== undefined) {
+      requireNullableNumber(source, 'resultPosition')
+      const position = source.resultPosition
+      if (position !== null && position !== undefined) {
+        if (typeof position !== 'number' || !Number.isInteger(position) || position < 1) {
+          throw new ApiError('BAD_SSE_FRAME', '来源结果位置必须为正整数', 0)
+        }
+      }
+    }
+    if (source.providerRank !== undefined) {
+      requireNullableNumber(source, 'providerRank')
+      const providerRank = source.providerRank
+      if (providerRank !== null && providerRank !== undefined) {
+        if (typeof providerRank !== 'number' || !Number.isInteger(providerRank) || providerRank < 1) {
+          throw new ApiError('BAD_SSE_FRAME', 'Provider 位次必须为正整数', 0)
+        }
+      }
+    }
     if (source.kind === 'local') {
       requireString(source, 'evidenceId')
       requireString(source, 'revisionId')

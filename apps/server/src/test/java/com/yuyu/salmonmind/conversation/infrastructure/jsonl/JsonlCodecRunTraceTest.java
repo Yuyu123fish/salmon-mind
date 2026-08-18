@@ -6,6 +6,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
 import com.yuyu.salmonmind.conversation.api.Entry;
 import com.yuyu.salmonmind.conversation.api.RunTraceItemPayload;
+import com.yuyu.salmonmind.conversation.api.ToolOutcomeDetailPayload;
+import com.yuyu.salmonmind.conversation.api.ToolRequestDetailPayload;
 import com.yuyu.salmonmind.conversation.domain.ConversationHistory;
 import org.junit.jupiter.api.Test;
 
@@ -23,7 +25,10 @@ class JsonlCodecRunTraceTest {
                 RunTraceItemPayload.reasoning("先分析问题", false),
                 RunTraceItemPayload.tool(
                         "call-1", "search", RunTraceItemPayload.ToolStatus.COMPLETED,
-                        "命中 2 个来源", null, false),
+                        "命中 2 个来源", null,
+                        new ToolRequestDetailPayload("salmon", false, "week", false, 3, false),
+                        new ToolOutcomeDetailPayload("BOCHA", ToolOutcomeDetailPayload.ResultStatus.SUCCESS,
+                                "COMPLETE", 2, 125, false, true), false),
                 RunTraceItemPayload.reasoning("达到展示上限", true),
                 RunTraceItemPayload.tool(
                         "call-2", "search", RunTraceItemPayload.ToolStatus.FAILED,
@@ -37,8 +42,11 @@ class JsonlCodecRunTraceTest {
 
         assertThat(decoded.trace()).containsExactlyElementsOf(trace);
         assertThat(line).contains("\"kind\":\"reasoning\"", "\"status\":\"failed\"",
-                "\"truncated\":true");
+                "\"truncated\":true", "\"requestDetail\"", "\"outcomeDetail\"",
+                "\"resultTruncated\":true");
         assertThat(httpJson).contains("\"kind\":\"REASONING\"", "\"toolStatus\":\"FAILED\"");
+        assertThat(decoded.trace().get(1).requestDetail().querySummary()).isEqualTo("salmon");
+        assertThat(decoded.trace().get(1).outcomeDetail().resultTruncated()).isTrue();
 
         Entry oldEntry = assistantEntry(new AssistantMessagePayload(
                 "旧回答", UUID.randomUUID(), "provider", "model", null));

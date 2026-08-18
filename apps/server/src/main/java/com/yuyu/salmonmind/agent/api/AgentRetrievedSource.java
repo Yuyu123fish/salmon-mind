@@ -20,4 +20,13 @@ public sealed interface AgentRetrievedSource
 
     /** Server 收到本轮结果的时间。 */
     Instant retrievedAt();
+
+    /** 首次把该来源送入模型上下文的 Tool Call ID；旧历史或无法对应时为空。 */
+    String originToolCallId();
+
+    /** 该来源在首次最终有界 Tool Result 中的 1-based 位置；旧历史时为空。 */
+    Integer resultPosition();
+
+    /** 网页 Provider 返回的合法正整数位次；本地来源为空。 */
+    Integer providerRank();
 }

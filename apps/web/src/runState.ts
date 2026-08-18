@@ -8,6 +8,7 @@ import type {
   ToolFailedEvent,
   ToolStartedEvent,
   ToolTraceItem,
+  ToolOutcomeDetail,
 } from './conversationApi.ts'
 
 export const MAX_TRACE_ITEMS = 64
@@ -80,7 +81,7 @@ export function reduceActiveRun(state: ActiveRunState, action: ActiveRunAction):
     }
     case 'tool_started': {
       if (!accepts(state, action.event.runId)) return state
-      const updated = upsertTool(state, action.event.toolCallId, () => {
+      const updated = upsertTool(state, action.event.toolCallId, (previous) => {
         const summary = boundText(action.event.safeSummary || '工具执行中', MAX_TOOL_TRACE_SUMMARY_CHARS)
         return {
           kind: 'TOOL',
@@ -90,6 +91,8 @@ export function reduceActiveRun(state: ActiveRunState, action: ActiveRunAction):
           safeSummary: summary.text,
           stableErrorCode: null,
           truncated: summary.truncated,
+          requestDetail: action.event.requestDetail ?? previous?.requestDetail ?? null,
+          outcomeDetail: previous?.outcomeDetail ?? null,
         }
       })
       return withNewContent(updated, action.following)
@@ -105,7 +108,13 @@ export function reduceActiveRun(state: ActiveRunState, action: ActiveRunAction):
           toolStatus: 'COMPLETED',
           safeSummary: summary.text,
           stableErrorCode: null,
-          truncated: (previous?.truncated ?? false) || action.event.truncated || summary.truncated,
+          truncated:
+            (previous?.truncated ?? false) ||
+            (action.event.outcomeDetail === undefined && action.event.truncated) ||
+            summary.truncated,
+          requestDetail: previous?.requestDetail ?? null,
+          outcomeDetail:
+            action.event.outcomeDetail ?? previous?.outcomeDetail ?? legacyCompletedOutcome(action.event),
         }
       })
       return withNewContent(updated, action.following)
@@ -122,6 +131,8 @@ export function reduceActiveRun(state: ActiveRunState, action: ActiveRunAction):
           safeSummary: summary.text,
           stableErrorCode: action.event.stableErrorCode,
           truncated: (previous?.truncated ?? false) || summary.truncated,
+          requestDetail: previous?.requestDetail ?? null,
+          outcomeDetail: action.event.outcomeDetail ?? previous?.outcomeDetail ?? legacyFailedOutcome(action.event),
         }
       })
       return withNewContent(updated, action.following)
@@ -228,4 +239,28 @@ function boundText(raw: string, maximum: number): { text: string; truncated: boo
   const code = raw.charCodeAt(end - 1)
   if (code >= 0xd800 && code <= 0xdbff) end -= 1
   return { text: raw.slice(0, end), truncated: true }
+}
+
+function legacyCompletedOutcome(event: ToolCompletedEvent): ToolOutcomeDetail {
+  return {
+    provider: event.provider,
+    resultStatus: null,
+    stableReasonCode: null,
+    sourceCount: event.sourceCount,
+    durationMillis: event.durationMillis,
+    degraded: event.degraded,
+    resultTruncated: event.truncated,
+  }
+}
+
+function legacyFailedOutcome(event: ToolFailedEvent): ToolOutcomeDetail {
+  return {
+    provider: null,
+    resultStatus: null,
+    stableReasonCode: null,
+    sourceCount: null,
+    durationMillis: event.durationMillis,
+    degraded: false,
+    resultTruncated: false,
+  }
 }

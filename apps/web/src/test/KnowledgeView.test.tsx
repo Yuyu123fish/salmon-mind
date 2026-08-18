@@ -167,6 +167,23 @@ describe('KnowledgeView', () => {
     expect(screen.getByText('处理中', { selector: 'span' })).toBeInTheDocument()
   })
 
+  it('uses the compact page title and places collapsed diagnostics before the document workspace', async () => {
+    render(<KnowledgeView />)
+
+    const title = await screen.findByRole('heading', { level: 1, name: '本地资料台' })
+    const stats = screen.getByLabelText('知识库概览')
+    const diagnostics = screen.getByText('检索诊断').closest('details')
+    const workspace = screen.getByRole('heading', { level: 2, name: '最近加入' }).closest('.knowledge-grid')
+
+    expect(title).toBeInTheDocument()
+    expect(screen.queryByText('把资料放在手边，等它变得可读。')).toBeNull()
+    expect(screen.queryByText(/上传一份 TXT、Markdown、PDF 或 DOCX/)).toBeNull()
+    expect(diagnostics).not.toBeNull()
+    expect(diagnostics).not.toHaveAttribute('open')
+    expect(stats.compareDocumentPosition(diagnostics as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect((diagnostics as Node).compareDocumentPosition(workspace as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
   it('keeps a failed deletion in DELETING and exposes retry deletion without preview', async () => {
     const deleting = documentSummary(first.id, first.name, 'DELETING')
     api.deleteDocument.mockRejectedValue(new KnowledgeApiError(
@@ -206,12 +223,16 @@ describe('KnowledgeView', () => {
     render(<KnowledgeView />)
 
     expect(await screen.findByRole('table')).toBeInTheDocument()
+    const evidenceList = screen.getByRole('region', { name: '切片列表' }) as HTMLDivElement
+    evidenceList.scrollTop = 180
     fireEvent.click(screen.getByRole('button', { name: '展开' }))
+    expect(evidenceList.scrollTop).toBe(180)
     expect(screen.getByRole('button', { name: '收起' })).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '下一页' }))
     await waitFor(() => expect(screen.getByRole('button', { name: '展开' })).toBeInTheDocument())
     expect(screen.queryByRole('button', { name: '收起' })).toBeNull()
+    expect((screen.getByRole('region', { name: '切片列表' }) as HTMLDivElement).scrollTop).toBe(0)
   })
 
   it('ignores stale list, slice, and search responses after deletion starts', async () => {

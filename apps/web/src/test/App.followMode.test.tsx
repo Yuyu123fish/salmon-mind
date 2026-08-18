@@ -235,7 +235,7 @@ describe('App follow mode', () => {
           type: 'ASSISTANT_MESSAGE',
           createdAt: '2026-08-18T00:00:01Z',
           payload: {
-            text: '结论 [L1]',
+            text: '结论 [L1] [W2]',
             runId: 'run-1',
             citations: [
               {
@@ -246,6 +246,16 @@ describe('App follow mode', () => {
                 documentName: '项目手册',
                 location: '第一章',
                 citationNote: '与结论直接相关',
+              },
+              {
+                kind: 'web',
+                referenceId: 'W2',
+                provider: 'legacy-provider',
+                title: '历史 Web 引用',
+                url: 'https://legacy.example.com/reference',
+                site: 'legacy.example.com',
+                dateLabel: null,
+                retrievedAt: '2026-08-18T00:00:00Z',
               },
             ],
             retrievedSources: [
@@ -259,18 +269,42 @@ describe('App follow mode', () => {
                 retrievedAt: '2026-08-18T00:00:00Z',
                 excerptKind: 'LOCAL_EVIDENCE',
                 sourceExcerpt: '本地资料摘录',
+                originToolCallId: 'call-local',
+                resultPosition: 2,
               },
               {
                 kind: 'web',
                 referenceId: 'W1',
                 provider: 'bocha',
                 title: '外部参考',
-                url: 'https://example.com/reference',
+                url: 'javascript:alert(1)',
                 site: 'example.com',
                 dateLabel: null,
                 retrievedAt: '2026-08-18T00:00:00Z',
                 excerptKind: 'WEB_SEARCH_SUMMARY',
                 sourceExcerpt: '外部搜索摘要',
+                resultPosition: 1,
+                providerRank: 3,
+              },
+            ],
+            trace: [
+              {
+                kind: 'TOOL',
+                truncated: false,
+                toolCallId: 'call-local',
+                toolName: 'search_local_knowledge',
+                toolStatus: 'COMPLETED',
+                safeSummary: '不能作为查询显示',
+                stableErrorCode: null,
+                requestDetail: {
+                  querySummary: '本地安全查询',
+                  querySummaryTruncated: false,
+                  freshness: null,
+                  freshnessDefaulted: false,
+                  count: 5,
+                  countDefaulted: false,
+                },
+                outcomeDetail: null,
               },
             ],
           },
@@ -285,7 +319,7 @@ describe('App follow mode', () => {
 
     const disclosure = await screen.findByRole('button', { name: /来源核验/ })
     expect(disclosure).toHaveAttribute('aria-expanded', 'false')
-    expect(disclosure).toHaveTextContent('1 条回答已引用 · 1 条本轮召回未引用')
+    expect(disclosure).toHaveTextContent('2 条回答已引用 · 1 条本轮召回未引用')
     expect(screen.queryByText('项目手册')).toBeNull()
 
     fireEvent.click(screen.getByRole('link', { name: '定位来源 [L1]' }))
@@ -293,9 +327,26 @@ describe('App follow mode', () => {
     await waitFor(() => expect(disclosure).toHaveAttribute('aria-expanded', 'true'))
     expect(screen.getByText('回答已引用')).toBeVisible()
     expect(screen.getByText('本轮召回未引用')).toBeVisible()
+    expect(screen.getByRole('region', { name: '来源列表与详情' })).toHaveAttribute('tabindex', '0')
+    expect(screen.getAllByText('结果位置 #2')).not.toHaveLength(0)
+    expect(screen.getByText('本地安全查询')).toBeVisible()
+    expect(screen.getByText(/本地知识库检索/)).toBeVisible()
     expect(screen.getByText('Agent 相关性摘要')).toBeVisible()
     expect(screen.getByText('本地证据摘录')).toBeVisible()
     expect(view.container.querySelector('#source-card-assistant-1-L1')).toHaveFocus()
+
+    fireEvent.click(screen.getByRole('button', { name: /本轮召回未引用/, expanded: false }))
+    fireEvent.click(screen.getByRole('button', { name: '展开来源详情 [W1]' }))
+
+    expect(view.container.querySelectorAll('.source-card-details')).toHaveLength(1)
+    expect(screen.queryByText('本地安全查询')).toBeNull()
+    expect(screen.getByText('外部搜索摘要')).toBeVisible()
+    expect(screen.getByText('Provider 位次 #3')).toBeVisible()
+    expect(screen.queryByRole('link', { name: '外部参考' })).toBeNull()
+
+    fireEvent.click(screen.getByRole('link', { name: '定位来源 [W2]' }))
+    await waitFor(() => expect(view.container.querySelector('#source-card-assistant-1-W2')).toHaveFocus())
+    expect(screen.getByText('检索时间').parentElement).toHaveTextContent('2026')
   })
 
   it('shows continue only for the active incomplete Assistant and sends its entry id', async () => {

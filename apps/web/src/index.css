@@ -420,7 +420,21 @@ button {
 .source-disclosure-body {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  min-width: 0;
+}
+
+.source-disclosure-scroll {
+  max-height: min(42vh, 460px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  overscroll-behavior: contain;
+  padding: 0 5px 2px 1px;
+}
+
+.source-disclosure-scroll:focus-visible {
+  outline: 2px solid var(--salmon);
+  outline-offset: 4px;
 }
 
 .source-disclosure-body h4 {
@@ -520,6 +534,49 @@ button {
 
 .source-card-details {
   min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.source-detail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 7px 0 0;
+  border-top: 1px solid rgba(197, 210, 205, 0.72);
+  padding-top: 7px;
+}
+
+.source-detail-list > div {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 8px;
+}
+
+.source-detail-list dt,
+.source-detail-list dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.68rem;
+  line-height: 1.45;
+}
+
+.source-detail-list dt {
+  color: var(--muted);
+}
+
+.source-detail-list dd {
+  color: var(--ink);
+}
+
+.source-detail-list a {
+  color: var(--river);
+  overflow-wrap: anywhere;
+  text-decoration: none;
+}
+
+.source-detail-list a:hover {
+  text-decoration: underline;
 }
 
 .citation-ref {
@@ -800,6 +857,11 @@ button {
   border-left-color: var(--muted);
 }
 
+.citation-card[data-active='true'] {
+  border-left-color: var(--river);
+  background: rgba(47, 79, 72, 0.08);
+}
+
 .citation-card:focus {
   outline: 2px solid var(--salmon);
   outline-offset: 2px;
@@ -1059,12 +1121,6 @@ button {
   font-weight: 500;
   line-height: 1.08;
   letter-spacing: -0.025em;
-}
-
-.knowledge-hero .lede {
-  max-width: 680px;
-  margin: 0;
-  color: var(--muted);
 }
 
 .knowledge-upload {
@@ -1752,6 +1808,17 @@ button {
   display: flex;
   flex-direction: column;
   gap: 9px;
+  max-height: min(52vh, 680px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  overscroll-behavior: contain;
+  padding: 1px 4px 1px 1px;
+}
+
+.evidence-list:focus-visible {
+  outline: 2px solid var(--salmon);
+  outline-offset: 4px;
 }
 
 .evidence-card {

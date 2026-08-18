@@ -108,6 +108,7 @@ function KnowledgeView() {
   const [searchResult, setSearchResult] = useState<KnowledgeSearchResult | null>(null)
   const [searchError, setSearchError] = useState<string | null>(null)
   const [expandedChunks, setExpandedChunks] = useState<Set<string>>(new Set())
+  const evidenceListRef = useRef<HTMLDivElement>(null)
   const [pageVisible, setPageVisible] = useState(window.document.visibilityState === 'visible')
   const detailRequest = useRef(0)
   const documentListRequest = useRef(0)
@@ -225,7 +226,9 @@ function KnowledgeView() {
   }, [detail?.document.state, evidencePageNumber, selectedId])
 
   useEffect(() => {
+    // 只有文档或页码真正变化时才清空展开项并归零内部滚动；展开单片不抢用户当前阅读位置。
     setExpandedChunks(new Set())
+    if (evidenceListRef.current !== null) evidenceListRef.current.scrollTop = 0
   }, [evidencePageNumber, selectedId])
 
   const readyCount = useMemo(() => documents.filter((item) => item.state === 'READY').length, [documents])
@@ -337,11 +340,7 @@ function KnowledgeView() {
     <section className="knowledge-view" aria-labelledby="knowledge-title">
       <header className="knowledge-hero">
         <div>
-          <p className="kicker">本地资料台</p>
-          <h1 id="knowledge-title">把资料放在手边，等它变得可读。</h1>
-          <p className="lede">
-            上传一份 TXT、Markdown、PDF 或 DOCX。页面会持续显示处理进度，只有完整建好索引后才标记为已就绪。
-          </p>
+          <h1 id="knowledge-title">本地资料台</h1>
         </div>
         <label className="knowledge-upload">
           <span>{uploading ? '正在接收…' : '选择文档'}</span>
@@ -367,6 +366,63 @@ function KnowledgeView() {
         <div><strong>{readyCount}</strong><span>已就绪</span></div>
         <div><strong>{activeCount}</strong><span>处理中</span></div>
       </div>
+
+      <details className="retrieval-diagnostics">
+        <summary className="retrieval-summary">
+          <div>
+            <p className="kicker">检索诊断</p>
+            <h2 id="retrieval-title">看看一条查询如何穿过资料</h2>
+          </div>
+          <span>{searchResult?.policyVersion ?? '按需展开'}</span>
+        </summary>
+        <div className="retrieval-diagnostics-body" aria-labelledby="retrieval-title">
+          <form className="retrieval-form" onSubmit={(event) => { event.preventDefault(); void handleSearch() }}>
+            <input
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="输入中文或英文查询"
+              maxLength={2000}
+              aria-label="检索查询"
+            />
+            <button type="submit" className="primary-small" disabled={searching || searchQuery.trim() === ''}>
+              {searching ? '检索中…' : '运行检索'}
+            </button>
+          </form>
+          {searchError !== null && <p className="detail-error">{searchError}</p>}
+          {searchResult !== null && (
+            <>
+              <div className={`retrieval-status ${searchResult.status.toLowerCase()}`} role="status">
+                <strong>{searchResult.status}</strong>
+                <span>{searchReasonLabels[searchResult.reason]}</span>
+                <small>已执行：{searchResult.executedStages.join(' → ') || '—'} · 跳过：{searchResult.skippedStages.join('、') || '—'}</small>
+              </div>
+              <div className="retrieval-stages">
+                {searchStageLabels.map(([key, label]) => {
+                  const stage: SearchStage = searchResult[key]
+                  return (
+                    <section className="retrieval-stage" key={key}>
+                      <div className="section-heading compact"><h3>{label}</h3><span>{stage.items.length} 条</span></div>
+                      {stage.items.length === 0 ? <p className="detail-hint">没有候选</p> : (
+                        <ol>
+                          {stage.items.map((item) => (
+                            <li key={`${key}-${item.evidenceId}`}>
+                              <div>
+                                <strong>#{item.rank ?? '—'} · {item.documentName}</strong>
+                                <small>{item.location} · 诊断分数 {item.score === null ? '—' : item.score.toFixed(4)}</small>
+                              </div>
+                              <p>{item.text}</p>
+                            </li>
+                          ))}
+                        </ol>
+                      )}
+                    </section>
+                  )
+                })}
+              </div>
+            </>
+          )}
+        </div>
+      </details>
 
       <div className="knowledge-grid">
         <section className="document-shelf" aria-labelledby="document-list-title">
@@ -412,7 +468,7 @@ function KnowledgeView() {
             <div className="detail-placeholder">
               <p className="kicker">资料详情</p>
               <h2>选一份资料</h2>
-              <p>状态、解析信息和 Evidence 会在这里出现。</p>
+              <p>状态、解析信息和切片会在这里出现。</p>
             </div>
           ) : detailLoading && detail === null ? (
             <p className="detail-hint">正在打开资料…</p>
@@ -502,7 +558,13 @@ function KnowledgeView() {
                   {evidenceError !== null && <p className="detail-error">{evidenceError}</p>}
                   {evidence === null && evidenceError === null && <p className="detail-hint">正在读取切片…</p>}
                   {evidence !== null && evidence.items.length === 0 && <p className="detail-hint">没有可预览的切片。</p>}
-                  <div className="evidence-list">
+                  <div
+                    ref={evidenceListRef}
+                    className="evidence-list"
+                    role="region"
+                    aria-label="切片列表"
+                    tabIndex={0}
+                  >
                     {evidence?.items.map((item) => (
                       <article
                         className="evidence-card"
@@ -568,62 +630,6 @@ function KnowledgeView() {
         </section>
       </div>
 
-      <details className="retrieval-diagnostics">
-        <summary className="retrieval-summary">
-          <div>
-            <p className="kicker">检索诊断</p>
-            <h2 id="retrieval-title">看看一条查询如何穿过资料</h2>
-          </div>
-          <span>{searchResult?.policyVersion ?? '按需展开'}</span>
-        </summary>
-        <div className="retrieval-diagnostics-body" aria-labelledby="retrieval-title">
-          <form className="retrieval-form" onSubmit={(event) => { event.preventDefault(); void handleSearch() }}>
-            <input
-              value={searchQuery}
-              onChange={(event) => setSearchQuery(event.target.value)}
-              placeholder="输入中文或英文查询"
-              maxLength={2000}
-              aria-label="检索查询"
-            />
-            <button type="submit" className="primary-small" disabled={searching || searchQuery.trim() === ''}>
-              {searching ? '检索中…' : '运行检索'}
-            </button>
-          </form>
-          {searchError !== null && <p className="detail-error">{searchError}</p>}
-          {searchResult !== null && (
-            <>
-              <div className={`retrieval-status ${searchResult.status.toLowerCase()}`} role="status">
-                <strong>{searchResult.status}</strong>
-                <span>{searchReasonLabels[searchResult.reason]}</span>
-                <small>已执行：{searchResult.executedStages.join(' → ') || '—'} · 跳过：{searchResult.skippedStages.join('、') || '—'}</small>
-              </div>
-              <div className="retrieval-stages">
-                {searchStageLabels.map(([key, label]) => {
-                  const stage: SearchStage = searchResult[key]
-                  return (
-                    <section className="retrieval-stage" key={key}>
-                      <div className="section-heading compact"><h3>{label}</h3><span>{stage.items.length} 条</span></div>
-                      {stage.items.length === 0 ? <p className="detail-hint">没有候选</p> : (
-                        <ol>
-                          {stage.items.map((item) => (
-                            <li key={`${key}-${item.evidenceId}`}>
-                              <div>
-                                <strong>#{item.rank ?? '—'} · {item.documentName}</strong>
-                                <small>{item.location} · 诊断分数 {item.score === null ? '—' : item.score.toFixed(4)}</small>
-                              </div>
-                              <p>{item.text}</p>
-                            </li>
-                          ))}
-                        </ol>
-                      )}
-                    </section>
-                  )
-                })}
-              </div>
-            </>
-          )}
-        </div>
-      </details>
     </section>
   )
 }

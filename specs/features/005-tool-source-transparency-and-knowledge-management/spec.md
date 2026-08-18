@@ -8,7 +8,7 @@ SalmonMind 已经可以在对话中展示 Run Trace、主动调用本地知识�
 
 回答末尾的来源区虽然区分“回答已引用”和“本轮召回未引用”，但展开后会把所有来源纵向铺开，并同时显示 Agent 相关性摘要与较长的来源摘录。来源缺少与原 Tool Call 的关联和在实际 Tool Result 中的位置，信息密度不够；另一方面，长摘录又占据大量篇幅，用户难以快速核验一条引用或浏览本轮召回质量。
 
-Knowledge 页面已经支持单文档上传、异步处理、失败重试、检索诊断和 Evidence 预览，但还不是可维护的知识库：用户无法删除不再需要的文档及其派生切片。当前文档同时跨越 PostgreSQL Source/Revision/Job/Evidence 元数据、Elasticsearch 派生切片、RustFS 原件和 Redis Stream 生命周期，简单删除一行数据库记录或只删除 Elasticsearch 内容都会留下不一致状态。现有页面还把检索诊断长期放在资料管理主流程之前，并一次纵向展示多张完整纯文本 Evidence 卡片，日常管理和切片阅读都不够紧凑。
+Knowledge 页面已经支持单文档上传、异步处理、失败重试、检索诊断、切片预览和单文档删除。Stage 02 完成后，资料清单与详情已经成为管理主区，但真实使用反馈要求把默认折叠的检索诊断提前到该主区上方；切片虽然可以逐片展开，列表本身仍没有高度边界，展开长内容时会持续推高外层页面。页面顶部的说明性文案也重复解释了界面已经能够直接表达的状态。
 
 Feature 005 需要在不改变 JSONL Active Path 历史权威、不调整现有 RAG 排名策略和上下文预算的前提下，形成两个独立闭环：让工具调用和来源核验“默认简洁、按需详细”；让单个终态文档可以从未来检索范围、派生索引、原件存储和元数据中可靠删除，并在失败后安全重试。
 
@@ -16,12 +16,12 @@ Feature 005 需要在不改变 JSONL Active Path 历史权威、不调整现有 
 
 - 为 Tool Execution 增加稳定、可持久化的展示详情。当前三个搜索工具只投影经过白名单校验和长度限制的搜索词、时间范围与请求数量；完成后展示 Provider、结果状态、稳定原因、来源数量、耗时、降级和结果截断。原始参数 JSON、完整 Tool Result、请求头、凭据、Provider 原始响应和内部堆栈仍不可进入 Trace。
 - Tool Execution 默认使用紧凑摘要；用户展开单次调用后查看请求和结果详情。运行中 SSE 与刷新后的历史 Assistant 使用同一展示合同，旧 JSONL 缺少新增字段时继续正常显示。
-- Retrieved Source 记录其首次进入模型上下文时对应的 Tool Call、实际结果位置，以及网页 Provider 已提供时的原始位次。回答来源区继续默认折叠；展开后先显示紧凑来源行，只有用户展开某一来源时才显示 Citation Note 和 Source Excerpt。未引用来源作为独立的二级折叠区，不再默认铺开全部摘录。
+- Retrieved Source 记录其首次进入模型上下文时对应的 Tool Call、实际结果位置，以及网页 Provider 已提供时的原始位次。回答来源区继续默认折叠；展开后使用有界的紧凑召回清单，并且任一时刻只显示一个来源详情。详情复用已持久化的安全 Query Summary、召回位置、Citation Note 和 Source Excerpt；未引用来源仍是独立的二级折叠区。
 - 保留当前 Run-local `L/W` Citation 身份、Retrieved Source 总量、Source Excerpt 和 Citation Note 的既有边界；不把 BM25、Vector、RRF、Rerank 原始分数包装成可信度。
 - 在 Knowledge Source 上增加独立于 Ingestion Job 的删除生命周期。首版只允许 `READY`、`FAILED`、`OCR_REQUIRED` 文档进入删除；处理中的文档不隐式取消 Worker 或 Stream 消息。
 - 删除开始时先把 Source 置为 `DELETING`，该提交点之后立即从未来检索范围排除，但仍在 Knowledge 页面中可见，以便用户观察或重试清理。随后按精确 Source/Revision/Generation 身份幂等删除 Elasticsearch 切片和 RustFS 原件，最后在 PostgreSQL 事务中清理 Evidence、Job、Revision、Source 并重算受影响 Generation 的计数。
 - 删除任一外部存储失败时不把文档恢复为可检索状态，也不伪装删除成功；文档保持 `DELETING`，再次执行同一个删除操作即可从已完成步骤继续。删除成功后返回无正文成功结果并从资料列表消失。
-- 优化 Knowledge 页面信息层级：资料列表与详情优先，检索诊断默认折叠；用户界面使用“切片”而不是内部领域术语 “Evidence”。切片卡片显示序号、位置和字符数，默认限制正文高度并支持单片展开；Markdown 安全渲染 GFM，其他格式保留纯文本段落与换行。
+- 优化 Knowledge 页面信息层级：精简顶部说明，资料概览后依次显示默认折叠的检索诊断、资料清单与详情；用户界面使用“切片”而不是内部领域术语 “Evidence”。切片卡片显示序号、位置和字符数，预览列表拥有有界的内部纵向滚动区并支持单片展开；Markdown 安全渲染 GFM，其他格式保留纯文本段落与换行。
 
 ## Domain Terms
 
@@ -39,7 +39,7 @@ Feature 005 需要在不改变 JSONL Active Path 历史权威、不调整现有 
 
 ### Source Disclosure
 
-Assistant 回答末尾用于核验当前 Run Citation 和 Retrieved Source 的渐进展开区域。区域本身、未引用来源分组和单个来源正文分别拥有折叠层级，默认只保留识别来源所需的紧凑信息。
+Assistant 回答末尾用于核验当前 Run Citation 和 Retrieved Source 的渐进展开区域。区域本身和未引用来源分组分别拥有折叠层级；展开后使用紧凑召回清单，并通过单一活动详情展示当前来源的召回链路与摘录，避免多个来源同时撑高回答。
 
 ### Knowledge Source Lifecycle
 
@@ -72,8 +72,8 @@ Knowledge Source 是否仍可参与管理和检索的来源级生命周期。Fea
 15. 作为知识库用户，我希望删除失败时看到“删除未完成”并能够重试，以免出现无法判断的半删除状态。
 16. 作为知识库用户，我希望处理中的文档不会被删除按钮偷偷取消，以便异步入库状态保持可理解。
 17. 作为历史对话阅读者，我希望知识库文档删除后既有回答及其来源快照仍然可读，以便历史事实不被追溯篡改。
-18. 作为知识库用户，我希望资料列表和详情位于检索诊断之前，以便日常管理不被开发诊断界面打断。
-19. 作为知识库用户，我希望切片默认紧凑并能逐条展开，以便长文档不会产生过长页面。
+18. 作为知识库用户，我希望默认折叠的检索诊断位于资料清单与详情上方，以便先运行诊断，再查看或切换资料。
+19. 作为知识库用户，我希望切片预览使用自己的内部滚动区并能逐条展开，以便长文档不会持续拉长整个页面。
 20. 作为 Markdown 文档用户，我希望切片中的标题、列表、表格和代码保持安全可读，以便预览接近原始结构。
 
 ## Behavior and Failure Semantics
@@ -94,10 +94,11 @@ Knowledge Source 是否仍可参与管理和检索的来源级生命周期。Fea
 - Retrieved Source 的权威仍是当前 Run 的 Source Registry。只有真正留在有界 Tool Result 中并交给 Agent 的完整来源项可以进入历史展示。
 - 每个新来源记录首次产生它的 Tool Call ID 和从 1 开始的 Result Position。网页 Provider 返回合法正整数位次时可以额外保存 Provider Rank；本地来源的 Result Position 是最终有界结果顺序，不保存内部各检索阶段分数。
 - Local 继续按 Evidence ID、Web 继续按 Provider 与规范化 URL 去重。后续调用再次返回同一来源时复用原 `L/W` ID，并保留首次实际进入模型上下文时的 Tool Call 与位置；本 Feature 不建立无限增长的召回出现历史。
-- 来源区整体默认折叠。展开后，“回答已引用”默认可见为紧凑来源行；“本轮召回未引用”默认保持二级折叠。单个来源的 Citation Note 与 Source Excerpt 只有在该来源展开后显示。
+- 来源区整体默认折叠。展开后，“回答已引用”默认可见为紧凑来源行；“本轮召回未引用”默认保持二级折叠。来源清单和当前详情共用一个有界的内部纵向滚动区，任一时刻至多一个来源处于详情态。
 - 紧凑 Local 行至少显示 `referenceId`、文档名、切片位置和 Result Position；紧凑 Web 行至少显示 `referenceId`、标题、站点、Provider、Result Position，以及存在时的日期或 Provider Rank。
-- 点击正文合法 Citation 时，界面依次展开 Source Disclosure、对应分组和目标来源，随后聚焦并滚动到该来源。该行为不得破坏消息区 Follow Mode 或把整个页面强制滚动到底部。
-- Citation Note 仍只属于已引用来源，Source Excerpt 仍保持既有来源类型标签与长度上限。默认折叠只改变信息层级，不删除已持久化核验数据。
+- 当前来源详情按已有数据展示来源身份、首次 Tool Call、该调用的安全 Query Summary、Result Position、可选 Provider Rank、检索时间、Citation Note 与 Source Excerpt；缺失字段直接省略，不伪造“未知”值，也不显示内部检索 Score。
+- 点击正文合法 Citation 时，界面依次展开 Source Disclosure、对应分组并把目标设为唯一活动来源，随后在来源内部滚动区聚焦该行。该行为不得破坏消息区 Follow Mode 或把整个页面强制滚动到底部。
+- Citation Note 仍只属于已引用来源，Source Excerpt 仍保持既有来源类型标签与长度上限。新的清单与详情布局只改变信息层级，不删除已持久化核验数据，也不要求增加来源 Payload。
 - 旧 Retrieved Source 缺少 Tool Call 或位置时不显示伪造的“未知排名”；它仍按既有来源身份和摘录正常展示。
 
 ### 单文档删除状态机
@@ -133,9 +134,10 @@ DELETING
 - 删除按钮只位于当前文档详情操作区。首次点击进入确认状态，确认内容至少包含准确文档名和当前 Evidence 数量；取消确认不发起 DELETE。
 - `DELETING` 文档显示“删除未完成/正在删除”的明确状态和重试删除入口，不显示普通入库重试、Evidence 预览或可检索文案。
 - 删除成功后，前端使仍在进行的旧列表、详情、Evidence 和检索诊断请求失效；当前选择移动到仍存在的相邻文档或空状态，旧响应不得把已删除文档重新写回界面。
-- Knowledge 页面优先显示资料概览、列表和当前详情。检索诊断作为次级区域默认折叠；展开后继续沿用现有搜索与各阶段诊断合同，不调整 RAG 算法。
+- Knowledge 页面移除“把资料放在手边，等它变得可读。”和“页面会持续显示处理进度，只有完整建好索引后才标记为已就绪。”，不再补充另一段营销式说明；现有“本地资料台”作为简洁可访问的页面标题保留。
+- 页面顺序固定为：简洁标题与上传入口 → 资料概览 → 默认折叠的检索诊断 → 资料清单与当前详情。诊断区展开后继续沿用现有搜索与各阶段诊断合同，不调整 RAG 算法。
 - 用户界面统一使用“切片预览”“切片数量”等措辞；内部类型、数据库表和模块接口仍可使用 Evidence，避免为文案修改领域模型。
-- 每张切片卡片显示从 1 开始的可读序号、Location 和字符数。正文默认限制可见高度，用户可以独立展开或收起；翻页或切换文档后不保留另一个文档的展开状态。
+- 每张切片卡片显示从 1 开始的可读序号、Location 和字符数。正文默认限制可见高度，用户可以独立展开或收起；切片列表使用视口相关的最大高度和内部纵向滚动，分页控件留在滚动区外。翻页或切换文档后重置展开状态并把内部滚动位置归零。
 - Markdown Revision 使用现有安全 GFM 渲染 seam，继续禁用原始 HTML和危险链接；TEXT、PDF、DOCX 以纯文本方式保留段落与换行，不因类似 Markdown 的符号改变含义。
 - 长表格、代码、URL 和无空格文本不能撑破详情列；桌面和窄屏下删除确认、分页与单片展开均可操作。
 
@@ -185,7 +187,7 @@ DELETING
 ### 测试 seam
 
 - Tool Display Detail 通过 Agent stream interface、Conversation 映射和 JSONL 往返验证。测试观察类型化事件与重新打开后的 Assistant，不断言 Collector 私有列表或框架内部对象。
-- Source Disclosure 通过 Web 组件的用户行为验证：默认折叠、分组展开、单来源展开、Citation 聚焦和旧 Payload 兼容，不测试 CSS 的具体像素值。
+- Source Disclosure 通过 Web 组件的用户行为验证：默认折叠、分组展开、单一活动来源、召回详情、Citation 聚焦和旧 Payload 兼容；内部滚动的真实尺寸与触控行为留给浏览器验收，不在 JSDOM 中断言具体像素值。
 - 文档删除以 `knowledge::api`/HTTP 为主要测试面，复用现有 PostgreSQL、Elasticsearch、S3-compatible 和 Redis Testcontainers 基础设施，验证从可检索文档到完全删除的端到端结果。
 - 删除失败恢复使用可控 Adapter 故障验证 application 编排：只检查 Source 是否立即停止召回、状态是否保持 `DELETING`、再次调用是否收敛，不为每个 Mapper 建重复单元测试。
 - Chunk Preview 与检索诊断使用现有前端测试 seam；Markdown 安全边界复用既有 Renderer 测试，不复制一套 Markdown Parser 测试。
@@ -197,7 +199,7 @@ DELETING
 2. Started、Completed、Failed 的同一 Tool Call 原位更新，耗时、来源数、降级、结果截断和稳定错误在运行中及刷新后保持一致。
 3. Query Summary 的控制字符、空白、Unicode 与长度边界正确；未知工具不会自动展示任意参数。
 4. Retrieved Source 的 Tool Call、Result Position、可选 Provider Rank 和首次去重语义正确；内部检索 Score 不进入 Conversation Payload。
-5. 来源区默认紧凑；引用与未引用分组、单来源展开和行内 Citation 聚焦在多来源场景下可用。
+5. 来源区默认紧凑；引用与未引用分组、单一活动来源、已有召回详情和行内 Citation 聚焦在多来源场景下可用。
 6. 旧 Trace/Retrieved Source 缺少新增字段时能够解码、打开和再次写入，不需要历史迁移。
 7. READY 文档删除后不再出现在列表、详情和本地检索中；对应 Elasticsearch Evidence、RustFS 原件、PostgreSQL 元数据均不存在，Generation 计数准确。
 8. FAILED 与 OCR_REQUIRED 文档在零 Evidence 情况下仍可删除；非终态文档返回 `DOCUMENT_DELETE_NOT_ALLOWED` 且 Worker 状态不变。
@@ -205,8 +207,8 @@ DELETING
 10. 并发或重复 DELETE 不越过 Workspace/Source/Revision 精确目标，不删除整个 Index、Bucket、Stream 或其他文档。
 11. 文档删除后，历史 Conversation 中已经持久化的 Citation 与 Source Excerpt 继续可读。
 12. 删除期间和删除成功后的旧异步前端响应不会复活文档、Evidence 或过期诊断结果。
-13. Markdown 切片使用安全 GFM，其他格式保持纯文本；切片折叠、展开、分页和长内容在桌面/窄屏可用。
-14. Knowledge 页面默认优先展示资料管理，检索诊断折叠后仍可正常运行既有 Pipeline。
+13. Markdown 切片使用安全 GFM，其他格式保持纯文本；切片折叠、展开、内部滚动、分页和长内容在桌面/窄屏可用。
+14. Knowledge 页面在资料概览后先显示默认折叠的检索诊断，再显示资料清单和详情；既有 Pipeline 功能不回退。
 
 ### 真实验证边界
 
@@ -236,9 +238,9 @@ DELETING
 3. 同一 Tool Call 在 started/completed/failed 之间按 ID 原位更新；多个并发调用互不覆盖，运行中与刷新后的详情一致。
 4. Tool Display Detail 与 Retrieved Source 新字段不进入模型上下文、标题、Compaction 或 Token Budget；旧 JSONL 无需迁移即可读取。
 5. 每个新 Retrieved Source 可以追溯到首次产生它的 Tool Call 和实际 Result Position；网页存在合法 Provider Rank 时可以查看，但内部检索 Score 不显示。
-6. Source Disclosure 默认折叠；展开后引用来源优先、未引用来源二级折叠，单个来源的 Citation Note 和 Source Excerpt 按需展开。
+6. Source Disclosure 默认折叠；展开后引用来源优先、未引用来源二级折叠，紧凑清单中至多一个来源详情可见，并能查看现有安全召回链路、Citation Note 和 Source Excerpt。
 7. 点击合法行内 Citation 可以展开并聚焦对应来源；旧/未知 ID、代码和普通链接仍不产生伪定位。
-8. 大量召回来源不会默认铺开全部摘录；桌面和窄屏均可扫描来源身份并独立展开具体来源。
+8. 大量召回来源不会默认铺开全部摘录；来源清单与当前详情限制在内部滚动区中，桌面和窄屏均可扫描来源身份并切换活动来源。
 9. 用户可以在详情中确认并删除 READY、FAILED 或 OCR_REQUIRED 的单个文档；非终态文档明确拒绝且不会被隐式取消。
 10. 删除 Source 进入 `DELETING` 后立即退出未来检索范围，且不能被旧 Worker/Job 状态覆盖回可检索。
 11. 删除成功后，关联 Elasticsearch Evidence、RustFS 原件、PostgreSQL Evidence/Job/Revision/Source 均已清理，受影响 Generation 计数正确。
@@ -246,16 +248,16 @@ DELETING
 13. 删除操作严格限制在当前 Workspace 的精确 Source/Revision/Generation/Object Key，不扫描或清空整个 Index、Bucket、Stream 或其他数据。
 14. 文档删除后历史 Conversation 的 Citation、Retrieved Source、Citation Note 和 Source Excerpt 仍然可读，但该文档不再被未来 Run 召回。
 15. 删除成功或切换文档后，过期列表、详情、Evidence 和检索请求不会把旧状态重新写回页面。
-16. Knowledge 页面优先展示资料列表和详情，检索诊断默认折叠且展开后功能不回退。
-17. UI 使用“切片预览”，每片显示可读序号、位置和字符数；正文默认紧凑并可独立展开。
+16. Knowledge 页面移除两段指定说明文案，并在资料概览后、资料清单与详情前展示默认折叠的检索诊断；展开后功能不回退。
+17. UI 使用“切片预览”，每片显示可读序号、位置和字符数；正文默认紧凑并可独立展开，切片列表通过内部纵向滚动限制页面增长。
 18. Markdown 切片安全渲染 GFM，TEXT/PDF/DOCX 保持纯文本段落；长表格、代码、URL 和无空格文本不破坏布局。
 19. Agent/Conversation/Knowledge/Web 的聚焦行为测试、跨存储删除集成测试、模块结构测试、前端 lint/build 和必要浏览器验收通过。
 20. 实施报告准确列出真实外部验证和人工验收是否执行；未执行的模型、Provider 或真实数据验证不得写成已通过。
 
 ## Further Notes
 
-- 本 Feature 拟拆为两个线性 Stage：① Tool Display Detail、Retrieved Source 元数据与 Source Disclosure；② 单文档删除、Knowledge 页面层级和 Chunk Preview。当前只创建 Spec，不创建 Plan 文件。
+- 本 Feature 使用三个线性 Stage：① Tool Display Detail、Retrieved Source 元数据与 Source Disclosure；② 单文档删除、Knowledge 页面层级和 Chunk Preview；③ 根据真实使用反馈收口 Knowledge 与 Source Disclosure 的信息密度和滚动所有权。Stage 03 不改变前两个 Stage 已成立的后端、持久化和删除合同。
 - Feature 005 的删除目标包括 RustFS 原件，而不只是 Elasticsearch 切片；否则“删除文档”会留下用户不可见的原始内容，不符合知识库管理语义。
 - 首版只删除终态文档是控制范围的明确产品边界。若后续要求删除处理中文档，必须单独设计 Worker 取消、Stream Pending、发布 Fence 和并发恢复，不能在实施中自行放宽。
-- 本 Spec 的 `Draft` 只表示候选稳定合同。开发者确认后才能改为 `Specified`；后续 Stage Plan、代码实施、测试执行、真实外部验证、提交和推送仍需分别授权。
+- 本 Spec 保持 `Specified`；Stage 03 Plan 仍从 `Draft` 开始。Plan 确认、代码实施、测试执行、真实外部验证、提交和推送继续分别授权。
 - Feature 005 不推翻 Feature 002–004 已验收的 JSONL/Active Path 权威、Redis 非权威、Citation 身份、上下文预算、工具预算和模块依赖方向。若实施发现必须改变这些边界，应停止并回到 Spec 讨论。

@@ -32,7 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Server 内有界文档 Worker：从 Redis Stream 取消息，按状态顺序完成解析、Embedding、
  * Elasticsearch 幂等写入，最后由 PostgreSQL 事务发布 READY。Stream 只在成功或终态
- * 失败后 ACK；处理中断会保留 Pending，供下一次 reclaim。
+ * 失败后执行 XACK→XDEL 收束；处理中断会保留 Pending，供下一次 reclaim。
  */
 @Component
 class KnowledgeIngestionWorker implements SmartLifecycle {
@@ -50,11 +50,14 @@ class KnowledgeIngestionWorker implements SmartLifecycle {
     private final boolean enabled;
     private final long reclaimIdleMillis;
     private final long repairIntervalMillis;
+    private final long janitorIntervalMillis;
+    private final int janitorBatchSize;
     private final String consumerName;
 
     private final AtomicBoolean running = new AtomicBoolean();
     private volatile ExecutorService executor;
     private volatile long nextRepairAt;
+    private volatile long nextJanitorAt;
 
     KnowledgeIngestionWorker(
             KnowledgeMetadataPort metadata,
@@ -69,7 +72,9 @@ class KnowledgeIngestionWorker implements SmartLifecycle {
             @Value("${salmon.knowledge.worker.batch-size:4}") int batchSize,
             @Value("${salmon.knowledge.worker.enabled:true}") boolean enabled,
             @Value("${salmon.knowledge.worker.reclaim-idle:30s}") java.time.Duration reclaimIdle,
-            @Value("${salmon.knowledge.worker.repair-interval:10s}") java.time.Duration repairInterval
+            @Value("${salmon.knowledge.worker.repair-interval:10s}") java.time.Duration repairInterval,
+            @Value("${salmon.knowledge.worker.cleanup-interval:30s}") java.time.Duration janitorInterval,
+            @Value("${salmon.knowledge.worker.cleanup-batch-size:64}") int janitorBatchSize
     ) {
         this.metadata = metadata;
         this.queue = queue;
@@ -84,6 +89,15 @@ class KnowledgeIngestionWorker implements SmartLifecycle {
         this.enabled = enabled;
         this.reclaimIdleMillis = Math.max(1000, reclaimIdle.toMillis());
         this.repairIntervalMillis = Math.max(1000, repairInterval.toMillis());
+        if (janitorInterval.compareTo(java.time.Duration.ofSeconds(1)) < 0
+                || janitorInterval.compareTo(java.time.Duration.ofMinutes(10)) > 0) {
+            throw new IllegalArgumentException("Knowledge 清理周期必须在 1 秒到 10 分钟之间");
+        }
+        if (janitorBatchSize < 1 || janitorBatchSize > 256) {
+            throw new IllegalArgumentException("Knowledge 清理批次必须在 1 到 256 之间");
+        }
+        this.janitorIntervalMillis = Math.max(1000, janitorInterval.toMillis());
+        this.janitorBatchSize = janitorBatchSize;
         this.consumerName = "server-" + UUID.randomUUID();
     }
 
@@ -98,6 +112,7 @@ class KnowledgeIngestionWorker implements SmartLifecycle {
             return thread;
         });
         nextRepairAt = 0;
+        nextJanitorAt = 0;
         executor.submit(this::runLoop);
     }
 
@@ -125,6 +140,7 @@ class KnowledgeIngestionWorker implements SmartLifecycle {
         while (running.get()) {
             try {
                 repairPendingDispatch();
+                cleanupAcknowledgedMessages();
                 processMessages(queue.reclaim(consumerName, java.time.Duration.ofMillis(reclaimIdleMillis), batchSize), true);
                 processMessages(queue.read(consumerName, batchSize, java.time.Duration.ofSeconds(1)), false);
             } catch (KnowledgeException ex) {
@@ -159,11 +175,35 @@ class KnowledgeIngestionWorker implements SmartLifecycle {
         }
     }
 
+    /** 只清理已经 ACK 的消息，不重新读取或改变 PostgreSQL 业务状态。 */
+    private void cleanupAcknowledgedMessages() {
+        long now = System.currentTimeMillis();
+        if (now < nextJanitorAt) {
+            return;
+        }
+        nextJanitorAt = now + janitorIntervalMillis;
+        List<String> safeToDelete = new ArrayList<>();
+        for (KnowledgeQueuePort.CleanupCandidate candidate : queue.cleanupCandidates(janitorBatchSize)) {
+            KnowledgeMetadataPort.StoredJob job = candidate.jobId() == null
+                    ? null
+                    : metadata.findJob(candidate.jobId());
+            if (job == null
+                    || job.state().terminal()
+                    || job.attemptNumber() != candidate.attemptNumber()
+                    || !candidate.messageId().equals(job.streamMessageId())) {
+                safeToDelete.add(candidate.messageId());
+            }
+        }
+        if (!safeToDelete.isEmpty()) {
+            queue.cleanupAcked(safeToDelete);
+        }
+    }
+
     private void processMessages(List<KnowledgeQueuePort.QueueMessage> messages, boolean reclaimed) {
         for (KnowledgeQueuePort.QueueMessage message : messages) {
             if (message.attemptNumber() < 1 || message.deliveryAttempt() < 1
                     || message.jobId().equals(new UUID(0, 0))) {
-                queue.acknowledge(message.messageId());
+                settleMessage(message.messageId());
                 continue;
             }
             processOne(message, reclaimed);
@@ -173,11 +213,16 @@ class KnowledgeIngestionWorker implements SmartLifecycle {
     private void processOne(KnowledgeQueuePort.QueueMessage message, boolean reclaimed) {
         KnowledgeMetadataPort.StoredJob job = metadata.findJob(message.jobId());
         if (job == null || job.attemptNumber() != message.attemptNumber()) {
-            queue.acknowledge(message.messageId());
+            settleMessage(message.messageId());
+            return;
+        }
+        if (job.streamMessageId() != null && !job.streamMessageId().equals(message.messageId())) {
+            // 当前 Job 已经由新消息接管；旧 message ID 只能清理，不能再次处理文档。
+            settleMessage(message.messageId());
             return;
         }
         if (job.state().terminal()) {
-            queue.acknowledge(message.messageId());
+            settleMessage(message.messageId());
             return;
         }
         List<IngestionJobState> processableStates = reclaimed
@@ -186,7 +231,7 @@ class KnowledgeIngestionWorker implements SmartLifecycle {
                 : List.of(IngestionJobState.PENDING_DISPATCH, IngestionJobState.QUEUED);
         if (!metadata.transition(job.id(), processableStates, IngestionJobState.PARSING)) {
             // 另一 consumer 已取得同一 Job；当前消息可 ACK，真正的 Pending 由持有者负责。
-            queue.acknowledge(message.messageId());
+            settleMessage(message.messageId());
             return;
         }
         Path temp = null;
@@ -205,17 +250,17 @@ class KnowledgeIngestionWorker implements SmartLifecycle {
                 } else {
                     metadata.markFailed(job.id(), "EMPTY_DOCUMENT", "文档没有可索引正文", false);
                 }
-                queue.acknowledge(message.messageId());
+                settleMessage(message.messageId());
                 return;
             }
             List<DocumentChunk> chunks = chunker.chunk(parsed.text());
             if (chunks.isEmpty()) {
                 metadata.markFailed(job.id(), "EMPTY_DOCUMENT", "文档没有可索引切片", false);
-                queue.acknowledge(message.messageId());
+                settleMessage(message.messageId());
                 return;
             }
             if (!metadata.transition(job.id(), List.of(IngestionJobState.PARSING), IngestionJobState.EMBEDDING)) {
-                queue.acknowledge(message.messageId());
+                settleMessage(message.messageId());
                 return;
             }
             List<EmbeddingResult> batches = embed(chunks);
@@ -224,7 +269,7 @@ class KnowledgeIngestionWorker implements SmartLifecycle {
             KnowledgeMetadataPort.Generation generation = metadata.ensureActiveGeneration(
                     first.provider(), first.model(), indexName);
             if (!metadata.transition(job.id(), List.of(IngestionJobState.EMBEDDING), IngestionJobState.INDEXING)) {
-                queue.acknowledge(message.messageId());
+                settleMessage(message.messageId());
                 return;
             }
 
@@ -248,7 +293,7 @@ class KnowledgeIngestionWorker implements SmartLifecycle {
             }
             metadata.publishReady(job.id(), revision.id(), generation, published,
                     parsed.pageCount(), parsed.textCharCount());
-            queue.acknowledge(message.messageId());
+            settleMessage(message.messageId());
         } catch (KnowledgeException ex) {
             handleFailure(message, job, errorCode(ex), safeMessage(ex), retryable(ex));
         } catch (EmbeddingException ex) {
@@ -277,8 +322,8 @@ class KnowledgeIngestionWorker implements SmartLifecycle {
                 && metadata.prepareAutomaticRetry(job.id())) {
             try {
                 String nextMessageId = queue.dispatch(job.id(), job.attemptNumber(), message.deliveryAttempt() + 1);
-                metadata.markQueued(job.id(), nextMessageId);
-                queue.acknowledge(message.messageId());
+                metadata.markAutomaticRetryQueued(job.id(), nextMessageId);
+                settleMessage(message.messageId());
                 return;
             } catch (KnowledgeException ex) {
                 // 新消息未可靠投递时保留旧 Pending；下一轮 reclaim 或补投器继续恢复。
@@ -288,7 +333,20 @@ class KnowledgeIngestionWorker implements SmartLifecycle {
             }
         }
         metadata.markFailed(job.id(), errorCode, errorMessage, retryable);
-        queue.acknowledge(message.messageId());
+        settleMessage(message.messageId());
+    }
+
+    /** XACK 失败只保留 Pending；XDEL 失败不改变已提交的业务终态。 */
+    private void settleMessage(String messageId) {
+        try {
+            queue.settle(messageId);
+        } catch (KnowledgeException ex) {
+            if (ex.code() == KnowledgeException.Code.KNOWLEDGE_QUEUE_UNAVAILABLE) {
+                // XACK 未成功时保留 Pending；这里不能把已完成业务误标为失败。
+                return;
+            }
+            throw ex;
+        }
     }
 
     private List<EmbeddingResult> embed(List<DocumentChunk> chunks) {

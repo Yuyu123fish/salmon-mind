@@ -12,13 +12,14 @@ import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.definition.ToolDefinition;
 import org.springframework.ai.chat.model.ToolContext;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
  * 生产 Agent 的唯一 Knowledge Tool Adapter。它只解析一个 query 参数并把有界结果
  * 序列化给模型；正文是外部资料，不能改变系统策略或获得额外权限。
  */
-final class LocalKnowledgeToolCallback implements ToolCallback {
+final class LocalKnowledgeToolCallback implements ParallelSafeToolCallback {
 
     static final String NAME = "search_local_knowledge";
     private static final int MAX_EVIDENCES = 5;
@@ -103,6 +104,7 @@ final class LocalKnowledgeToolCallback implements ToolCallback {
                 item.put("revisionId", evidence.revisionId().toString());
                 item.put("documentName", evidence.documentName() == null ? "" : evidence.documentName());
                 item.put("location", evidence.location() == null ? "" : evidence.location());
+                item.put("retrievedAt", Instant.now().toString());
                 item.put("text", evidence.text() == null ? "" : evidence.text());
             }
             return objectMapper.writeValueAsString(envelope);

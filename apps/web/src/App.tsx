@@ -1,17 +1,30 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import Markdown from 'react-markdown'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import KnowledgeView from './KnowledgeView.tsx'
+import { MarkdownRenderer } from './MarkdownRenderer.tsx'
+import { RunTracePanel } from './RunTracePanel.tsx'
+import { mergeConversation, mergeConversationDetail } from './conversationState.ts'
+import { followModeAfterScroll } from './followMode.ts'
+import {
+  createActiveRunState,
+  isActiveRun,
+  reduceActiveRun,
+  type ActiveRunAction,
+  type ActiveRunState,
+} from './runState.ts'
 import { fetchCurrentWorkspace, type Workspace } from './workspaceApi.ts'
 import {
   createConversation,
   fetchConversation,
   fetchConversations,
   streamRetry,
+  streamContinue,
   streamSend,
   type CitationPayload,
   type ConversationDetail,
+  type Conversation,
   type ConversationSummary,
   type Entry,
+  type RetrievedSourcePayload,
   type Run,
   type RunStreamListener,
 } from './conversationApi.ts'
@@ -27,21 +40,6 @@ const DRAFT_KEY = '__local_draft__'
 
 // 新对话草稿的默认标题：仅前端展示，不发送给后端
 const DRAFT_TITLE = '新对话'
-
-// 单个 Conversation 的活动 Run 前端状态，按 Conversation ID 隔离。
-// 只承载传输中的临时信息（durable User Entry、delta 累积文本），
-// 不替代后端权威的 pendingRun；终态事件后立即删除本状态。
-type ActiveRunState = {
-  /** run_started 前为 null，用于把 delta 与 Run 身份绑定 */
-  runId: string | null
-  /** run_started 携带的已持久化 User Entry，用于建立 Assistant 占位位置 */
-  userEntry: Entry | null
-  /** assistant_delta 按顺序累积的临时文本，assistant_completed 后由持久化 Entry 取代 */
-  assistantText: string
-  /** 工具事件只用于当前连接的短状态，终态后随 Run 一起清理。 */
-  toolStatus: 'searching' | 'completed' | 'unavailable' | null
-  toolProvider: string | null
-}
 
 // 可重试的失败 Run（FAILED / INTERRUPTED）；RUNNING 是单进程串行队列之外的残留，不提供操作
 function isRetryable(run: Run | null): boolean {
@@ -87,6 +85,10 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [activeView, setActiveView] = useState<'chat' | 'knowledge'>('chat')
   const messagesRef = useRef<HTMLDivElement>(null)
+  const selectedIdRef = useRef<string | null>(null)
+  const followingRef = useRef(true)
+  const programmaticScrollRef = useRef(false)
+  const [following, setFollowing] = useState(true)
   // 防止快速切换 Conversation 时过期打开请求覆盖新选择的加载/错误状态
   const openedSeqRef = useRef(0)
   // 已占用 Run 槽位的 Conversation ID：同步防止重复点击产生并发 send/retry
@@ -95,6 +97,8 @@ function App() {
   const draftSendingRef = useRef(false)
   // 首次发送进行中（create/send 前段）的 UI 状态：发送按钮禁用，避免视觉上的可重复点击
   const [firstSending, setFirstSending] = useState(false)
+  // SSE 与刷新响应可能乱序到达；记录每个 Conversation 已接收的最新快照供侧栏合并。
+  const conversationSnapshotsRef = useRef<Record<string, Conversation>>({})
 
   // 加载工作空间与对话列表
   useEffect(() => {
@@ -159,7 +163,14 @@ function App() {
       }
       try {
         const detail = await fetchConversation(id)
-        setCaches((current) => ({ ...current, [id]: detail }))
+        setCaches((current) => ({
+          ...current,
+          [id]: (() => {
+            const merged = mergeConversationDetail(current[id], detail)
+            conversationSnapshotsRef.current[id] = merged.conversation
+            return merged
+          })(),
+        }))
       } catch (error: unknown) {
         if (seq === openedSeqRef.current) {
           setDetailError(errorMessage(error))
@@ -184,25 +195,103 @@ function App() {
   const refreshDetail = useCallback(async (id: string) => {
     try {
       const detail = await fetchConversation(id)
-      setCaches((current) => ({ ...current, [id]: detail }))
+      setCaches((current) => ({
+        ...current,
+        [id]: (() => {
+          const merged = mergeConversationDetail(current[id], detail)
+          conversationSnapshotsRef.current[id] = merged.conversation
+          return merged
+        })(),
+      }))
     } catch (error: unknown) {
       setSendErrors((current) => ({ ...current, [id]: `状态刷新失败：${errorMessage(error)}` }))
     }
   }, [])
 
-  // 打开后或内容变化时滚到底部；依赖提取为变量以保持依赖数组可静态检查
-  const scrollDetail = selectedId !== null ? caches[selectedId] : undefined
-  const scrollAssistantText = selectedId !== null ? runStates[selectedId]?.assistantText : undefined
-  useEffect(() => {
+  const setFollowMode = useCallback((next: boolean) => {
+    followingRef.current = next
+    setFollowing(next)
+  }, [])
+
+  const clearNewContent = useCallback((conversationId: string) => {
+    setRunStates((current) => {
+      const state = current[conversationId]
+      if (state === undefined) return current
+      return { ...current, [conversationId]: reduceActiveRun(state, { type: 'restore_follow' }) }
+    })
+  }, [])
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
     const el = messagesRef.current
-    if (el) {
-      el.scrollTop = el.scrollHeight
+    if (!el) return
+    programmaticScrollRef.current = true
+    el.scrollTo({ top: el.scrollHeight, behavior })
+    requestAnimationFrame(() => {
+      programmaticScrollRef.current = false
+    })
+  }, [])
+
+  const restoreFollow = useCallback(
+    (behavior: ScrollBehavior = 'auto') => {
+      const id = selectedIdRef.current
+      setFollowMode(true)
+      if (id !== null) clearNewContent(id)
+      scrollToBottom(behavior)
+    },
+    [clearNewContent, scrollToBottom, setFollowMode],
+  )
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId
+    setFollowMode(true)
+    if (selectedId !== null) clearNewContent(selectedId)
+    requestAnimationFrame(() => scrollToBottom('auto'))
+  }, [selectedId, clearNewContent, scrollToBottom, setFollowMode])
+
+  // 只有当前视图仍处于 Follow Mode 时，流式文本、Trace 或 durable Entry 的高度变化才跟随。
+  const scrollPathLength = selectedId !== null ? caches[selectedId]?.activePath.length : undefined
+  const scrollAssistantText = selectedId !== null ? runStates[selectedId]?.assistantText : undefined
+  const scrollTrace = selectedId !== null ? runStates[selectedId]?.trace : undefined
+  const scrollTraceExpanded = selectedId !== null ? runStates[selectedId]?.traceExpanded : undefined
+  useEffect(() => {
+    if (followingRef.current) requestAnimationFrame(() => scrollToBottom('auto'))
+  }, [scrollPathLength, scrollAssistantText, scrollTrace, scrollTraceExpanded, scrollToBottom])
+
+  const handleMessagesScroll = useCallback(() => {
+    const el = messagesRef.current
+    if (el === null) return
+    const next = followModeAfterScroll(
+      followingRef.current,
+      el,
+      programmaticScrollRef.current,
+    )
+    if (next && !followingRef.current) {
+      restoreFollow('auto')
+    } else if (!next && followingRef.current) {
+      setFollowMode(false)
     }
-  }, [selectedId, scrollDetail, scrollAssistantText])
+  }, [restoreFollow, setFollowMode])
+
+  const handleTraceLayoutChange = useCallback(() => {
+    if (followingRef.current) requestAnimationFrame(() => scrollToBottom('auto'))
+  }, [scrollToBottom])
+
+  const toggleSelectedTrace = useCallback(() => {
+    const id = selectedIdRef.current
+    if (id === null) return
+    setRunStates((current) => {
+      const state = current[id]
+      if (state === undefined) return current
+      return { ...current, [id]: reduceActiveRun(state, { type: 'toggle_trace' }) }
+    })
+  }, [])
 
   // 更新侧栏列表项并移到最前
   const updateConversationInList = useCallback(
-    (conversation: Pick<ConversationSummary, 'id' | 'title' | 'updatedAt'>, run: Run | null) => {
+    (incoming: Conversation, run: Run | null) => {
+      const current = conversationSnapshotsRef.current[incoming.id]
+      const conversation = current === undefined ? incoming : mergeConversation(current, incoming)
+      conversationSnapshotsRef.current[incoming.id] = conversation
       setConversations((current) => {
         if (current === null) return current
         const updated: ConversationSummary[] = current.map((item) =>
@@ -230,23 +319,20 @@ function App() {
    */
   const makeListener = useCallback(
     (conversationId: string, sentText: string): RunStreamListener => {
-      const endRun = () => {
+      const reduceRun = (action: ActiveRunAction) => {
         setRunStates((current) => {
-          const next = { ...current }
-          delete next[conversationId]
-          return next
+          const state = current[conversationId]
+          if (state === undefined) return current
+          return { ...current, [conversationId]: reduceActiveRun(state, action) }
         })
       }
+      // 后台 Conversation 不累加当前视图提示；只有当前且已退出 Follow Mode 的流记未读。
+      const followsCurrentView = () =>
+        selectedIdRef.current !== conversationId || followingRef.current
+
       return {
         onRunStarted(event) {
-          setRunStates((current) => {
-            const state = current[conversationId]
-            if (state === undefined) return current
-            return {
-              ...current,
-              [conversationId]: { ...state, runId: event.run.id, userEntry: event.userEntry },
-            }
-          })
+          reduceRun({ type: 'run_started', event })
           // 收到 run_started 才清空已发送草稿；期间用户新输入的新文本不被覆盖
           setDrafts((current) =>
             current[conversationId] === sentText ? { ...current, [conversationId]: '' } : current,
@@ -278,65 +364,26 @@ function App() {
               ...current,
               [conversationId]: {
                 ...detail,
-                conversation: event.conversation,
+                conversation: mergeConversation(detail.conversation, event.conversation),
                 activePath: [...detail.activePath, event.compactionEntry],
               },
             }
           })
         },
+        onReasoningDelta(event) {
+          reduceRun({ type: 'reasoning_delta', event, following: followsCurrentView() })
+        },
         onToolStarted(event) {
-          setRunStates((current) => {
-            const state = current[conversationId]
-            if (state === undefined || state.runId !== event.runId) return current
-            return {
-              ...current,
-              [conversationId]: {
-                ...state,
-                toolStatus: 'searching',
-                toolProvider: providerLabel(event.toolName),
-              },
-            }
-          })
+          reduceRun({ type: 'tool_started', event, following: followsCurrentView() })
         },
         onToolCompleted(event) {
-          setRunStates((current) => {
-            const state = current[conversationId]
-            if (state === undefined || state.runId !== event.runId) return current
-            return {
-              ...current,
-              [conversationId]: {
-                ...state,
-                toolStatus: 'completed',
-                toolProvider: providerLabel(event.provider ?? event.toolName),
-              },
-            }
-          })
+          reduceRun({ type: 'tool_completed', event, following: followsCurrentView() })
         },
         onToolFailed(event) {
-          setRunStates((current) => {
-            const state = current[conversationId]
-            if (state === undefined || state.runId !== event.runId) return current
-            return {
-              ...current,
-              [conversationId]: {
-                ...state,
-                toolStatus: 'unavailable',
-                toolProvider: providerLabel(event.toolName),
-              },
-            }
-          })
+          reduceRun({ type: 'tool_failed', event, following: followsCurrentView() })
         },
         onAssistantDelta(event) {
-          setRunStates((current) => {
-            const state = current[conversationId]
-            if (state === undefined || state.runId === null || event.runId !== state.runId) {
-              return current
-            }
-            return {
-              ...current,
-              [conversationId]: { ...state, assistantText: state.assistantText + event.delta },
-            }
-          })
+          reduceRun({ type: 'assistant_delta', event, following: followsCurrentView() })
         },
         onAssistantCompleted(event) {
           // 用持久化 Entry 替换临时文本：只追加一次，避免增量拼接误差成为最终历史
@@ -354,7 +401,6 @@ function App() {
               },
             }
           })
-          endRun()
         },
         onTitleUpdated(event) {
           setCaches((current) => {
@@ -362,29 +408,45 @@ function App() {
             if (detail === undefined) return current
             return {
               ...current,
-              [conversationId]: { ...detail, conversation: { ...detail.conversation, title: event.title } },
+              [conversationId]: {
+                ...detail,
+                conversation: mergeConversation(detail.conversation, event.conversation),
+              },
             }
           })
-          updateConversationInList({ id: conversationId, title: event.title, updatedAt: event.titleEntry.createdAt }, null)
+          updateConversationInList(event.conversation, null)
         },
         onRunCompleted(event) {
           setCaches((current) => {
             const detail = current[conversationId]
             if (detail === undefined) return current
-            return { ...current, [conversationId]: { ...detail, conversation: event.conversation, pendingRun: null } }
+            return {
+              ...current,
+              [conversationId]: {
+                ...detail,
+                conversation: mergeConversation(detail.conversation, event.conversation),
+                pendingRun: null,
+              },
+            }
           })
           updateConversationInList(event.conversation, event.run)
-          endRun()
+          reduceRun({ type: 'run_completed' })
         },
         onRunFailed(event) {
           setSendErrors((current) => ({ ...current, [conversationId]: event.message }))
           setCaches((current) => {
             const detail = current[conversationId]
             if (detail === undefined) return current
-            return { ...current, [conversationId]: { ...detail, conversation: event.conversation } }
+            return {
+              ...current,
+              [conversationId]: {
+                ...detail,
+                conversation: mergeConversation(detail.conversation, event.conversation),
+              },
+            }
           })
           updateConversationInList(event.conversation, event.run)
-          endRun()
+          reduceRun({ type: 'run_failed' })
           // 重新读取权威 pendingRun，决定是否展示重试入口
           void refreshDetail(conversationId)
         },
@@ -420,23 +482,17 @@ function App() {
       runSlotsRef.current.add(id)
       setRunStates((current) => ({
         ...current,
-        [id]: {
-          runId: null,
-          userEntry: null,
-          assistantText: '',
-          toolStatus: null,
-          toolProvider: null,
-        },
+        [id]: createActiveRunState(),
       }))
       setSendErrors((current) => ({ ...current, [id]: null }))
       try {
         await start(makeListener(id, sentText))
       } catch (error: unknown) {
-        // 传输中断或前置 JSON 错误：清除临时 Run 状态，重新读取权威状态，不自动重发
+        // 传输中断或前置 JSON 错误：保留已收到的安全 Trace，重新读取权威状态，不自动重发。
         setRunStates((current) => {
-          const next = { ...current }
-          delete next[id]
-          return next
+          const state = current[id]
+          if (state === undefined || state.status === 'completed') return current
+          return { ...current, [id]: reduceActiveRun(state, { type: 'run_failed' }) }
         })
         setSendErrors((current) => ({ ...current, [id]: errorMessage(error) }))
         await refreshDetail(id)
@@ -493,23 +549,43 @@ function App() {
 
   const handleSend = useCallback(async () => {
     const id = selectedId
-    if (id === null || runStates[id] !== undefined) return
+    if (id === null || isActiveRun(runStates[id])) return
     const text = drafts[id]?.trim() ?? ''
     if (text === '') return
     if (id === DRAFT_KEY) {
+      restoreFollow('auto')
       await sendFirstMessage(text)
       return
     }
+    restoreFollow('auto')
     await startRun(id, text, (listener) => streamSend(id, text, listener))
-  }, [selectedId, runStates, drafts, startRun, sendFirstMessage])
+  }, [selectedId, runStates, drafts, startRun, sendFirstMessage, restoreFollow])
 
   const handleRetry = useCallback(async () => {
     const id = selectedId
-    if (id === null || runStates[id] !== undefined) return
+    if (id === null || isActiveRun(runStates[id])) return
     const pending = caches[id]?.pendingRun ?? null
     if (pending === null || !isRetryable(pending)) return
+    restoreFollow('auto')
     await startRun(id, drafts[id] ?? '', (listener) => streamRetry(id, pending.id, listener))
-  }, [selectedId, runStates, caches, drafts, startRun])
+  }, [selectedId, runStates, caches, drafts, startRun, restoreFollow])
+
+  const handleContinue = useCallback(async () => {
+    const id = selectedId
+    const detail = id === null ? undefined : caches[id]
+    const leaf = detail?.activePath.at(-1)
+    if (
+      id === null ||
+      leaf === undefined ||
+      leaf.type !== 'ASSISTANT_MESSAGE' ||
+      leaf.payload.completionStatus !== 'INCOMPLETE_LENGTH' ||
+      isActiveRun(runStates[id])
+    ) {
+      return
+    }
+    restoreFollow('auto')
+    await startRun(id, '', (listener) => streamContinue(id, leaf.id, listener))
+  }, [selectedId, caches, runStates, startRun, restoreFollow])
 
   // Enter 发送、Shift+Enter 换行；输入法组合中不触发发送
   const handleKeyDown = useCallback(
@@ -535,7 +611,17 @@ function App() {
   const selectedDetail = selectedId !== null ? caches[selectedId] : undefined
   const selectedRun = selectedId !== null ? runStates[selectedId] : undefined
   const pendingRun = selectedDetail?.pendingRun ?? null
-  const running = selectedRun !== undefined
+  const running = isActiveRun(selectedRun)
+  const durableCurrentAssistant = selectedDetail?.activePath.some(
+    (entry) => entry.type === 'ASSISTANT_MESSAGE' && entry.payload.runId === selectedRun?.runId,
+  ) ?? false
+  const showTransientAssistant =
+    selectedRun !== undefined &&
+    selectedRun.userEntry !== null &&
+    !durableCurrentAssistant &&
+    (running ||
+      (selectedRun.status === 'failed' &&
+        (selectedRun.trace.length > 0 || selectedRun.assistantText !== '')))
   // 本地草稿没有详情缓存：发送条件不要求 detail，但 create 进行中与空白内容不可发送
   const isDraft = selectedId === DRAFT_KEY
   const textareaDisabled = selectedId === null
@@ -611,7 +697,7 @@ function App() {
                 type="button"
                 className="conv-item"
                 data-selected={item.id === selectedId}
-                data-running={runStates[item.id] !== undefined}
+                data-running={isActiveRun(runStates[item.id])}
                 onClick={() => {
                   setSidebarOpen(false)
                   setSelectedId(item.id)
@@ -619,7 +705,7 @@ function App() {
               >
                 <span className="conv-title">{item.title}</span>
                 <span className="conv-time">
-                  {runStates[item.id] !== undefined ? '回答中…' : formatTime(item.updatedAt)}
+                  {isActiveRun(runStates[item.id]) ? '回答中…' : formatTime(item.updatedAt)}
                 </span>
               </button>
             ))}
@@ -665,15 +751,6 @@ function App() {
                 {/* isDraft 时 selectedDetail 一定不存在，非草稿分支已由外层条件保证有缓存 */}
                 <h2>{isDraft ? DRAFT_TITLE : selectedDetail!.conversation.title}</h2>
                 {running && <span className="run-badge">回答中…</span>}
-                {running && selectedRun.toolStatus === 'searching' && (
-                  <span className="tool-badge">正在检索{selectedRun.toolProvider ?? '资料'}</span>
-                )}
-                {running && selectedRun.toolStatus === 'completed' && (
-                  <span className="tool-badge">{selectedRun.toolProvider ?? '资料'}检索完成</span>
-                )}
-                {running && selectedRun.toolStatus === 'unavailable' && (
-                  <span className="tool-badge unavailable">{selectedRun.toolProvider ?? '资料'}检索暂不可用</span>
-                )}
                 {!running && !isDraft && pendingRun !== null && isRetryable(pendingRun) && (
                   <span className="retry-badge">回答失败</span>
                 )}
@@ -689,18 +766,52 @@ function App() {
                 )}
               </header>
 
-              <div className="messages" ref={messagesRef}>
+              <div className="messages" ref={messagesRef} onScroll={handleMessagesScroll}>
                 {isDraft || selectedDetail!.activePath.length === 0 ? (
                   <p className="hint">发送第一条消息开始对话。</p>
                 ) : (
-                  selectedDetail!.activePath.map((entry) => (
-                    <MessageEntry key={entry.id} entry={entry} />
-                  ))
+                  selectedDetail!.activePath.map((entry) => {
+                    const controlsCurrentRun =
+                      selectedRun !== undefined &&
+                      entry.type === 'ASSISTANT_MESSAGE' &&
+                      entry.payload.runId === selectedRun.runId &&
+                      selectedRun.status !== 'failed'
+                    return (
+                      <MessageEntry
+                        key={entry.id}
+                        entry={entry}
+                        isCurrentLeaf={entry.id === selectedDetail!.conversation.activeLeafEntryId}
+                        continueDisabled={running}
+                        onContinue={handleContinue}
+                        traceExpanded={controlsCurrentRun ? selectedRun.traceExpanded : undefined}
+                        traceRunning={controlsCurrentRun && running}
+                        onTraceToggle={controlsCurrentRun ? toggleSelectedTrace : undefined}
+                        onTraceLayoutChange={handleTraceLayoutChange}
+                      />
+                    )
+                  })
                 )}
-                {running && selectedRun.userEntry !== null && (
-                  <StreamingAssistant text={selectedRun.assistantText} />
+                {showTransientAssistant && selectedRun !== undefined && (
+                  <StreamingAssistant
+                    text={selectedRun.assistantText}
+                    trace={selectedRun.trace}
+                    failed={selectedRun.status === 'failed'}
+                    expanded={selectedRun.traceExpanded}
+                    onToggle={toggleSelectedTrace}
+                    onTraceLayoutChange={handleTraceLayoutChange}
+                  />
                 )}
               </div>
+
+              {!following && (selectedRun?.newContentCount ?? 0) > 0 && (
+                <button
+                  type="button"
+                  className="new-content-button"
+                  onClick={() => restoreFollow('auto')}
+                >
+                  ↓ 有新内容 · {selectedRun!.newContentCount}
+                </button>
+              )}
 
               {!running && !isDraft && pendingRun !== null && isRetryable(pendingRun) && (
                 <div className="retry-bar">
@@ -760,12 +871,32 @@ function App() {
   )
 }
 
-function MessageEntry({ entry }: { entry: Entry }) {
+function MessageEntry({
+  entry,
+  isCurrentLeaf,
+  continueDisabled,
+  onContinue,
+  traceExpanded,
+  traceRunning = false,
+  onTraceToggle,
+  onTraceLayoutChange,
+}: {
+  entry: Entry
+  isCurrentLeaf: boolean
+  continueDisabled: boolean
+  onContinue: () => void
+  traceExpanded?: boolean
+  traceRunning?: boolean
+  onTraceToggle?: () => void
+  onTraceLayoutChange: () => void
+}) {
   if (entry.type === 'USER_MESSAGE') {
     return (
       <div className="msg-row user">
         <div className="bubble user-bubble">
-          <p className="bubble-text">{entry.payload.text}</p>
+          <p className="bubble-text">
+            {entry.payload.action === 'CONTINUE_GENERATION' ? '继续生成' : entry.payload.text}
+          </p>
           <time>{formatTimeShort(entry.createdAt)}</time>
         </div>
       </div>
@@ -775,13 +906,40 @@ function MessageEntry({ entry }: { entry: Entry }) {
     return (
       <div className="msg-row assistant">
         <div className="bubble assistant-bubble">
-          <div className="markdown">
-            <Markdown>{entry.payload.text ?? ''}</Markdown>
-          </div>
+          <RunTracePanel
+            trace={entry.payload.trace ?? []}
+            running={traceRunning}
+            expanded={traceExpanded}
+            onToggle={onTraceToggle}
+            onLayoutChange={onTraceLayoutChange}
+          />
+          <AssistantEvidenceView
+            entryId={entry.id}
+            citations={entry.payload.citations ?? []}
+            retrievedSources={entry.payload.retrievedSources ?? []}
+            onLayoutChange={onTraceLayoutChange}
+          >
+            {(activate) => (
+              <MarkdownRenderer
+                text={entry.payload.text ?? ''}
+                citationIds={new Set((entry.payload.citations ?? []).map((citation) => citation.referenceId))}
+                onCitationActivate={activate}
+              />
+            )}
+          </AssistantEvidenceView>
+          {entry.payload.completionStatus === 'INCOMPLETE_LENGTH' && (
+            <div className="incomplete-answer" role="status">
+              <span>回答未完成</span>
+              {isCurrentLeaf && (
+                <button type="button" onClick={onContinue} disabled={continueDisabled}>
+                  继续生成
+                </button>
+              )}
+            </div>
+          )}
           <p className="model-line">
             {entry.payload.model ?? '模型'} · {formatTimeShort(entry.createdAt)}
           </p>
-          <CitationCards citations={entry.payload.citations ?? []} />
         </div>
       </div>
     )
@@ -798,70 +956,238 @@ function MessageEntry({ entry }: { entry: Entry }) {
   return null
 }
 
-function providerLabel(toolName: string): string {
-  if (toolName === 'search_web_bocha') return '博查'
-  if (toolName === 'search_web_searchapi') return 'SearchApi.io'
-  if (toolName === 'search_local_knowledge') return '本地知识库'
-  if (toolName === 'BOCHA') return '博查'
-  if (toolName === 'SEARCH_API') return 'SearchApi.io'
-  if (toolName === 'LOCAL') return '本地知识库'
-  return '资料'
+function AssistantEvidenceView({
+  entryId,
+  citations,
+  retrievedSources,
+  onLayoutChange,
+  children,
+}: {
+  entryId: string
+  citations: CitationPayload[]
+  retrievedSources: RetrievedSourcePayload[]
+  onLayoutChange: () => void
+  children: (activate: (referenceId: string) => void) => ReactNode
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const [pendingFocus, setPendingFocus] = useState<string | null>(null)
+  const cardRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const citedIds = new Set<string>()
+  const uniqueCitations: CitationPayload[] = []
+  for (const citation of citations) {
+    if (citedIds.has(citation.referenceId)) continue
+    citedIds.add(citation.referenceId)
+    uniqueCitations.push(citation)
+  }
+  const sourcesById = new Map<string, RetrievedSourcePayload>()
+  for (const source of retrievedSources) {
+    if (!sourcesById.has(source.referenceId)) sourcesById.set(source.referenceId, source)
+  }
+  const unreferenced = [...sourcesById.values()].filter((source) => !citedIds.has(source.referenceId))
+  const hasDisclosure = uniqueCitations.length > 0 || sourcesById.size > 0
+  const disclosureId = `source-disclosure-${entryId}`
+
+  useEffect(() => {
+    if (!expanded || pendingFocus === null) return
+    const referenceId = pendingFocus
+    const frame = requestAnimationFrame(() => {
+      const card = cardRefs.current[referenceId]
+      if (card === null || card === undefined) return
+      card.focus()
+      card.scrollIntoView({ block: 'nearest' })
+      setPendingFocus(null)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [expanded, pendingFocus])
+
+  const activate = (referenceId: string) => {
+    setExpanded(true)
+    setPendingFocus(referenceId)
+    onLayoutChange()
+  }
+
+  const toggle = () => {
+    setExpanded((current) => !current)
+    onLayoutChange()
+  }
+
+  return (
+    <>
+      {children(activate)}
+      {hasDisclosure ? (
+        <section className="source-disclosure" aria-label="来源核验">
+          <button
+            type="button"
+            className="source-disclosure-toggle"
+            aria-expanded={expanded}
+            aria-controls={disclosureId}
+            onClick={toggle}
+          >
+            <span>来源核验</span>
+            <small>
+              {uniqueCitations.length} 条回答已引用 · {unreferenced.length} 条本轮召回未引用
+            </small>
+          </button>
+          {expanded ? (
+            <div id={disclosureId} className="source-disclosure-body">
+              {uniqueCitations.length > 0 ? (
+                <section aria-labelledby={`${disclosureId}-cited`}>
+                  <h4 id={`${disclosureId}-cited`}>回答已引用</h4>
+                  <div className="citation-list">
+                    {uniqueCitations.map((citation) => (
+                      <SourceCard
+                        key={citation.referenceId}
+                        citation={citation}
+                        source={sourcesById.get(citation.referenceId)}
+                        referenceId={citation.referenceId}
+                        entryId={entryId}
+                        cardRef={(card) => {
+                          cardRefs.current[citation.referenceId] = card
+                        }}
+                      />
+                    ))}
+                  </div>
+                </section>
+              ) : null}
+              {unreferenced.length > 0 ? (
+                <section aria-labelledby={`${disclosureId}-unreferenced`}>
+                  <h4 id={`${disclosureId}-unreferenced`}>本轮召回未引用</h4>
+                  <div className="citation-list">
+                    {unreferenced.map((source) => (
+                      <SourceCard
+                        key={source.referenceId}
+                        source={source}
+                        referenceId={source.referenceId}
+                        entryId={entryId}
+                        unreferenced
+                        cardRef={(card) => {
+                          cardRefs.current[source.referenceId] = card
+                        }}
+                      />
+                    ))}
+                  </div>
+                </section>
+              ) : null}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
+    </>
+  )
 }
 
-function CitationCards({ citations }: { citations: CitationPayload[] }) {
-  if (citations.length === 0) return null
+function SourceCard({
+  citation,
+  source,
+  referenceId,
+  entryId,
+  unreferenced = false,
+  cardRef,
+}: {
+  citation?: CitationPayload
+  source?: RetrievedSourcePayload
+  referenceId: string
+  entryId: string
+  unreferenced?: boolean
+  cardRef: (card: HTMLDivElement | null) => void
+}) {
+  const local = source?.kind === 'local' ? source : citation?.kind === 'local' ? citation : null
+  const web = source?.kind === 'web' ? source : citation?.kind === 'web' ? citation : null
+  const safeUrl = web === null ? null : safeHttpUrl(web.url)
+  const note = !unreferenced && citation?.citationNote?.trim() ? citation.citationNote : null
+  const excerpt = source?.sourceExcerpt?.trim() ? source.sourceExcerpt : null
+  const excerptLabel = source?.kind === 'local' ? '本地证据摘录' : '搜索摘要'
+
   return (
-    <div className="citation-list" aria-label="回答来源">
-      {citations.map((citation) => {
-        if (citation.kind === 'local') {
-          return (
-            <div className="citation-card local-citation" key={citation.referenceId}>
-              <span className="citation-ref">[{citation.referenceId}]</span>
-              <div>
-                <strong>{citation.documentName}</strong>
-                <small>{citation.location}</small>
-              </div>
-            </div>
+    <div
+      id={`source-card-${entryId}-${referenceId}`}
+      ref={cardRef}
+      className="citation-card"
+      data-unreferenced={unreferenced ? 'true' : 'false'}
+      tabIndex={-1}
+    >
+      <span className="citation-ref">[{referenceId}]</span>
+      <div>
+        {local !== null ? <strong>{local.documentName}</strong> : null}
+        {web !== null ? (
+          safeUrl === null ? (
+            <strong>{web.title}</strong>
+          ) : (
+            <a href={safeUrl} target="_blank" rel="noopener noreferrer">
+              {web.title}
+            </a>
           )
-        }
-        const safeUrl = /^https?:\/\//i.test(citation.url) ? citation.url : null
-        return (
-          <div className="citation-card web-citation" key={citation.referenceId}>
-            <span className="citation-ref">[{citation.referenceId}]</span>
-            <div>
-              {safeUrl === null ? (
-                <strong>{citation.title}</strong>
-              ) : (
-                <a href={safeUrl} target="_blank" rel="noopener noreferrer">
-                  {citation.title}
-                </a>
-              )}
-              <small>
-                {citation.provider} · {citation.site}
-                {citation.dateLabel ? ` · ${citation.dateLabel}` : ''} · 检索于{' '}
-                {formatTime(citation.retrievedAt)}
-              </small>
-            </div>
-          </div>
-        )
-      })}
+        ) : null}
+        {local !== null ? <small>{local.location}</small> : null}
+        {web !== null ? (
+          <small>
+            {web.provider} · {web.site}
+            {web.dateLabel ? ` · ${web.dateLabel}` : ''} · 检索于 {formatTime(web.retrievedAt)}
+          </small>
+        ) : null}
+        {note !== null ? (
+          <p className="source-note">
+            <b>Agent 相关性摘要</b>
+            {note}
+          </p>
+        ) : null}
+        {excerpt !== null ? (
+          <p className="source-excerpt">
+            <b>{excerptLabel}</b>
+            {excerpt}
+          </p>
+        ) : null}
+      </div>
     </div>
   )
 }
 
+function safeHttpUrl(value: string): string | null {
+  try {
+    const url = new URL(value)
+    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password) {
+      return null
+    }
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
 // 运行中的临时 Assistant：只用于展示 delta，最终以持久化 Entry 替换
-function StreamingAssistant({ text }: { text: string }) {
+function StreamingAssistant({
+  text,
+  trace,
+  failed,
+  expanded,
+  onToggle,
+  onTraceLayoutChange,
+}: {
+  text: string
+  trace: ActiveRunState['trace']
+  failed: boolean
+  expanded: boolean
+  onToggle: () => void
+  onTraceLayoutChange: () => void
+}) {
   return (
     <div className="msg-row assistant">
       <div className="bubble assistant-bubble streaming">
-        {text === '' ? (
+        <RunTracePanel
+          trace={trace}
+          running={!failed}
+          expanded={expanded}
+          onToggle={onToggle}
+          onLayoutChange={onTraceLayoutChange}
+        />
+        {text === '' && !failed ? (
           <p className="thinking">正在思考…</p>
-        ) : (
-          <div className="markdown">
-            <Markdown>{text}</Markdown>
-          </div>
-        )}
-        <p className="model-line">正在生成…</p>
+        ) : text !== '' ? (
+          <MarkdownRenderer text={text} />
+        ) : null}
+        <p className="model-line">
+          {failed ? '本次回答失败，以上临时内容未持久化' : '正在生成…'}
+        </p>
       </div>
     </div>
   )

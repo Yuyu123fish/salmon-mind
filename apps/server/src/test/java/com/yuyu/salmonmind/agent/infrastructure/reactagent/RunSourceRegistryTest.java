@@ -38,6 +38,9 @@ class RunSourceRegistryTest {
 
         var citations = registry.citationsFor("依据 [W2]、[L1]、[W2] 和伪造 [W99]");
         assertThat(citations).extracting("referenceId").containsExactly("W2", "L1");
+        assertThat(citations.get(0).citationNote()).contains("依据");
+        assertThat(registry.retrievedSources()).hasSize(3)
+                .extracting("referenceId").containsExactly("L1", "W1", "W2");
     }
 
     @Test
@@ -85,6 +88,30 @@ class RunSourceRegistryTest {
         assertThat(bounded.path("items")).hasSize(1);
         assertThat(registry.citationsFor("依据 [W1] [W2]")).extracting(AgentCitation::referenceId)
                 .containsExactly("W1");
+    }
+
+    @Test
+    void boundsRetrievedSourcesToThirtyTwoAndKeepsExcerptKindsSeparate() throws Exception {
+        RunSourceRegistry registry = new RunSourceRegistry(mapper);
+        StringBuilder items = new StringBuilder();
+        for (int i = 1; i <= 33; i++) {
+            if (i > 1) {
+                items.append(',');
+            }
+            items.append("{\"title\":\"结果").append(i)
+                    .append("\",\"url\":\"https://example.com/").append(i)
+                    .append("\",\"site\":\"example.com\",\"snippet\":\"网页摘要\",")
+                    .append("\"retrievedAt\":\"2026-08-17T00:00:00Z\"}");
+        }
+        String result = "{\"status\":\"SUCCESS\",\"reason\":\"NONE\",\"sourceKind\":\"WEB\","
+                + "\"provider\":\"BOCHA\",\"items\":[" + items + "]}";
+
+        RunSourceRegistry.Decoration decoration = registry.decorate(result, 200_000);
+
+        assertThat(decoration.sourceCount()).isEqualTo(32);
+        assertThat(registry.retrievedSources()).hasSize(32)
+                .allSatisfy(source -> assertThat(source.excerptKind()).isEqualTo("WEB_SEARCH_SUMMARY"));
+        assertThat(registry.citationsFor("依据 [W33]")).isEmpty();
     }
 
     private String envelope(String kind, String provider, String item) {

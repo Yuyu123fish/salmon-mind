@@ -1,14 +1,19 @@
 package com.yuyu.salmonmind.agent.api;
 
 /**
- * 流式主回答的稳定监听合同：按序收到增量 delta，最终以 onComplete 或 onError 恰好一次结束。
- * delta 只用于临时显示，不构成最终结果；最终结果以 onComplete 携带的完整文本与 usage 为准。
+ * 流式主回答的稳定监听合同：Displayable Reasoning 与回答 delta 分开按序到达，
+ * 最终以 onComplete 或 onError 恰好一次结束。两类 delta 都只用于临时显示；
+ * 最终回答与持久化 Trace 以 onComplete 携带的结果为准。
  *
  * <p>工具生命周期事件（started/completed/failed）是平台内部模块合同：
  * 一个 Tool Call ID 的 started 后至多一次 completed 或 failed；工具失败不必然终止运行。
  * 所有事件实现方均可安全忽略（默认空实现），忽略后行为与 Feature 002 完全一致。
  */
 public interface AgentStreamListener {
+
+    /** 收到模型公开提供的一段可展示 reasoning；不得与最终回答文本混合。 */
+    default void onReasoningDelta(String delta) {
+    }
 
     /** 收到一段有序增量文本；多次调用按到达顺序拼接即为完整回答。 */
     void onDelta(String delta);

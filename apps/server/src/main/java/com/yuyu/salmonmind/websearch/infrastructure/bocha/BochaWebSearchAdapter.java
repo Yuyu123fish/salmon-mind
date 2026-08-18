@@ -67,20 +67,26 @@ public class BochaWebSearchAdapter implements WebSearchProviderPort {
                     .body(body)
                     .retrieve()
                     .body(JsonNode.class);
-            if (response == null || !response.has("webPages")
-                    || !response.get("webPages").has("value")
-                    || !response.get("webPages").get("value").isArray()) {
+            if (response == null || !successfulCode(response)) {
+                throw new WebSearchProviderException(WebSearchReason.INVALID_RESPONSE,
+                        "博查响应业务状态异常");
+            }
+            JsonNode data = response.get("data");
+            JsonNode pages = data == null ? null : data.get("webPages");
+            JsonNode values = pages == null ? null : pages.get("value");
+            if (data == null || !data.isObject() || pages == null || !pages.isObject()
+                    || values == null || !values.isArray()) {
                 throw new WebSearchProviderException(WebSearchReason.INVALID_RESPONSE,
                         "博查响应缺少 webPages.value");
             }
             List<RawSearchHit> hits = new java.util.ArrayList<>();
             int rank = 1;
-            for (JsonNode item : response.get("webPages").get("value")) {
+            for (JsonNode item : values) {
                 hits.add(new RawSearchHit(
                         rank++, text(item, "name"), text(item, "url"), text(item, "siteName"),
                         firstText(item, "summary", "snippet"), text(item, "datePublished")));
             }
-            return new RawSearchResult(hits, firstText(response, "requestId", "traceId"));
+            return new RawSearchResult(hits, safeTrace(firstText(response, "log_id", "requestId")));
         } catch (WebSearchProviderException ex) {
             throw ex;
         } catch (RestClientResponseException ex) {
@@ -134,6 +140,25 @@ public class BochaWebSearchAdapter implements WebSearchProviderPort {
             }
         }
         return false;
+    }
+
+    /** 2xx 也可能携带业务失败码；未知值不能依据 msg 猜测成鉴权或限流。 */
+    private static boolean successfulCode(JsonNode response) {
+        JsonNode code = response.get("code");
+        if (code == null || code.isNull()) {
+            return true;
+        }
+        String value = code.isValueNode() ? code.asText() : "";
+        return "0".equals(value) || "200".equals(value)
+                || "ok".equalsIgnoreCase(value) || "success".equalsIgnoreCase(value);
+    }
+
+    private static String safeTrace(String value) {
+        if (!StringUtils.hasText(value) || value.length() > 120
+                || value.chars().anyMatch(Character::isISOControl)) {
+            return null;
+        }
+        return value;
     }
 
     private static String text(JsonNode node, String name) {

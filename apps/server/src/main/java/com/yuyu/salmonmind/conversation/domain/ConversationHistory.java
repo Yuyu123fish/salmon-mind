@@ -2,6 +2,7 @@ package com.yuyu.salmonmind.conversation.domain;
 
 import com.yuyu.salmonmind.conversation.api.ConversationException;
 import com.yuyu.salmonmind.conversation.api.Entry;
+import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -24,6 +25,29 @@ public record ConversationHistory(Header header, List<Entry> entries, List<Long>
     public ConversationHistory {
         entries = List.copyOf(entries);
         byteOffsets = List.copyOf(byteOffsets);
+        validateContinuationActions(entries);
+    }
+
+    private static void validateContinuationActions(List<Entry> entries) {
+        Map<UUID, Entry> byId = new HashMap<>();
+        for (Entry entry : entries) {
+            byId.put(entry.id(), entry);
+        }
+        for (Entry entry : entries) {
+            if (entry.type() != Entry.EntryType.USER_MESSAGE) {
+                continue;
+            }
+            UserMessagePayload payload = (UserMessagePayload) entry.payload();
+            if (payload.action() != UserMessagePayload.Action.CONTINUE_GENERATION) {
+                continue;
+            }
+            Entry source = byId.get(payload.sourceAssistantEntryId());
+            if (source == null || source.type() != Entry.EntryType.ASSISTANT_MESSAGE
+                    || !source.id().equals(entry.parentId())
+                    || source.seq() >= entry.seq()) {
+                throw corrupted("继续生成动作没有指向其父 Assistant Entry");
+            }
+        }
     }
 
     /** Header 是文件第一行，不参与 Entry 树。 */

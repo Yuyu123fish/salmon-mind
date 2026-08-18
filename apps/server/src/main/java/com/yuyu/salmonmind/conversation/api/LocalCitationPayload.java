@@ -8,8 +8,16 @@ public record LocalCitationPayload(
         UUID evidenceId,
         UUID revisionId,
         String documentName,
-        String location
+        String location,
+        String citationNote
 ) implements CitationPayload {
+
+    /** 兼容旧 JSONL 与既有调用方没有 Note 的构造。 */
+    public LocalCitationPayload(
+            String referenceId, UUID evidenceId, UUID revisionId, String documentName, String location
+    ) {
+        this(referenceId, evidenceId, revisionId, documentName, location, null);
+    }
 
     @Override
     public String kind() {

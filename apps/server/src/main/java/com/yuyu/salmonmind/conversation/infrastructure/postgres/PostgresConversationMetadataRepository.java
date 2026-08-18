@@ -3,6 +3,7 @@ package com.yuyu.salmonmind.conversation.infrastructure.postgres;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.yuyu.salmonmind.conversation.api.Conversation;
 import com.yuyu.salmonmind.conversation.api.Run;
+import com.yuyu.salmonmind.conversation.api.RunResultStatus;
 import com.yuyu.salmonmind.conversation.application.port.ConversationMetadataRepository;
 import org.springframework.stereotype.Repository;
 
@@ -167,6 +168,7 @@ class PostgresConversationMetadataRepository implements ConversationMetadataRepo
         entity.setErrorCode(run.errorCode());
         entity.setStartedAt(run.startedAt());
         entity.setEndedAt(run.endedAt());
+        entity.setResultStatus(run.resultStatus() == null ? null : run.resultStatus().name());
         return entity;
     }
 
@@ -178,6 +180,7 @@ class PostgresConversationMetadataRepository implements ConversationMetadataRepo
                 Run.RunStatus.valueOf(entity.getStatus()),
                 entity.getErrorCode(),
                 entity.getStartedAt(),
-                entity.getEndedAt());
+                entity.getEndedAt(),
+                entity.getResultStatus() == null ? null : RunResultStatus.valueOf(entity.getResultStatus()));
     }
 }

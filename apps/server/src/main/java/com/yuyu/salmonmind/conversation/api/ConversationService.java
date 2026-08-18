@@ -33,8 +33,9 @@ public interface ConversationService {
      * 发送一条用户消息，以 SSE Run Stream 返回结果。User Entry 先落 JSONL，再以数据库
      * 事务创建 RUNNING Run 并推进活动叶子；durable 状态成立后回调
      * {@link RunStreamListener#onRunStarted}，随后按 Spec 顺序发送压缩、delta、完成、
-     * 标题与终态事件。成功时不追加不完整内容：只有模型成功且文本非空才追加一个
-     * Assistant Entry。
+     * 标题与终态事件。模型成功且文本非空时追加一个 Assistant Entry；该 Entry 的
+     * completionStatus 可以是自然完成或长度中断的 INCOMPLETE_LENGTH，后者仍属于
+     * SUCCEEDED Run，可由“继续生成”用例追加后续正文。
      *
      * <p>失败边界：onRunStarted 之前（Conversation 不存在、历史损坏、输入非法、忙碌）
      * 抛异常，由 HTTP 层映射为 JSON 错误；之后的一切失败（模型、Redis、压缩、持久化）
@@ -55,4 +56,15 @@ public interface ConversationService {
      * @param listener 本次 Run 的事件消费者；本方法同步阻塞直到 Run 完成
      */
     void retry(UUID conversationId, UUID runId, RunStreamListener listener);
+
+    /**
+     * 从当前 Active Path 叶子的未完成 Assistant 追加一次继续生成动作；动作与新 Run
+     * 都是可恢复的 durable 状态，旧 User/Assistant Entry 不被修改或复制。
+     * 只有目标恰为当前叶子且 completionStatus=INCOMPLETE_LENGTH 时允许；前置冲突抛出
+     * CONTINUE_GENERATION_NOT_ALLOWED，Run 启动后的失败按普通 SSE run_failed 合同收束。
+     *
+     * @param assistantEntryId 当前 Active Path 叶子的 Assistant Entry ID
+     * @param listener         本次新 Run 的 SSE 事件消费者
+     */
+    void continueGeneration(UUID conversationId, UUID assistantEntryId, RunStreamListener listener);
 }

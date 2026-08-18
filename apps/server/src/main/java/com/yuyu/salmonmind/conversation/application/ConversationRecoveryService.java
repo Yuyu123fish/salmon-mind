@@ -1,6 +1,8 @@
 package com.yuyu.salmonmind.conversation.application;
 
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
+import com.yuyu.salmonmind.conversation.api.AssistantCompletionStatus;
+import com.yuyu.salmonmind.conversation.api.RunResultStatus;
 import com.yuyu.salmonmind.conversation.api.Conversation;
 import com.yuyu.salmonmind.conversation.api.ConversationException;
 import com.yuyu.salmonmind.conversation.api.Entry;
@@ -26,6 +28,9 @@ import java.util.UUID;
  */
 @Component
 class ConversationRecoveryService {
+
+    /** 只有自动续写异常允许把稳定错误码复制到 Run；普通 detail 不能伪装成 Run 错误。 */
+    private static final String OUTPUT_CONTINUATION_FAILED = "OUTPUT_CONTINUATION_FAILED";
 
     private final ConversationHistoryRepository historyRepository;
     private final ConversationMetadataRepository metadataRepository;
@@ -159,17 +164,24 @@ class ConversationRecoveryService {
             }
             case ASSISTANT_MESSAGE -> {
                 AssistantMessagePayload payload = (AssistantMessagePayload) entry.payload();
+                RunResultStatus expectedResultStatus = payload.completionStatus() == AssistantCompletionStatus.INCOMPLETE_LENGTH
+                        ? RunResultStatus.INCOMPLETE_LENGTH : RunResultStatus.COMPLETE;
+                String expectedErrorCode = expectedErrorCode(payload);
                 Run run = metadataRepository.findRunById(payload.runId());
                 if (run == null) {
                     // 补齐成功终态的 Run；trigger 为该回答的用户父 Entry
                     metadataRepository.insertRun(new Run(
                             payload.runId(), entry.conversationId(), entry.parentId(),
-                            Run.RunStatus.SUCCEEDED, null, entry.createdAt(), entry.createdAt()));
-                } else if (run.status() != Run.RunStatus.SUCCEEDED || run.endedAt() == null) {
+                            Run.RunStatus.SUCCEEDED, expectedErrorCode, entry.createdAt(), entry.createdAt(),
+                            expectedResultStatus));
+                } else if (run.status() != Run.RunStatus.SUCCEEDED || run.endedAt() == null
+                        || run.resultStatus() != expectedResultStatus
+                        || !Objects.equals(run.errorCode(), expectedErrorCode)) {
                     // 数据库仍落后：补齐终态与结束时间
                     metadataRepository.updateRun(new Run(
                             run.id(), run.conversationId(), run.triggerEntryId(),
-                            Run.RunStatus.SUCCEEDED, run.errorCode(), run.startedAt(), entry.createdAt()));
+                            Run.RunStatus.SUCCEEDED, expectedErrorCode, run.startedAt(), entry.createdAt(),
+                            expectedResultStatus));
                 }
             }
             case COMPACTION -> {
@@ -179,6 +191,11 @@ class ConversationRecoveryService {
                 // 标题修复由最新 Title Entry 单独完成；Title 不改变 Run 或活动叶子
             }
         }
+    }
+
+    private static String expectedErrorCode(AssistantMessagePayload payload) {
+        return OUTPUT_CONTINUATION_FAILED.equals(payload.completionDetailCode())
+                ? OUTPUT_CONTINUATION_FAILED : null;
     }
 
     private static boolean containsEntry(List<Entry> entries, UUID entryId) {

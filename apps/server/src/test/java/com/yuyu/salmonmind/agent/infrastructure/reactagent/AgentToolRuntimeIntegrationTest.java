@@ -4,13 +4,18 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.time.Duration;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import com.yuyu.salmonmind.agent.api.AgentExecutionException;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
 import com.yuyu.salmonmind.agent.api.AgentRequest;
 import com.yuyu.salmonmind.agent.api.AgentResult;
+import com.yuyu.salmonmind.agent.api.AgentRunTraceItem;
 import com.yuyu.salmonmind.agent.api.AgentStreamListener;
 import com.yuyu.salmonmind.agent.api.AgentToolCompleted;
 import com.yuyu.salmonmind.agent.api.AgentToolFailed;
@@ -112,7 +117,8 @@ class AgentToolRuntimeIntegrationTest {
         assertThat(events.started).hasSize(1);
         assertThat(events.started.get(0).toolCallId()).isEqualTo(ToolCallingChatModel.TOOL_CALL_ID);
         assertThat(events.started.get(0).toolName()).isEqualTo(ToolCallingChatModel.TOOL_NAME);
-        assertThat(events.started.get(0).safeQuerySummary()).contains("salmon");
+        assertThat(events.started.get(0).safeQuerySummary()).isEqualTo("工具执行中");
+        assertThat(events.started.get(0).safeQuerySummary()).doesNotContain("salmon");
         assertThat(events.completed).hasSize(1);
         assertThat(events.completed.get(0).toolCallId()).isEqualTo(ToolCallingChatModel.TOOL_CALL_ID);
         assertThat(events.completed.get(0).toolName()).isEqualTo(ToolCallingChatModel.TOOL_NAME);
@@ -123,6 +129,16 @@ class AgentToolRuntimeIntegrationTest {
         assertThat(events.error()).isNull();
         // delta 拼接即最终回答
         assertThat(String.join("", events.deltas)).isEqualTo(ToolCallingChatModel.FINAL_ANSWER);
+        assertThat(events.reasoning).containsExactly("需要先查询资料。", "资料足够，可以作答。");
+        assertThat(result.trace()).satisfiesExactly(
+                item -> assertThat(item).extracting(AgentRunTraceItem::kind, AgentRunTraceItem::text)
+                        .containsExactly(AgentRunTraceItem.Kind.REASONING, "需要先查询资料。"),
+                item -> assertThat(item).extracting(
+                        AgentRunTraceItem::kind, AgentRunTraceItem::toolCallId, AgentRunTraceItem::toolStatus)
+                        .containsExactly(AgentRunTraceItem.Kind.TOOL, ToolCallingChatModel.TOOL_CALL_ID,
+                                AgentRunTraceItem.ToolStatus.COMPLETED),
+                item -> assertThat(item).extracting(AgentRunTraceItem::kind, AgentRunTraceItem::text)
+                        .containsExactly(AgentRunTraceItem.Kind.REASONING, "资料足够，可以作答。"));
     }
 
     @Test
@@ -141,7 +157,8 @@ class AgentToolRuntimeIntegrationTest {
         assertThat(events.failed.get(0).toolCallId()).isEqualTo(ToolCallingChatModel.TOOL_CALL_ID);
         assertThat(events.failed.get(0).toolName()).isEqualTo(ToolCallingChatModel.TOOL_NAME);
         assertThat(events.failed.get(0).stableErrorCode()).isEqualTo("TOOL_EXECUTION_FAILED");
-        assertThat(events.failed.get(0).safeMessage()).contains("搜索服务不可用");
+        assertThat(events.failed.get(0).safeMessage()).isEqualTo("工具执行失败");
+        assertThat(events.failed.get(0).safeMessage()).doesNotContain("gate 测试注入异常");
         assertThat(events.completed).isEmpty();
         assertThat(events.result()).isNotNull();
         assertThat(events.error()).isNull();
@@ -225,10 +242,105 @@ class AgentToolRuntimeIntegrationTest {
                 .contains("referenceId\":\"W1");
         assertThat(result.citations()).hasSize(1);
         assertThat(result.citations().get(0).referenceId()).isEqualTo("W1");
+        assertThat(result.citations().get(0).citationNote()).contains("回答依据");
+        assertThat(result.retrievedSources()).hasSize(1)
+                .singleElement()
+                .satisfies(retrieved -> assertThat(retrieved.sourceExcerpt()).isEqualTo("摘要"));
         assertThat(events.completed).singleElement().satisfies(event -> {
             assertThat(event.provider()).isEqualTo("BOCHA");
             assertThat(event.sourceCount()).isEqualTo(1);
         });
+    }
+
+    @Test
+    void blocksWebProviderBeforeHandlerWhenUserForbidsBrowsing() {
+        var tool = new RecordingSearchTool("search_web_bocha", false,
+                "{\"status\":\"SUCCESS\",\"sourceKind\":\"WEB\",\"provider\":\"BOCHA\",\"items\":[]}");
+        var model = new ToolCallingChatModel("已按要求不联网回答。", "search_web_bocha");
+        var adapter = newAdapter(model, List.of(tool), 200_000);
+        var events = new RecordingListener();
+
+        AgentResult result = completeSync(adapter, events, new AgentRequest(
+                "web-disabled-thread", null, UUID.randomUUID(),
+                userList("请只根据当前对话回答，不要联网"), CheckpointPolicy.REUSE_IF_MATCH));
+
+        assertThat(tool.calls).isEmpty();
+        assertThat(events.failed).singleElement()
+                .extracting(AgentToolFailed::stableErrorCode)
+                .isEqualTo("WEB_SEARCH_DISABLED");
+        assertThat(result.text()).isEqualTo("已按要求不联网回答。");
+    }
+
+    @Test
+    void keepsLocalSearchAvailableWhenOnlyBrowsingIsForbidden() {
+        var tool = new RecordingSearchTool("search_local_knowledge", false,
+                "{\"status\":\"SUCCESS\",\"sourceKind\":\"LOCAL\",\"provider\":\"LOCAL\",\"items\":[]}");
+        var model = new ToolCallingChatModel("已依据本地资料回答。", "search_local_knowledge");
+        var adapter = newAdapter(model, List.of(tool), 200_000);
+        var events = new RecordingListener();
+
+        AgentResult result = completeSync(adapter, events, new AgentRequest(
+                "local-allowed-thread", null, UUID.randomUUID(),
+                userList("请查本地资料，但不要联网"), CheckpointPolicy.REUSE_IF_MATCH));
+
+        assertThat(tool.calls).hasSize(1);
+        assertThat(events.completed).singleElement().extracting(AgentToolCompleted::sourceCount).isEqualTo(0);
+        assertThat(result.text()).isEqualTo("已依据本地资料回答。");
+    }
+
+    @Test
+    void blocksLocalProviderBeforeHandlerWhenUserForbidsAllRetrieval() {
+        var tool = new RecordingSearchTool("search_local_knowledge", false,
+                "{\"status\":\"SUCCESS\",\"sourceKind\":\"LOCAL\",\"provider\":\"LOCAL\",\"items\":[]}");
+        var model = new ToolCallingChatModel("已按要求只使用当前对话。", "search_local_knowledge");
+        var adapter = newAdapter(model, List.of(tool), 200_000);
+        var events = new RecordingListener();
+
+        AgentResult result = completeSync(adapter, events, new AgentRequest(
+                "local-disabled-thread", null, UUID.randomUUID(),
+                userList("只根据当前对话回答，不要查询任何资料"), CheckpointPolicy.REUSE_IF_MATCH));
+
+        assertThat(tool.calls).isEmpty();
+        assertThat(events.failed).singleElement()
+                .extracting(AgentToolFailed::stableErrorCode)
+                .isEqualTo("LOCAL_SEARCH_DISABLED");
+        assertThat(result.text()).isEqualTo("已按要求只使用当前对话。");
+    }
+
+    @Test
+    void keepsInvalidProviderResponseDistinctInToolTrace() {
+        var tool = new RecordingSearchTool(false,
+                "{\"status\":\"UNAVAILABLE\",\"reason\":\"INVALID_RESPONSE\","
+                        + "\"sourceKind\":\"WEB\",\"provider\":\"BOCHA\",\"items\":[]}");
+        var model = new ToolCallingChatModel("未完成网页核验，仍返回当前对话结果。", RecordingSearchTool.NAME);
+        var adapter = newAdapter(model, List.of(tool), 200_000);
+        var events = new RecordingListener();
+
+        completeSync(adapter, events, new AgentRequest(
+                "invalid-provider-thread", null, UUID.randomUUID(), userList("核对网页"),
+                CheckpointPolicy.REUSE_IF_MATCH));
+
+        assertThat(events.failed).singleElement()
+                .extracting(AgentToolFailed::stableErrorCode)
+                .isEqualTo("WEB_SEARCH_INVALID_RESPONSE");
+    }
+
+    @Test
+    void keepsOrdinaryProviderFailureDistinctFromInvalidResponse() {
+        var tool = new RecordingSearchTool(false,
+                "{\"status\":\"UNAVAILABLE\",\"reason\":\"PROVIDER_FAILED\","
+                        + "\"sourceKind\":\"WEB\",\"provider\":\"BOCHA\",\"items\":[]}");
+        var model = new ToolCallingChatModel("未完成网页核验，仍返回当前对话结果。", RecordingSearchTool.NAME);
+        var adapter = newAdapter(model, List.of(tool), 200_000);
+        var events = new RecordingListener();
+
+        completeSync(adapter, events, new AgentRequest(
+                "provider-failure-thread", null, UUID.randomUUID(), userList("核对网页"),
+                CheckpointPolicy.REUSE_IF_MATCH));
+
+        assertThat(events.failed).singleElement()
+                .extracting(AgentToolFailed::stableErrorCode)
+                .isEqualTo("WEB_SEARCH_PROVIDER_FAILED");
     }
 
     @Test
@@ -268,7 +380,103 @@ class AgentToolRuntimeIntegrationTest {
         assertThat(reusedCall).anyMatch(ToolResponseMessage.class::isInstance);
     }
 
-    private ReactAgentSessionAdapter newAdapter(ToolCallingChatModel model, List<ToolCallback> tools, int maxResultChars) {
+    @Test
+    void parallelReadOnlyToolsUseReverseCompletionButOriginalModelResultOrder() throws Exception {
+        var tool = new ParallelGateTool();
+        var model = new ParallelCallingChatModel();
+        var adapter = newAdapter(model, List.of(tool.left, tool.right), 200_000);
+        var events = new RecordingListener();
+
+        AgentResult[] result = new AgentResult[1];
+        Thread run = new Thread(() -> result[0] = completeSync(adapter, events, new AgentRequest(
+                "parallel-gate-thread", null, UUID.randomUUID(), userList("并行查询"),
+                CheckpointPolicy.REUSE_IF_MATCH)));
+        run.start();
+
+        assertThat(tool.entered.await(5, TimeUnit.SECONDS)).isTrue();
+        // 两个工具都已进入后，先放行 right，再放行 left，形成确定的反向完成顺序。
+        tool.allowRight.countDown();
+        // 必须等生命周期拦截器已经观察到 right 返回，才能放行 left；
+        // 工具函数内部的记录先于函数真正返回，单独等待它会留下线程调度竞态。
+        assertThat(events.parallelRightCompleted.await(5, TimeUnit.SECONDS)).isTrue();
+        tool.allowLeft.countDown();
+        run.join(5_000);
+
+        assertThat(run.isAlive()).isFalse();
+        assertThat(result[0].text()).isEqualTo("并行结果已按调用顺序收集。");
+        assertThat(events.completed).extracting(AgentToolCompleted::toolName)
+                .containsExactly("parallel_right", "parallel_left");
+        // 生命周期回调的先后以实际观察到的完成顺序为准；模型收到的 ToolResponse 仍按原调用列表。
+        assertThat(tool.completionOrder).containsExactly("parallel_right", "parallel_left");
+        ToolResponseMessage responses = toolResponseOf(model.calls.get(1));
+        assertThat(responses.getResponses()).extracting(ToolResponseMessage.ToolResponse::name)
+                .containsExactly("parallel_left", "parallel_right");
+    }
+
+    @Test
+    void frameworkToolTimeoutProducesOneStableFailureAndSuppressesLateCompletion() throws Exception {
+        var tool = new BlockingTool();
+        var model = new SingleBlockingToolModel();
+        var adapter = newAdapter(model, List.of(tool), 200_000, 32_768, 32, Duration.ofSeconds(1));
+        var events = new RecordingListener();
+
+        Thread run = new Thread(() -> completeSync(adapter, events, new AgentRequest(
+                "timeout-gate-thread", null, UUID.randomUUID(), userList("执行慢工具"),
+                CheckpointPolicy.REUSE_IF_MATCH)));
+        run.start();
+        assertThat(tool.entered.await(5, TimeUnit.SECONDS)).isTrue();
+        run.join(8_000);
+        assertThat(run.isAlive()).isFalse();
+        assertThat(events.failed).singleElement()
+                .extracting(AgentToolFailed::stableErrorCode)
+                .isEqualTo(ToolLifecycleInterceptor.TOOL_EXECUTION_TIMEOUT);
+        assertThat(events.completed).isEmpty();
+        assertThat(events.result()).isNotNull();
+
+        // 让底层同步回调迟到返回；终态 fence 不允许再追加 completed 或新的 Agent 终态。
+        tool.release.countDown();
+        assertThat(tool.returned.await(5, TimeUnit.SECONDS)).isTrue();
+        assertThat(events.failed).hasSize(1);
+        assertThat(events.completed).isEmpty();
+    }
+
+    @Test
+    void timeoutDoesNotCancelIndependentParallelTool() throws Exception {
+        var tools = new ParallelTimeoutTools();
+        var model = new ParallelTimeoutCallingChatModel();
+        var adapter = newAdapter(model, List.of(tools.blocking, tools.fast), 200_000,
+                32_768, 32, Duration.ofSeconds(1));
+        var events = new RecordingListener();
+        AgentResult[] result = new AgentResult[1];
+
+        Thread run = new Thread(() -> result[0] = completeSync(adapter, events, new AgentRequest(
+                "parallel-timeout-gate-thread", null, UUID.randomUUID(), userList("并行执行慢工具"),
+                CheckpointPolicy.REUSE_IF_MATCH)));
+        run.start();
+        assertThat(tools.blocking.entered.await(5, TimeUnit.SECONDS)).isTrue();
+        assertThat(tools.fast.entered.await(5, TimeUnit.SECONDS)).isTrue();
+        assertThat(tools.fast.returned.await(5, TimeUnit.SECONDS)).isTrue();
+        run.join(8_000);
+
+        assertThat(run.isAlive()).isFalse();
+        assertThat(result[0]).isNotNull();
+        assertThat(events.failed).singleElement()
+                .extracting(AgentToolFailed::stableErrorCode)
+                .isEqualTo(ToolLifecycleInterceptor.TOOL_EXECUTION_TIMEOUT);
+        assertThat(events.completed).singleElement()
+                .extracting(AgentToolCompleted::toolName)
+                .isEqualTo("fast_tool");
+        assertThat(toolResponseOf(model.calls.get(1)).getResponses())
+                .extracting(ToolResponseMessage.ToolResponse::name)
+                .containsExactly("blocking_tool", "fast_tool");
+
+        tools.blocking.release.countDown();
+        assertThat(tools.blocking.returned.await(5, TimeUnit.SECONDS)).isTrue();
+        assertThat(events.failed).hasSize(1);
+        assertThat(events.completed).hasSize(1);
+    }
+
+    private ReactAgentSessionAdapter newAdapter(ChatModel model, List<ToolCallback> tools, int maxResultChars) {
         return newAdapter(model, tools, maxResultChars, 32_768, 32);
     }
 
@@ -280,6 +488,18 @@ class AgentToolRuntimeIntegrationTest {
                 (ChatModelProvider) () -> new ChatModelHandle(model, "test-provider", "test-model"),
                 redisUrl, "", 65_432, 32_768, 0.1, maxResultChars, tools,
                 maxResultTokens, maxSteps);
+        adapters.add(adapter);
+        return adapter;
+    }
+
+    private ReactAgentSessionAdapter newAdapter(
+            ChatModel model, List<ToolCallback> tools, int maxResultChars,
+            int maxResultTokens, int maxSteps, java.time.Duration toolExecutionTimeout
+    ) {
+        var adapter = new ReactAgentSessionAdapter(
+                (ChatModelProvider) () -> new ChatModelHandle(model, "test-provider", "test-model"),
+                redisUrl, "", 65_432, 32_768, 0.1, maxResultChars, tools,
+                maxResultTokens, maxSteps, toolExecutionTimeout);
         adapters.add(adapter);
         return adapter;
     }
@@ -331,19 +551,218 @@ class AgentToolRuntimeIntegrationTest {
         return UserMessage.builder().text(text).build();
     }
 
+    /** 两个显式只读工具：用闸门控制真实并行调用和可重复的反向完成顺序。 */
+    private static final class ParallelGateTool {
+        final CountDownLatch entered = new CountDownLatch(2);
+        final CountDownLatch allowLeft = new CountDownLatch(1);
+        final CountDownLatch allowRight = new CountDownLatch(1);
+        final List<String> completionOrder = new CopyOnWriteArrayList<>();
+        final GateTool left = new GateTool("parallel_left", allowLeft);
+        final GateTool right = new GateTool("parallel_right", allowRight);
+
+        private final class GateTool implements ParallelSafeToolCallback {
+            private final String name;
+            private final CountDownLatch permit;
+
+            private GateTool(String name, CountDownLatch permit) {
+                this.name = name;
+                this.permit = permit;
+            }
+
+            @Override
+            public ToolDefinition getToolDefinition() {
+                return ToolDefinition.builder()
+                        .name(name).description("Gate 只读工具")
+                        .inputSchema("{\"type\":\"object\"}").build();
+            }
+
+            @Override
+            public String call(String input) {
+                entered.countDown();
+                try {
+                    if (!permit.await(5, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("并行 Gate 未收到放行信号");
+                    }
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("并行 Gate 被中断", ex);
+                }
+                completionOrder.add(name);
+                return name + " result";
+            }
+        }
+    }
+
+    /** 阻塞工具：框架超时返回错误 ToolResponse，真实同步回调稍后才释放。 */
+    private static final class BlockingTool implements ParallelSafeToolCallback {
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        final CountDownLatch returned = new CountDownLatch(1);
+
+        @Override
+        public ToolDefinition getToolDefinition() {
+            return ToolDefinition.builder().name("blocking_tool")
+                    .description("Gate 阻塞工具").inputSchema("{\"type\":\"object\"}").build();
+        }
+
+        @Override
+        public String call(String input) {
+            entered.countDown();
+            try {
+                release.await(5, TimeUnit.SECONDS);
+                return "迟到结果";
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                return "被中断";
+            } finally {
+                returned.countDown();
+            }
+        }
+    }
+
+    private static final class FastTool implements ParallelSafeToolCallback {
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch returned = new CountDownLatch(1);
+
+        @Override
+        public ToolDefinition getToolDefinition() {
+            return ToolDefinition.builder().name("fast_tool")
+                    .description("Gate 快速只读工具").inputSchema("{\"type\":\"object\"}").build();
+        }
+
+        @Override
+        public String call(String input) {
+            entered.countDown();
+            try {
+                return "快速结果";
+            } finally {
+                returned.countDown();
+            }
+        }
+    }
+
+    private static final class ParallelTimeoutTools {
+        final BlockingTool blocking = new BlockingTool();
+        final FastTool fast = new FastTool();
+    }
+
+    private static final class ParallelCallingChatModel implements ChatModel {
+        final List<List<Message>> calls = new CopyOnWriteArrayList<>();
+
+        @Override
+        public ChatResponse call(Prompt prompt) {
+            List<Message> instructions = new ArrayList<>(prompt.getInstructions());
+            calls.add(instructions);
+            boolean hasResults = instructions.stream().anyMatch(ToolResponseMessage.class::isInstance);
+            if (!hasResults) {
+                AssistantMessage toolCalls = AssistantMessage.builder()
+                        .toolCalls(List.of(
+                                new AssistantMessage.ToolCall("parallel-call-left", "function",
+                                        "parallel_left", "{}"),
+                                new AssistantMessage.ToolCall("parallel-call-right", "function",
+                                        "parallel_right", "{}")))
+                        .build();
+                return new ChatResponse(List.of(new Generation(toolCalls)));
+            }
+            var metadata = ChatResponseMetadata.builder().usage(new DefaultUsage(4, 5, 9)).build();
+            return new ChatResponse(List.of(new Generation(
+                    AssistantMessage.builder().content("并行结果已按调用顺序收集。").build())), metadata);
+        }
+
+        @Override
+        public org.springframework.ai.chat.prompt.ChatOptions getDefaultOptions() {
+            return OpenAiChatOptions.builder().build();
+        }
+
+        @Override
+        public reactor.core.publisher.Flux<ChatResponse> stream(Prompt prompt) {
+            return reactor.core.publisher.Flux.just(call(prompt));
+        }
+    }
+
+    private static final class SingleBlockingToolModel implements ChatModel {
+        final List<List<Message>> calls = new CopyOnWriteArrayList<>();
+
+        @Override
+        public ChatResponse call(Prompt prompt) {
+            List<Message> instructions = new ArrayList<>(prompt.getInstructions());
+            calls.add(instructions);
+            boolean hasResults = instructions.stream().anyMatch(ToolResponseMessage.class::isInstance);
+            if (!hasResults) {
+                AssistantMessage toolCall = AssistantMessage.builder()
+                        .toolCalls(List.of(new AssistantMessage.ToolCall(
+                                "blocking-call", "function", "blocking_tool", "{}")))
+                        .build();
+                return new ChatResponse(List.of(new Generation(toolCall)));
+            }
+            return new ChatResponse(List.of(new Generation(
+                    AssistantMessage.builder().content("慢工具已收束为安全结果。").build())));
+        }
+
+        @Override
+        public org.springframework.ai.chat.prompt.ChatOptions getDefaultOptions() {
+            return OpenAiChatOptions.builder().build();
+        }
+
+        @Override
+        public reactor.core.publisher.Flux<ChatResponse> stream(Prompt prompt) {
+            return reactor.core.publisher.Flux.just(call(prompt));
+        }
+    }
+
+    private static final class ParallelTimeoutCallingChatModel implements ChatModel {
+        final List<List<Message>> calls = new CopyOnWriteArrayList<>();
+
+        @Override
+        public ChatResponse call(Prompt prompt) {
+            List<Message> instructions = new ArrayList<>(prompt.getInstructions());
+            calls.add(instructions);
+            boolean hasResults = instructions.stream().anyMatch(ToolResponseMessage.class::isInstance);
+            if (!hasResults) {
+                AssistantMessage toolCalls = AssistantMessage.builder()
+                        .toolCalls(List.of(
+                                new AssistantMessage.ToolCall("parallel-timeout-call", "function",
+                                        "blocking_tool", "{}"),
+                                new AssistantMessage.ToolCall("parallel-fast-call", "function",
+                                        "fast_tool", "{}")))
+                        .build();
+                return new ChatResponse(List.of(new Generation(toolCalls)));
+            }
+            return new ChatResponse(List.of(new Generation(
+                    AssistantMessage.builder().content("并行工具均已安全收束。").build())));
+        }
+
+        @Override
+        public org.springframework.ai.chat.prompt.ChatOptions getDefaultOptions() {
+            return OpenAiChatOptions.builder().build();
+        }
+
+        @Override
+        public reactor.core.publisher.Flux<ChatResponse> stream(Prompt prompt) {
+            return reactor.core.publisher.Flux.just(call(prompt));
+        }
+    }
+
     /** 记录工具生命周期事件与模型终态；失败抛出由调用方决定。 */
     private static final class RecordingListener implements AgentStreamListener {
 
         private final List<String> deltas = new CopyOnWriteArrayList<>();
+        private final List<String> reasoning = new CopyOnWriteArrayList<>();
         private final List<AgentToolStarted> started = new CopyOnWriteArrayList<>();
         private final List<AgentToolCompleted> completed = new CopyOnWriteArrayList<>();
         private final List<AgentToolFailed> failed = new CopyOnWriteArrayList<>();
+        private final CountDownLatch parallelRightCompleted = new CountDownLatch(1);
         private volatile AgentResult result;
         private volatile AgentExecutionException error;
 
         @Override
         public void onDelta(String delta) {
             deltas.add(delta);
+        }
+
+        @Override
+        public void onReasoningDelta(String delta) {
+            reasoning.add(delta);
         }
 
         @Override
@@ -364,6 +783,9 @@ class AgentToolRuntimeIntegrationTest {
         @Override
         public void onToolCompleted(AgentToolCompleted event) {
             completed.add(event);
+            if ("parallel_right".equals(event.toolName())) {
+                parallelRightCompleted.countDown();
+            }
         }
 
         @Override
@@ -390,19 +812,26 @@ class AgentToolRuntimeIntegrationTest {
 
         private final List<String> calls = new CopyOnWriteArrayList<>();
 
+        private final String name;
+
         private final boolean throwOnCall;
 
         private final String resultText;
 
         RecordingSearchTool() {
-            this(false, "检索命中：SalmonMind 支持本地文档问答，混合召回与引用。");
+            this(NAME, false, "检索命中：SalmonMind 支持本地文档问答，混合召回与引用。");
         }
 
         RecordingSearchTool(boolean throwOnCall) {
-            this(throwOnCall, null);
+            this(NAME, throwOnCall, null);
         }
 
         RecordingSearchTool(boolean throwOnCall, String resultText) {
+            this(NAME, throwOnCall, resultText);
+        }
+
+        RecordingSearchTool(String name, boolean throwOnCall, String resultText) {
+            this.name = name;
             this.throwOnCall = throwOnCall;
             this.resultText = resultText;
         }
@@ -410,7 +839,7 @@ class AgentToolRuntimeIntegrationTest {
         @Override
         public ToolDefinition getToolDefinition() {
             return ToolDefinition.builder()
-                    .name(NAME)
+                    .name(name)
                     .description("只读测试搜索工具：按查询返回固定短结果")
                     .inputSchema("""
                             {"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
@@ -446,13 +875,19 @@ class AgentToolRuntimeIntegrationTest {
         static final String FINAL_ANSWER = "根据检索结果，SalmonMind 支持本地文档问答。";
 
         private final String finalAnswer;
+        private final String toolName;
 
         ToolCallingChatModel() {
             this(FINAL_ANSWER);
         }
 
         ToolCallingChatModel(String finalAnswer) {
+            this(finalAnswer, RecordingSearchTool.NAME);
+        }
+
+        ToolCallingChatModel(String finalAnswer, String toolName) {
             this.finalAnswer = finalAnswer;
+            this.toolName = toolName;
         }
 
         private final List<List<Message>> calls = new CopyOnWriteArrayList<>();
@@ -469,11 +904,15 @@ class AgentToolRuntimeIntegrationTest {
             if (!sawToolResult) {
                 var toolCallMessage = AssistantMessage.builder()
                         .toolCalls(List.of(new AssistantMessage.ToolCall(
-                                TOOL_CALL_ID, "function", TOOL_NAME, "{\"query\":\"salmon\"}")))
+                                TOOL_CALL_ID, "function", toolName, "{\"query\":\"salmon\"}")))
+                        .properties(Map.of("reasoningContent", "需要先查询资料。"))
                         .build();
                 return new ChatResponse(List.of(new Generation(toolCallMessage)));
             }
-            var answer = AssistantMessage.builder().content(finalAnswer).build();
+            var answer = AssistantMessage.builder()
+                    .content(finalAnswer)
+                    .properties(Map.of("reasoningContent", "资料足够，可以作答。"))
+                    .build();
             var metadata = ChatResponseMetadata.builder().usage(new DefaultUsage(42, 7, 49)).build();
             return new ChatResponse(List.of(new Generation(answer)), metadata);
         }

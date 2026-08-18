@@ -25,4 +25,15 @@ public record AgentToolCompleted(
     public AgentToolCompleted(String toolCallId, String toolName, long durationMillis) {
         this(toolCallId, toolName, durationMillis, null, 0, false, false);
     }
+
+    /**
+     * 返回可直接暴露给运行轨迹和 SSE 的简短结果，不包含工具原始输出。
+     */
+    public String safeSummary() {
+        if (provider == null || provider.isBlank()) {
+            return "工具执行完成";
+        }
+        return provider + " · " + sourceCount + " 个来源"
+                + (degraded ? " · 降级结果" : "");
+    }
 }

@@ -120,6 +120,20 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
     }
 
     @Override
+    @Transactional
+    public void markAutomaticRetryQueued(UUID jobId, String messageId) {
+        KnowledgeIngestionJobEntity update = new KnowledgeIngestionJobEntity();
+        update.setStreamMessageId(messageId);
+        update.setState(IngestionJobState.QUEUED.name());
+        update.setUpdatedAt(Instant.now());
+        jobMapper.update(update, Wrappers.<KnowledgeIngestionJobEntity>lambdaUpdate()
+                .eq(KnowledgeIngestionJobEntity::getId, jobId)
+                .in(KnowledgeIngestionJobEntity::getState,
+                        IngestionJobState.PENDING_DISPATCH.name(),
+                        IngestionJobState.QUEUED.name()));
+    }
+
+    @Override
     public List<StoredDocument> list(UUID workspaceId) {
         return sourceMapper.selectList(Wrappers.<KnowledgeSourceEntity>lambdaQuery()
                         .eq(KnowledgeSourceEntity::getWorkspaceId, workspaceId)

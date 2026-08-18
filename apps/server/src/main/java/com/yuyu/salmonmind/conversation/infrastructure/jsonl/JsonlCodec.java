@@ -8,12 +8,17 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
+import com.yuyu.salmonmind.conversation.api.AssistantCompletionStatus;
 import com.yuyu.salmonmind.conversation.api.CitationPayload;
 import com.yuyu.salmonmind.conversation.api.CompactionPayload;
 import com.yuyu.salmonmind.conversation.api.Entry;
 import com.yuyu.salmonmind.conversation.api.EntryPayload;
 import com.yuyu.salmonmind.conversation.api.LocalCitationPayload;
+import com.yuyu.salmonmind.conversation.api.LocalRetrievedSourcePayload;
+import com.yuyu.salmonmind.conversation.api.RetrievedSourcePayload;
+import com.yuyu.salmonmind.conversation.api.RunTraceItemPayload;
 import com.yuyu.salmonmind.conversation.api.WebCitationPayload;
+import com.yuyu.salmonmind.conversation.api.WebRetrievedSourcePayload;
 import com.yuyu.salmonmind.conversation.api.TokenUsage;
 import com.yuyu.salmonmind.conversation.api.TitlePayload;
 import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
@@ -95,6 +100,10 @@ class JsonlCodec {
                 ObjectNode node = mapper.createObjectNode();
                 node.put("text", p.text());
                 node.put("runId", p.runId().toString());
+                if (p.action() != UserMessagePayload.Action.MESSAGE) {
+                    node.put("action", p.action().name());
+                    node.put("sourceAssistantEntryId", p.sourceAssistantEntryId().toString());
+                }
                 yield node;
             }
             case AssistantMessagePayload p -> {
@@ -103,6 +112,12 @@ class JsonlCodec {
                 node.put("runId", p.runId().toString());
                 node.put("provider", p.provider());
                 node.put("model", p.model());
+                if (p.completionStatus() != AssistantCompletionStatus.COMPLETE) {
+                    node.put("completionStatus", p.completionStatus().name());
+                }
+                if (p.completionDetailCode() != null && !p.completionDetailCode().isBlank()) {
+                    node.put("completionDetailCode", p.completionDetailCode());
+                }
                 if (p.usage() != null) {
                     node.set("usage", encodeUsage(p.usage()));
                 }
@@ -110,6 +125,18 @@ class JsonlCodec {
                     ArrayNode citations = node.putArray("citations");
                     for (CitationPayload citation : p.citations()) {
                         citations.add(encodeCitation(citation));
+                    }
+                }
+                if (!p.retrievedSources().isEmpty()) {
+                    ArrayNode sources = node.putArray("retrievedSources");
+                    for (RetrievedSourcePayload source : p.retrievedSources()) {
+                        sources.add(encodeRetrievedSource(source));
+                    }
+                }
+                if (!p.trace().isEmpty()) {
+                    ArrayNode trace = node.putArray("trace");
+                    for (RunTraceItemPayload item : p.trace()) {
+                        trace.add(encodeTraceItem(item));
                     }
                 }
                 yield node;
@@ -178,13 +205,17 @@ class JsonlCodec {
 
     private EntryPayload decodePayload(Entry.EntryType type, JsonNode node) {
         return switch (type) {
-            case USER_MESSAGE -> new UserMessagePayload(text(node, "text"), uuid(node, "runId"));
+            case USER_MESSAGE -> decodeUserPayload(node);
             case ASSISTANT_MESSAGE -> {
                 TokenUsage usage = node.hasNonNull("usage") ? decodeUsage(node.get("usage")) : null;
                 List<CitationPayload> citations = decodeCitations(node.get("citations"));
+                List<RetrievedSourcePayload> retrievedSources = decodeRetrievedSources(node.get("retrievedSources"));
+                List<RunTraceItemPayload> trace = decodeTrace(node.get("trace"));
+                AssistantCompletionStatus completionStatus = completionStatus(node);
                 yield new AssistantMessagePayload(
                         text(node, "text"), uuid(node, "runId"), text(node, "provider"), text(node, "model"),
-                        usage, citations);
+                        usage, citations, retrievedSources, trace, completionStatus,
+                        node.hasNonNull("completionDetailCode") ? text(node, "completionDetailCode") : null);
             }
             case COMPACTION -> {
                 TokenUsage usage = node.hasNonNull("usage") ? decodeUsage(node.get("usage")) : null;
@@ -222,6 +253,9 @@ class JsonlCodec {
     private ObjectNode encodeCitation(CitationPayload citation) {
         ObjectNode node = mapper.createObjectNode();
         node.put("referenceId", citation.referenceId());
+        if (citation.citationNote() != null) {
+            node.put("citationNote", citation.citationNote());
+        }
         switch (citation) {
             case LocalCitationPayload local -> {
                 node.put("kind", "local");
@@ -245,6 +279,86 @@ class JsonlCodec {
         return node;
     }
 
+    private UserMessagePayload decodeUserPayload(JsonNode node) {
+        UserMessagePayload.Action action;
+        try {
+            action = node.hasNonNull("action")
+                    ? UserMessagePayload.Action.valueOf(text(node, "action"))
+                    : UserMessagePayload.Action.MESSAGE;
+        } catch (IllegalArgumentException ex) {
+            throw corrupted("user payload 的 action 无效");
+        }
+        UUID source = node.hasNonNull("sourceAssistantEntryId")
+                ? uuid(node, "sourceAssistantEntryId") : null;
+        try {
+            return new UserMessagePayload(text(node, "text"), uuid(node, "runId"), action, source);
+        } catch (IllegalArgumentException ex) {
+            throw corrupted("user payload 的 action/source 组合无效");
+        }
+    }
+
+    private AssistantCompletionStatus completionStatus(JsonNode node) {
+        if (!node.hasNonNull("completionStatus")) {
+            return AssistantCompletionStatus.COMPLETE;
+        }
+        try {
+            return AssistantCompletionStatus.valueOf(text(node, "completionStatus"));
+        } catch (IllegalArgumentException ex) {
+            throw corrupted("assistant payload 的 completionStatus 无效");
+        }
+    }
+
+    private ObjectNode encodeTraceItem(RunTraceItemPayload item) {
+        ObjectNode node = mapper.createObjectNode();
+        node.put("kind", item.kind() == RunTraceItemPayload.Kind.REASONING ? "reasoning" : "tool");
+        node.put("truncated", item.truncated());
+        if (item.kind() == RunTraceItemPayload.Kind.REASONING) {
+            node.put("text", item.text());
+            return node;
+        }
+        node.put("toolCallId", item.toolCallId());
+        node.put("toolName", item.toolName());
+        node.put("status", switch (item.toolStatus()) {
+            case RUNNING -> "running";
+            case COMPLETED -> "completed";
+            case FAILED -> "failed";
+        });
+        node.put("safeSummary", item.safeSummary());
+        if (item.stableErrorCode() != null) {
+            node.put("stableErrorCode", item.stableErrorCode());
+        }
+        return node;
+    }
+
+    private ObjectNode encodeRetrievedSource(RetrievedSourcePayload source) {
+        ObjectNode node = mapper.createObjectNode();
+        node.put("referenceId", source.referenceId());
+        node.put("kind", source.kind());
+        node.put("retrievedAt", source.retrievedAt().toString());
+        node.put("excerptKind", source.excerptKind());
+        if (source.sourceExcerpt() != null) {
+            node.put("sourceExcerpt", source.sourceExcerpt());
+        }
+        switch (source) {
+            case LocalRetrievedSourcePayload local -> {
+                node.put("evidenceId", local.evidenceId().toString());
+                node.put("revisionId", local.revisionId().toString());
+                node.put("documentName", local.documentName());
+                node.put("location", local.location());
+            }
+            case WebRetrievedSourcePayload web -> {
+                node.put("provider", web.provider());
+                node.put("title", web.title());
+                node.put("url", web.url());
+                node.put("site", web.site());
+                if (web.dateLabel() != null) {
+                    node.put("dateLabel", web.dateLabel());
+                }
+            }
+        }
+        return node;
+    }
+
     private List<CitationPayload> decodeCitations(JsonNode node) {
         if (node == null || node.isNull()) {
             return List.of();
@@ -258,16 +372,94 @@ class JsonlCodec {
             String referenceId = text(item, "referenceId");
             if ("local".equals(kind)) {
                 citations.add(new LocalCitationPayload(referenceId, uuid(item, "evidenceId"),
-                        uuid(item, "revisionId"), text(item, "documentName"), text(item, "location")));
+                        uuid(item, "revisionId"), text(item, "documentName"), text(item, "location"),
+                        optionalText(item, "citationNote")));
             } else if ("web".equals(kind)) {
                 citations.add(new WebCitationPayload(referenceId, text(item, "provider"), text(item, "title"),
                         text(item, "url"), text(item, "site"), optionalText(item, "dateLabel"),
-                        instant(item, "retrievedAt")));
+                        instant(item, "retrievedAt"), optionalText(item, "citationNote")));
             } else {
                 throw corrupted("未知 Citation kind: " + kind);
             }
         }
         return List.copyOf(citations);
+    }
+
+    private List<RetrievedSourcePayload> decodeRetrievedSources(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return List.of();
+        }
+        if (!node.isArray()) {
+            throw corrupted("assistant retrievedSources 不是数组");
+        }
+        List<RetrievedSourcePayload> sources = new ArrayList<>();
+        for (JsonNode item : node) {
+            String kind = text(item, "kind");
+            String referenceId = text(item, "referenceId");
+            String excerptKind = text(item, "excerptKind");
+            Instant retrievedAt = instant(item, "retrievedAt");
+            if (referenceId == null || !referenceId.matches("[LW][1-9][0-9]*")
+                    || excerptKind == null || retrievedAt == null) {
+                throw corrupted("retrieved source 身份字段缺失");
+            }
+            if ("local".equals(kind)) {
+                UUID evidenceId = uuid(item, "evidenceId");
+                UUID revisionId = uuid(item, "revisionId");
+                String documentName = text(item, "documentName");
+                String location = text(item, "location");
+                if (evidenceId == null || revisionId == null || documentName == null || location == null) {
+                    throw corrupted("local retrieved source 身份字段损坏");
+                }
+                sources.add(new LocalRetrievedSourcePayload(
+                        referenceId, evidenceId, revisionId, documentName, location, retrievedAt,
+                        excerptKind, optionalText(item, "sourceExcerpt")));
+            } else if ("web".equals(kind)) {
+                String provider = text(item, "provider");
+                String title = text(item, "title");
+                String url = text(item, "url");
+                String site = text(item, "site");
+                if (provider == null || title == null || url == null || site == null) {
+                    throw corrupted("web retrieved source 身份字段损坏");
+                }
+                sources.add(new WebRetrievedSourcePayload(
+                        referenceId, provider, title, url, site, optionalText(item, "dateLabel"),
+                        retrievedAt, excerptKind, optionalText(item, "sourceExcerpt")));
+            } else {
+                throw corrupted("未知 Retrieved Source kind: " + kind);
+            }
+        }
+        return List.copyOf(sources);
+    }
+
+    private List<RunTraceItemPayload> decodeTrace(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return List.of();
+        }
+        if (!node.isArray()) {
+            throw corrupted("assistant trace 不是数组");
+        }
+        List<RunTraceItemPayload> trace = new ArrayList<>();
+        for (JsonNode item : node) {
+            boolean truncated = optionalBoolean(item, "truncated", false);
+            switch (text(item, "kind")) {
+                case "reasoning" -> trace.add(RunTraceItemPayload.reasoning(
+                        text(item, "text"), truncated));
+                case "tool" -> trace.add(RunTraceItemPayload.tool(
+                        text(item, "toolCallId"),
+                        text(item, "toolName"),
+                        switch (text(item, "status")) {
+                            case "running" -> RunTraceItemPayload.ToolStatus.RUNNING;
+                            case "completed" -> RunTraceItemPayload.ToolStatus.COMPLETED;
+                            case "failed" -> RunTraceItemPayload.ToolStatus.FAILED;
+                            default -> throw corrupted("未知 Tool Trace status");
+                        },
+                        text(item, "safeSummary"),
+                        optionalText(item, "stableErrorCode"),
+                        truncated));
+                default -> throw corrupted("未知 Trace kind");
+            }
+        }
+        return List.copyOf(trace);
     }
 
     // 解析整行：JSON 语法截断（EOF 未闭合）抛 TornTailException，其余解析错误视为损坏
@@ -331,6 +523,17 @@ class JsonlCodec {
             throw corrupted("字段不是文本: " + field);
         }
         return value.asText();
+    }
+
+    private static boolean optionalBoolean(JsonNode node, String field, boolean defaultValue) {
+        JsonNode value = node.get(field);
+        if (value == null || value.isNull()) {
+            return defaultValue;
+        }
+        if (!value.isBoolean()) {
+            throw corrupted("字段不是布尔值: " + field);
+        }
+        return value.asBoolean();
     }
 
     private static UUID uuid(JsonNode node, String field) {

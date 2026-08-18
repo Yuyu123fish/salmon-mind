@@ -19,6 +19,7 @@ public class RunEntity {
     private String errorCode;
     private Instant startedAt;
     private Instant endedAt;
+    private String resultStatus;
 
     public UUID getId() {
         return id;
@@ -74,5 +75,13 @@ public class RunEntity {
 
     public void setEndedAt(Instant endedAt) {
         this.endedAt = endedAt;
+    }
+
+    public String getResultStatus() {
+        return resultStatus;
+    }
+
+    public void setResultStatus(String resultStatus) {
+        this.resultStatus = resultStatus;
     }
 }

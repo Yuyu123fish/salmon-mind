@@ -66,10 +66,27 @@ salmon:
   agent:
     # ReactAgent 公开的 ModelCallLimitHook 硬步数上限；不是模型自觉停止的提示。
     max-steps: ${AGENT_MAX_STEPS:32}
+    checkpoint:
+      # meta/reverse/content/leaf 共享的滑动 Lease；执行期 lock 不在此范围内。
+      ttl: ${AGENT_CHECKPOINT_TTL:24h}
+      cleanup-max-attempts: ${AGENT_CHECKPOINT_CLEANUP_MAX_ATTEMPTS:3}
+    continuation:
+      max-auto-attempts: ${AGENT_CONTINUATION_MAX_AUTO_ATTEMPTS:2}
+      max-cumulative-output-tokens: ${AGENT_CONTINUATION_MAX_OUTPUT_TOKENS:131072}
+      timeout: ${AGENT_CONTINUATION_TIMEOUT:120s}
+    parallel:
+      max-concurrent-tools: ${AGENT_MAX_CONCURRENT_TOOLS:2}
+      max-concurrent-per-web-provider: ${AGENT_MAX_CONCURRENT_PER_WEB_PROVIDER:1}
+      tool-execution-timeout: ${AGENT_TOOL_EXECUTION_TIMEOUT:60s}
     max-tool-result-chars: ${AGENT_MAX_TOOL_RESULT_CHARS:200000}
     max-tool-calls-per-run: ${AGENT_MAX_TOOL_CALLS_PER_RUN:4}
     # 一次主调用内所有工具消息的总 token 预算；工具结果在返回模型前按完整 item/文本边界裁剪。
     max-tool-result-tokens-per-run: ${AGENT_MAX_TOOL_RESULT_TOKENS_PER_RUN:32768}
+    trace:
+      # 展示/持久化硬上限，不是模型 Token Budget；部署只能下调，代码不会允许突破固定边界。
+      max-items: ${AGENT_TRACE_MAX_ITEMS:64}
+      max-reasoning-chars: ${AGENT_TRACE_MAX_REASONING_CHARS:32768}
+      max-tool-summary-chars: ${AGENT_TRACE_MAX_TOOL_SUMMARY_CHARS:512}
   websearch:
     connect-timeout: ${WEB_SEARCH_CONNECT_TIMEOUT:5s}
     read-timeout: ${WEB_SEARCH_READ_TIMEOUT:15s}
@@ -113,6 +130,9 @@ salmon:
       enabled: ${KNOWLEDGE_WORKER_ENABLED:true}
       batch-size: ${KNOWLEDGE_WORKER_BATCH_SIZE:4}
       max-auto-retries: ${KNOWLEDGE_WORKER_MAX_AUTO_RETRIES:2}
+      cleanup-max-attempts: ${KNOWLEDGE_WORKER_CLEANUP_MAX_ATTEMPTS:3}
+      cleanup-interval: ${KNOWLEDGE_WORKER_CLEANUP_INTERVAL:30s}
+      cleanup-batch-size: ${KNOWLEDGE_WORKER_CLEANUP_BATCH_SIZE:64}
       reclaim-idle: ${KNOWLEDGE_WORKER_RECLAIM_IDLE:30s}
       repair-interval: ${KNOWLEDGE_WORKER_REPAIR_INTERVAL:10s}
     content-store:

@@ -1,0 +1,27 @@
+package com.yuyu.salmonmind.codebase.api;
+
+/**
+ * codebase 对调用方稳定暴露的失败类别。
+ *
+ * <p>错误消息由 Server 生成，不包含目标仓库的完整路径、Git stderr 或文件内容。</p>
+ */
+public enum CodebaseErrorCode {
+    INVALID_ABSOLUTE_PATH,
+    PATH_NOT_FOUND,
+    PATH_NOT_DIRECTORY,
+    PATH_NOT_READABLE,
+    NOT_GIT_REPOSITORY,
+    BARE_REPOSITORY_NOT_SUPPORTED,
+    REPOSITORY_NOT_FOUND,
+    REPOSITORY_UNAVAILABLE,
+    PATH_OUTSIDE_REPOSITORY,
+    SENSITIVE_FILE_DENIED,
+    UNSUPPORTED_TEXT_FILE,
+    INVALID_QUERY,
+    GIT_NOT_AVAILABLE,
+    GIT_QUERY_FAILED,
+    GIT_QUERY_TIMEOUT,
+    CODEBASE_DATA_CORRUPTED,
+    CODEBASE_DATA_UNAVAILABLE,
+    CODEBASE_INTERNAL_ERROR
+}

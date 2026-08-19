@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import KnowledgeView from './KnowledgeView.tsx'
 import { MarkdownRenderer } from './MarkdownRenderer.tsx'
+import RepositoryMenu from './RepositoryMenu.tsx'
 import { RunTracePanel } from './RunTracePanel.tsx'
 import { mergeConversation, mergeConversationDetail } from './conversationState.ts'
 import { followModeAfterScroll } from './followMode.ts'
@@ -672,11 +673,14 @@ function App() {
             Knowledge
           </button>
         </nav>
-        <p className="status">
-          {workspaceState.status === 'ready' && '已连接'}
-          {workspaceState.status === 'loading' && '正在连接'}
-          {workspaceState.status === 'error' && '未连接'}
-        </p>
+        <div className="topbar-actions">
+          <RepositoryMenu />
+          <p className="status">
+            {workspaceState.status === 'ready' && '已连接'}
+            {workspaceState.status === 'loading' && '正在连接'}
+            {workspaceState.status === 'error' && '未连接'}
+          </p>
+        </div>
       </header>
 
       <div className="workspace" data-view={activeView}>

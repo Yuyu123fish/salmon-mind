@@ -12,6 +12,12 @@ spring:
     username: salmon_mind
     password: salmon_mind_local
 
+# 本地代码库只读底座配置；目标仓库不会被写入。修改后需重启 Server。
+codebase:
+  data-dir: data/repository-understanding
+  git-command: git
+  git-timeout: 10s
+
 salmon:
   model:
     chat:

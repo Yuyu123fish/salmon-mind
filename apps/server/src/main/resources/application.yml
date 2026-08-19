@@ -2,6 +2,12 @@ server:
   address: ${SERVER_ADDRESS:127.0.0.1}
   port: ${SERVER_PORT:8080}
 
+# 本地代码库只读底座：路径按 Server 所在机器解释；修改后需重启 Server。
+codebase:
+  data-dir: ${CODEBASE_DATA_DIR:data/repository-understanding}
+  git-command: ${CODEBASE_GIT_COMMAND:git}
+  git-timeout: ${CODEBASE_GIT_TIMEOUT:10s}
+
 spring:
   application:
     name: salmon-mind-server

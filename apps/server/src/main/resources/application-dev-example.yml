@@ -2,6 +2,12 @@
 # application-dev.yml 已被 .gitignore 忽略，不会入库；本模板文件随仓库维护。
 # 运行 `mvn spring-boot:run` 时默认激活 dev profile，自动加载本文件。
 spring:
+  threads:
+    # Java 21 虚拟线程默认开启；修改后需重启 Server，关闭可回退平台线程
+    virtual:
+      enabled: true
+  main:
+    keep-alive: true
   datasource:
     username: salmon_mind
     password: salmon_mind_local
@@ -51,7 +57,29 @@ salmon:
   redis:
     # 本地 Redis 无密码时留空
     password:
+  conversation:
+    cache:
+      # 可选：Redis 快照缓存默认开启；Redis 不可用时自动回退 JSONL
+      enabled: true
+      ttl: 10m
+      max-entry-bytes: 4194304
+      key-prefix: salmon:conversation:snapshot:v1:
   knowledge:
+    upload:
+      # 大文件可恢复上传；修改阈值/生命周期/超时后需重启 Server，Redis 与 RustFS 必须可用
+      resumable-enabled: true
+      resumable-threshold-bytes: 10485760
+      part-size-bytes: 5242880
+      max-concurrent-parts: 3
+      session-idle-ttl: 30m
+      max-session-lifetime: 24h
+      orphan-grace: 2h
+      terminal-retention: 1h
+      cleanup-interval: 1m
+      cleanup-batch-size: 100
+      key-prefix: salmon:knowledge:upload:v1:
+      api-call-timeout: 15s
+      api-attempt-timeout: 10s
     content-store:
       # 宿主机运行后端时，访问 Compose 映射到本机的 RustFS API 端口
       endpoint: http://127.0.0.1:9000

@@ -142,7 +142,7 @@ class TikaDocumentParser implements DocumentParserPort {
             if (pageCount > MAX_PAGE_COUNT) {
                 throw new KnowledgeException(KnowledgeException.Code.PARSE_FAILED, "文档页数超过处理上限");
             }
-            return new ParsedDocument(detected, text, pageCount, text.length());
+            return new ParsedDocument(detected, text, pageCount, text.length(), TikaMetadataProjector.project(metadata));
         } catch (KnowledgeException ex) {
             throw ex;
         } catch (Exception ex) {

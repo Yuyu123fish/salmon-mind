@@ -1,5 +1,7 @@
 package com.yuyu.salmonmind.knowledge.api;
 
+import com.yuyu.salmonmind.knowledge.domain.ParsedDocumentMetadata;
+
 import java.util.List;
 
 /**
@@ -11,10 +13,17 @@ public record DocumentDetail(
         DocumentSummary document,
         List<IngestionJobView> jobs,
         int pageCount,
-        int textCharCount
+        int textCharCount,
+        ParsedDocumentMetadata metadata
 ) {
+
+    public DocumentDetail(DocumentSummary document, List<IngestionJobView> jobs,
+                          int pageCount, int textCharCount) {
+        this(document, jobs, pageCount, textCharCount, ParsedDocumentMetadata.empty());
+    }
 
     public DocumentDetail {
         jobs = List.copyOf(jobs);
+        metadata = metadata == null ? ParsedDocumentMetadata.empty() : metadata;
     }
 }

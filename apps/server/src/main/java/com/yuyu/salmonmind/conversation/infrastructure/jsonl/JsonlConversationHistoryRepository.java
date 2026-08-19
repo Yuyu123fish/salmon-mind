@@ -62,6 +62,13 @@ class JsonlConversationHistoryRepository implements ConversationHistoryRepositor
         return directoryOf(conversationId).resolve(EVENTS_FILE);
     }
 
+    /**
+     * 读取 JSONL 自身的轻量版本。缓存只能把它作为新鲜度依据，不能使用数据库序号或 Redis 版本替代。
+     */
+    JsonlAuthorityVersion authorityVersion(UUID conversationId) {
+        return JsonlAuthorityVersion.read(fileOf(conversationId));
+    }
+
     /** 原子创建：同目录临时文件写入 Header、强制刷盘后移动为正式文件。 */
     @Override
     public void create(UUID conversationId, Instant createdAt) {

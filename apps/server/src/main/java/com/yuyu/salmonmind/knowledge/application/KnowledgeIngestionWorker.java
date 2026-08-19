@@ -243,7 +243,9 @@ class KnowledgeIngestionWorker implements SmartLifecycle {
             temp = Files.createTempFile("salmon-knowledge-worker-", ".source");
             objectStorage.download(revision.objectKey(), temp);
             ParsedDocument parsed = parser.parse(temp, revision.detectedMediaType());
-            metadata.updateParseMetadata(revision.id(), parsed.pageCount(), parsed.textCharCount());
+            // 先持久化解析统计和白名单元信息，再决定正文为空的失败语义；
+            // 数据库写入失败会进入既有失败收束，不会继续发布 READY。
+            metadata.updateParseMetadata(revision.id(), parsed.pageCount(), parsed.textCharCount(), parsed.metadata());
             if (parsed.text().isBlank()) {
                 if (revision.format() == com.yuyu.salmonmind.knowledge.domain.DocumentFormat.PDF) {
                     metadata.markOcrRequired(job.id(), "OCR_REQUIRED", "PDF 未提取到可检索正文");

@@ -10,9 +10,15 @@ import com.yuyu.salmonmind.knowledge.api.DocumentUpload;
 import com.yuyu.salmonmind.knowledge.api.EvidencePage;
 import com.yuyu.salmonmind.knowledge.api.KnowledgeService;
 import com.yuyu.salmonmind.knowledge.api.KnowledgeException;
+import com.yuyu.salmonmind.knowledge.api.UploadInitRequest;
+import com.yuyu.salmonmind.knowledge.api.UploadSessionView;
+import com.yuyu.salmonmind.knowledge.application.KnowledgeUploadApplicationService;
 import com.yuyu.salmonmind.knowledge.application.port.EvidenceIndexPort;
 import com.yuyu.salmonmind.knowledge.application.port.KnowledgeMetadataPort;
 import com.yuyu.salmonmind.knowledge.application.port.ObjectStoragePort;
+import com.yuyu.salmonmind.knowledge.application.port.ResumableUploadStoragePort;
+import com.yuyu.salmonmind.knowledge.application.KnowledgeUploadObjectKeys;
+import com.yuyu.salmonmind.knowledge.domain.ParsedDocumentMetadata;
 import com.yuyu.salmonmind.model.embedding.EmbeddingException;
 import com.yuyu.salmonmind.model.embedding.EmbeddingResult;
 import com.yuyu.salmonmind.model.embedding.EmbeddingService;
@@ -39,9 +45,13 @@ import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -56,7 +66,11 @@ import java.util.zip.ZipOutputStream;
                 "salmon.knowledge.worker.enabled=true",
                 "salmon.knowledge.worker.reclaim-idle=1s",
                 "salmon.knowledge.worker.max-auto-retries=1",
-                "salmon.knowledge.worker.repair-interval=1s"
+                "salmon.knowledge.worker.repair-interval=1s",
+                "salmon.knowledge.max-object-bytes=1048576",
+                "salmon.knowledge.upload.resumable-threshold-bytes=1",
+                "salmon.knowledge.upload.part-size-bytes=65536",
+                "salmon.knowledge.upload.max-concurrent-parts=2"
         }
 )
 @Import(KnowledgeWorkflowIntegrationTest.DeterministicEmbeddingConfiguration.class)
@@ -102,6 +116,12 @@ class KnowledgeWorkflowIntegrationTest {
 
     @Autowired
     private EvidenceIndexPort evidenceIndex;
+
+    @Autowired
+    private ResumableUploadStoragePort resumableStorage;
+
+    @Autowired
+    private KnowledgeUploadApplicationService resumableUploads;
 
     @Autowired
     private WorkspaceRegistry workspaceRegistry;
@@ -157,6 +177,80 @@ class KnowledgeWorkflowIntegrationTest {
         EvidencePage evidence = knowledge.evidence(accepted.id(), 0, 20);
         assertThat(evidence.total()).isGreaterThan(0);
         assertThat(evidence.items()).extracting(item -> item.text()).anyMatch(text -> text.contains("第一段"));
+    }
+
+    @Test
+    void parsedMetadataRoundTripsAsTypedJsonbAndOldRevisionDefaultsToEmpty() {
+        UUID workspaceId = workspaceRegistry.current().id();
+        DocumentSummary accepted = knowledge.upload(new DocumentUpload(
+                "metadata-only.txt", "text/plain", new ByteArrayInputStream("metadata body".getBytes(StandardCharsets.UTF_8))));
+        assertThat(metadata.findRevision(accepted.revisionId()).parsedMetadata().hasValues()).isFalse();
+
+        ParsedDocumentMetadata expected = new ParsedDocumentMetadata(
+                "Round-trip 标题", List.of("作者一", "作者二"), "主题", "描述", "zh-CN",
+                Instant.parse("2024-01-01T00:00:00Z"), Instant.parse("2024-01-02T00:00:00Z"), "测试工具");
+        metadata.updateParseMetadata(accepted.revisionId(), 2, 12, expected);
+
+        KnowledgeMetadataPort.StoredRevision actual = metadata.findRevision(accepted.revisionId());
+        assertThat(actual.pageCount()).isEqualTo(2);
+        assertThat(actual.textCharCount()).isEqualTo(12);
+        assertThat(actual.parsedMetadata()).isEqualTo(expected);
+    }
+
+    @Test
+    void workerPersistsParsedMetadataBeforePublishingReady() throws Exception {
+        DocumentSummary accepted = knowledge.upload(new DocumentUpload(
+                "metadata-worker.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                new ByteArrayInputStream(minimalDocx())));
+
+        KnowledgeMetadataPort.StoredDocument stored = awaitReady(accepted.id());
+
+        assertThat(stored.revision().parsedMetadata().title()).isEqualTo("测试文档标题");
+        assertThat(stored.revision().parsedMetadata().authors()).containsExactly("测试作者");
+        assertThat(stored.revision().parsedMetadata().subject()).isEqualTo("测试主题");
+        assertThat(stored.revision().parsedMetadata().createdAt())
+                .isEqualTo(Instant.parse("2024-01-01T00:00:00Z"));
+    }
+
+    @Test
+    void resumableUploadUsesRealRedisReceiptsRustFsObjectsAndIdempotentPostgresSubmission() throws Exception {
+        byte[] original = ("可恢复上传正文。".repeat(3_000)).getBytes(StandardCharsets.UTF_8);
+        UUID workspaceId = workspaceRegistry.current().id();
+        UploadSessionView initialized = resumableUploads.init(new UploadInitRequest(
+                "chunked.txt", "text/plain", original.length,
+                "chunked.txt|" + original.length + "|42", 42));
+
+        int partSize = initialized.partSizeBytes();
+        for (int part = 1; part <= initialized.totalParts(); part++) {
+            int offset = (part - 1) * partSize;
+            int length = Math.min(partSize, original.length - offset);
+            byte[] bytes = java.util.Arrays.copyOfRange(original, offset, offset + length);
+            UploadSessionView progress = resumableUploads.putPart(initialized.sessionId(), part, length,
+                    sha256(bytes), new ByteArrayInputStream(bytes));
+            assertThat(progress.confirmedBytes()).isEqualTo(Math.min((long) part * partSize, original.length));
+        }
+
+        DocumentSummary accepted = resumableUploads.complete(initialized.sessionId());
+        DocumentSummary repeated = resumableUploads.complete(initialized.sessionId());
+        assertThat(repeated.id()).isEqualTo(accepted.id());
+        KnowledgeMetadataPort.StoredDocument submitted = metadata.find(workspaceId, accepted.id());
+        assertThat(submitted).isNotNull();
+        assertThat(submitted.revision().sizeBytes()).isEqualTo(original.length);
+        assertThat(submitted.revision().sha256()).isEqualTo(sha256(original));
+        assertThat(submitted.latestJob().state().name())
+                .isIn("PENDING_DISPATCH", "QUEUED", "PARSING", "EMBEDDING", "INDEXING", "READY");
+
+        UploadSessionView canceled = resumableUploads.init(new UploadInitRequest(
+                "cancelled.txt", "text/plain", original.length, "cancelled|" + original.length, 43));
+        int cancelLength = Math.min(canceled.partSizeBytes(), original.length);
+        byte[] cancelBytes = java.util.Arrays.copyOf(original, cancelLength);
+        resumableUploads.putPart(canceled.sessionId(), 1, cancelLength, sha256(cancelBytes),
+                new ByteArrayInputStream(cancelBytes));
+        resumableUploads.cancel(canceled.sessionId());
+        String bucket = LocalDate.now(ZoneOffset.UTC).toString().replace("-", "");
+        String prefix = KnowledgeUploadObjectKeys.partPrefix(bucket, workspaceId, canceled.sessionId());
+        assertThat(resumableStorage.listObjects(prefix, null, 100).objects()).isEmpty();
     }
 
     @Test
@@ -283,14 +377,16 @@ class KnowledgeWorkflowIntegrationTest {
                 + "2 0 obj<< /Type /Pages /Kids [3 0 R] /Count 1 >>endobj\n"
                 + "3 0 obj<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R >>endobj\n"
                 + "4 0 obj<< /Length 39 >>stream\nBT /F1 12 Tf (PDF Gate) Tj ET\nendstream endobj\n"
-                + "trailer<< /Root 1 0 R >>\n%%EOF\n").getBytes(StandardCharsets.US_ASCII);
+                + "5 0 obj<< /Title (测试PDF标题) /Author (测试PDF作者) /Subject (测试主题) >>endobj\n"
+                + "trailer<< /Root 1 0 R /Info 5 0 R >>\n%%EOF\n").getBytes(StandardCharsets.UTF_8);
     }
 
     private static byte[] minimalDocx() throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (ZipOutputStream zip = new ZipOutputStream(bytes, StandardCharsets.UTF_8)) {
-            put(zip, "[Content_Types].xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/></Types>");
-            put(zip, "_rels/.rels", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/></Relationships>");
+            put(zip, "[Content_Types].xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/><Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/></Types>");
+            put(zip, "_rels/.rels", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/><Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/></Relationships>");
+            put(zip, "docProps/core.xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><dc:title>测试文档标题</dc:title><dc:creator>测试作者</dc:creator><dc:subject>测试主题</dc:subject><dcterms:created xsi:type=\"dcterms:W3CDTF\">2024-01-01T00:00:00Z</dcterms:created></cp:coreProperties>");
             put(zip, "word/document.xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>DOCX Gate 文本</w:t></w:r></w:p><w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/><w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\"/></w:sectPr></w:body></w:document>");
         }
         return bytes.toByteArray();
@@ -300,6 +396,15 @@ class KnowledgeWorkflowIntegrationTest {
         zip.putNextEntry(new ZipEntry(name));
         zip.write(value.getBytes(StandardCharsets.UTF_8));
         zip.closeEntry();
+    }
+
+    private static String sha256(byte[] bytes) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return java.util.HexFormat.of().formatHex(digest.digest(bytes));
+        } catch (NoSuchAlgorithmException ex) {
+            throw new IllegalStateException(ex);
+        }
     }
 
     @TestConfiguration(proxyBeanMethods = false)

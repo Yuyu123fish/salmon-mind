@@ -6,6 +6,7 @@ import com.yuyu.salmonmind.knowledge.application.port.KnowledgeMetadataPort;
 import com.yuyu.salmonmind.knowledge.domain.DocumentFormat;
 import com.yuyu.salmonmind.knowledge.domain.IngestionJobState;
 import com.yuyu.salmonmind.knowledge.domain.KnowledgeSourceLifecycle;
+import com.yuyu.salmonmind.knowledge.domain.ParsedDocumentMetadata;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -87,6 +88,7 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
         revision.setDetectedMediaType(detectedMediaType);
         revision.setPageCount(0);
         revision.setTextCharCount(0);
+        revision.setParsedMetadata(ParsedDocumentMetadata.empty());
         revision.setCreatedAt(now);
         revisionMapper.insert(revision);
 
@@ -100,6 +102,25 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
         job.setUpdatedAt(now);
         jobMapper.insert(job);
         return new Submission(sourceId, revisionId, jobId, 1);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public Submission findSubmissionByObjectKey(UUID workspaceId, String objectKey) {
+        KnowledgeRevisionEntity revision = revisionMapper.selectOne(Wrappers.<KnowledgeRevisionEntity>lambdaQuery()
+                .eq(KnowledgeRevisionEntity::getContentObjectKey, objectKey).last("LIMIT 1"));
+        if (revision == null) {
+            return null;
+        }
+        KnowledgeSourceEntity source = sourceMapper.selectById(revision.getSourceId());
+        if (source == null || !workspaceId.equals(source.getWorkspaceId())) {
+            return null;
+        }
+        KnowledgeIngestionJobEntity job = jobMapper.selectList(Wrappers.<KnowledgeIngestionJobEntity>lambdaQuery()
+                        .eq(KnowledgeIngestionJobEntity::getSourceRevisionId, revision.getId())
+                        .orderByDesc(KnowledgeIngestionJobEntity::getAttemptNumber).last("LIMIT 1"))
+                .stream().findFirst().orElse(null);
+        return job == null ? null : new Submission(source.getId(), revision.getId(), job.getId(), job.getAttemptNumber());
     }
 
     @Override
@@ -343,13 +364,15 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
 
     @Override
     @Transactional
-    public void updateParseMetadata(UUID revisionId, int pageCount, int textCharCount) {
+    public void updateParseMetadata(UUID revisionId, int pageCount, int textCharCount,
+                                    ParsedDocumentMetadata parsedMetadata) {
         if (!lockActiveSourceForRevision(revisionId)) {
             return;
         }
         KnowledgeRevisionEntity update = new KnowledgeRevisionEntity();
         update.setPageCount(pageCount);
         update.setTextCharCount(textCharCount);
+        update.setParsedMetadata(parsedMetadata);
         revisionMapper.update(update, Wrappers.<KnowledgeRevisionEntity>lambdaUpdate()
                 .eq(KnowledgeRevisionEntity::getId, revisionId));
     }
@@ -430,7 +453,7 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
             // 删除先取得 Source 锁时，旧 Worker 只能收束消息，不能重新发布 READY。
             return;
         }
-        updateParseMetadata(revisionId, pageCount, textCharCount);
+        updateParseStats(revisionId, pageCount, textCharCount);
         evidenceMapper.delete(Wrappers.<KnowledgeEvidenceEntity>lambdaQuery()
                 .eq(KnowledgeEvidenceEntity::getGenerationId, generation.id())
                 .eq(KnowledgeEvidenceEntity::getSourceRevisionId, revisionId));
@@ -720,7 +743,15 @@ class PostgresKnowledgeMetadataRepository implements KnowledgeMetadataPort {
                 entity.getId(), entity.getSourceId(), entity.getName(), DocumentFormat.valueOf(entity.getFormat()),
                 entity.getMediaType(), entity.getDetectedMediaType(), nullToZero(entity.getSizeBytes()),
                 entity.getContentSha256(), entity.getContentObjectKey(), nullToZero(entity.getPageCount()),
-                nullToZero(entity.getTextCharCount()), entity.getCreatedAt());
+                nullToZero(entity.getTextCharCount()), entity.getParsedMetadata(), entity.getCreatedAt());
+    }
+
+    private void updateParseStats(UUID revisionId, int pageCount, int textCharCount) {
+        KnowledgeRevisionEntity update = new KnowledgeRevisionEntity();
+        update.setPageCount(pageCount);
+        update.setTextCharCount(textCharCount);
+        revisionMapper.update(update, Wrappers.<KnowledgeRevisionEntity>lambdaUpdate()
+                .eq(KnowledgeRevisionEntity::getId, revisionId));
     }
 
     private static StoredJob toJob(KnowledgeIngestionJobEntity entity) {

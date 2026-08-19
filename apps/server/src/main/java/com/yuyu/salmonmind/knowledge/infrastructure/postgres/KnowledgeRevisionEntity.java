@@ -2,7 +2,10 @@ package com.yuyu.salmonmind.knowledge.infrastructure.postgres;
 
 import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableId;
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableName;
+import com.yuyu.salmonmind.knowledge.domain.ParsedDocumentMetadata;
+import org.apache.ibatis.type.JdbcType;
 
 import java.time.Instant;
 import java.util.UUID;
@@ -24,6 +27,9 @@ public class KnowledgeRevisionEntity {
     private String detectedMediaType;
     private Integer pageCount;
     private Integer textCharCount;
+    @TableField(jdbcType = JdbcType.OTHER, typeHandler = ParsedDocumentMetadataJsonTypeHandler.class)
+    // 更新解析统计的局部实体必须保持 null，否则 MyBatis 会把空对象写回并覆盖 Worker 已保存的元信息。
+    private ParsedDocumentMetadata parsedMetadata;
     private Instant createdAt;
 
     public UUID getId() { return id; }
@@ -50,6 +56,10 @@ public class KnowledgeRevisionEntity {
     public void setPageCount(Integer pageCount) { this.pageCount = pageCount; }
     public Integer getTextCharCount() { return textCharCount; }
     public void setTextCharCount(Integer textCharCount) { this.textCharCount = textCharCount; }
+    public ParsedDocumentMetadata getParsedMetadata() { return parsedMetadata; }
+    public void setParsedMetadata(ParsedDocumentMetadata parsedMetadata) {
+        this.parsedMetadata = parsedMetadata == null ? ParsedDocumentMetadata.empty() : parsedMetadata;
+    }
     public Instant getCreatedAt() { return createdAt; }
     public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
 }

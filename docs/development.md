@@ -45,6 +45,12 @@ mvn -f apps/server/pom.xml spring-boot:run
 - `CONVERSATION_CACHE_ENABLED` 控制 Conversation 完整历史快照缓存，默认 `true`；`CONVERSATION_CACHE_TTL` 默认 `10m`（上限 7 天）；`CONVERSATION_CACHE_MAX_ENTRY_BYTES` 默认 `4194304`（上限 64 MiB）；`CONVERSATION_CACHE_KEY_PREFIX` 默认 `salmon:conversation:snapshot:v1:`，必须使用独立、以冒号结尾的 keyspace。
 - 缓存收益需要已有 `REDIS_URL` / `REDIS_PASSWORD`；Redis 未配置、不可用、缓存损坏或快照超限时会透明回退 JSONL，不阻止应用启动。缓存与虚拟线程配置均需要重启生效；关闭 `CONVERSATION_CACHE_ENABLED` 是 JSONL-only 回退点。
 
+### Knowledge 可恢复上传开发配置（Stage 02 审查前）
+
+Stage 02 的可恢复上传实现和配置模板已随代码提供，但在开发者审查完成前不作为已验收能力。`KNOWLEDGE_RESUMABLE_UPLOAD_ENABLED` 控制大文件 Session 总开关；开启后由 `/api/knowledge/uploads/policy` 返回阈值、part 大小和并发上限，浏览器只把超过服务端阈值且不超过 `KNOWLEDGE_MAX_OBJECT_BYTES` 的文件切为普通 RustFS Object。Redis Session 只保存 Receipt 元数据，不保存文件字节；RustFS 与 Redis 均不可用时不会伪造进度或完成。
+
+配置名包括 `KNOWLEDGE_RESUMABLE_UPLOAD_THRESHOLD_BYTES`、`KNOWLEDGE_UPLOAD_PART_SIZE_BYTES`、`KNOWLEDGE_UPLOAD_MAX_CONCURRENT_PARTS`、`KNOWLEDGE_UPLOAD_SESSION_IDLE_TTL`、`KNOWLEDGE_UPLOAD_MAX_SESSION_LIFETIME`、`KNOWLEDGE_UPLOAD_ORPHAN_GRACE`、`KNOWLEDGE_UPLOAD_TERMINAL_RETENTION`、`KNOWLEDGE_UPLOAD_CLEANUP_INTERVAL`、`KNOWLEDGE_UPLOAD_CLEANUP_BATCH_SIZE`、`KNOWLEDGE_UPLOAD_KEY_PREFIX`、`KNOWLEDGE_UPLOAD_API_CALL_TIMEOUT` 和 `KNOWLEDGE_UPLOAD_API_ATTEMPT_TIMEOUT`。默认值和代码级上下限以 `application.yml` / `application-dev-example.yml` 与 `KnowledgeUploadProperties` 为准；修改后需要重启 Server，且必须继续提供既有 `REDIS_URL` / `REDIS_PASSWORD` 与 RustFS Endpoint/账号/Bucket。真实凭据只能填写忽略的 `application-dev.yml` 或宿主环境变量。
+
 ## 开发者补充配置
 
 当一次实施需要开发者补充 API Key、Endpoint、账号、端口或外部服务时，配置交付必须形成闭环：

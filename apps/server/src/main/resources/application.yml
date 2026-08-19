@@ -132,6 +132,20 @@ salmon:
     chunk-max-chars: ${KNOWLEDGE_CHUNK_MAX_CHARS:1200}
     embedding-batch-size: ${KNOWLEDGE_EMBEDDING_BATCH_SIZE:32}
     max-object-bytes: ${KNOWLEDGE_MAX_OBJECT_BYTES:52428800}
+    upload:
+      resumable-enabled: ${KNOWLEDGE_RESUMABLE_UPLOAD_ENABLED:true}
+      resumable-threshold-bytes: ${KNOWLEDGE_RESUMABLE_UPLOAD_THRESHOLD_BYTES:10485760}
+      part-size-bytes: ${KNOWLEDGE_UPLOAD_PART_SIZE_BYTES:5242880}
+      max-concurrent-parts: ${KNOWLEDGE_UPLOAD_MAX_CONCURRENT_PARTS:3}
+      session-idle-ttl: ${KNOWLEDGE_UPLOAD_SESSION_IDLE_TTL:30m}
+      max-session-lifetime: ${KNOWLEDGE_UPLOAD_MAX_SESSION_LIFETIME:24h}
+      orphan-grace: ${KNOWLEDGE_UPLOAD_ORPHAN_GRACE:2h}
+      terminal-retention: ${KNOWLEDGE_UPLOAD_TERMINAL_RETENTION:1h}
+      cleanup-interval: ${KNOWLEDGE_UPLOAD_CLEANUP_INTERVAL:1m}
+      cleanup-batch-size: ${KNOWLEDGE_UPLOAD_CLEANUP_BATCH_SIZE:100}
+      key-prefix: ${KNOWLEDGE_UPLOAD_KEY_PREFIX:salmon:knowledge:upload:v1:}
+      api-call-timeout: ${KNOWLEDGE_UPLOAD_API_CALL_TIMEOUT:15s}
+      api-attempt-timeout: ${KNOWLEDGE_UPLOAD_API_ATTEMPT_TIMEOUT:10s}
     default-top-k: ${KNOWLEDGE_DEFAULT_TOP_K:5}
     max-top-k: ${KNOWLEDGE_MAX_TOP_K:20}
     queue:

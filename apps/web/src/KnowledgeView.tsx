@@ -4,10 +4,16 @@ import {
   fetchDocument,
   fetchDocuments,
   fetchEvidence,
+  fetchUploadPolicy,
+  fetchUploadSession,
+  initUploadSession,
+  cancelUploadSession,
+  completeUploadSession,
   retryDocument,
   searchKnowledge,
   uploadDocument,
   type DocumentDetail,
+  type ParsedDocumentMetadata,
   type DocumentSummary,
   type EvidencePage,
   type KnowledgeState,
@@ -17,6 +23,7 @@ import {
 } from './knowledgeApi.ts'
 import { KnowledgeApiError } from './knowledgeApi.ts'
 import { MarkdownRenderer } from './MarkdownRenderer.tsx'
+import { quickFileFingerprint, ResumableKnowledgeUploader, type UploadProgress } from './KnowledgeUpload.ts'
 
 const TERMINAL_STATES: KnowledgeState[] = ['READY', 'OCR_REQUIRED', 'FAILED']
 const DELETE_ELIGIBLE_STATES: KnowledgeState[] = [...TERMINAL_STATES, 'DELETING']
@@ -71,6 +78,24 @@ function stateClass(state: KnowledgeState): string {
   return state.toLowerCase().replace('_', '-')
 }
 
+const UPLOAD_SESSION_STORAGE_KEY = 'salmon:knowledge:upload-session:v1'
+
+function metadataItems(metadata: ParsedDocumentMetadata | undefined): Array<[string, string]> {
+  if (metadata === undefined) return []
+  const items: Array<[string, string | null | undefined]> = [
+    ['标题', metadata.title],
+    ['作者', metadata.authors.length > 0 ? metadata.authors.join('、') : null],
+    ['主题', metadata.subject],
+    ['描述', metadata.description],
+    ['语言', metadata.language],
+    ['创建时间', metadata.createdAt ? formatTime(metadata.createdAt) : null],
+    ['修改时间', metadata.modifiedAt ? formatTime(metadata.modifiedAt) : null],
+    ['生成应用', metadata.producer],
+  ]
+  return items.flatMap(([label, value]) => value !== null && value !== undefined && value.length > 0
+    ? [[label, value] as [string, string]] : [])
+}
+
 const searchStageLabels: Array<[keyof Pick<KnowledgeSearchResult, 'bm25' | 'vector' | 'rrf' | 'finalResults'>, string]> = [
   ['bm25', 'BM25 Top 40'],
   ['vector', 'Vector Top 40'],
@@ -96,6 +121,10 @@ function KnowledgeView() {
   const [loading, setLoading] = useState(true)
   const [detailLoading, setDetailLoading] = useState(false)
   const [uploading, setUploading] = useState(false)
+  const [uploadPolicy, setUploadPolicy] = useState<Awaited<ReturnType<typeof fetchUploadPolicy>> | null>(null)
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null)
+  const uploadSessionRef = useRef<Awaited<ReturnType<typeof fetchUploadSession>> | null>(null)
+  const uploaderRef = useRef<ResumableKnowledgeUploader | null>(null)
   const [retrying, setRetrying] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [deleteConfirming, setDeleteConfirming] = useState(false)
@@ -145,6 +174,67 @@ function KnowledgeView() {
 
   useEffect(() => {
     void refreshDocuments()
+  }, [refreshDocuments])
+
+  useEffect(() => {
+    let cancelled = false
+    void fetchUploadPolicy().then((policy) => {
+      if (!cancelled) setUploadPolicy(policy)
+    }).catch(() => {
+      // 选择文件时仍会再次读取策略；策略失败不阻塞普通资料列表。
+    })
+    const savedSessionId = window.localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)
+    if (savedSessionId !== null) {
+      void (async () => {
+        try {
+          const session = await fetchUploadSession(savedSessionId)
+          if (cancelled) return
+          if (session.status === 'COMPLETED') {
+            window.localStorage.removeItem(UPLOAD_SESSION_STORAGE_KEY)
+            void refreshDocuments()
+            return
+          }
+          if (session.status === 'COMPLETING') {
+            uploadSessionRef.current = session
+            setUploadProgress({ session, phase: 'COMPLETING', activePart: null, error: null })
+            try {
+              const accepted = await completeUploadSession(session.sessionId)
+              if (cancelled) return
+              window.localStorage.removeItem(UPLOAD_SESSION_STORAGE_KEY)
+              uploadSessionRef.current = null
+              setUploadProgress(null)
+              setDocuments((current) => [accepted, ...current.filter((item) => item.id !== accepted.id)])
+              setSelectedId(accepted.id)
+              void refreshDocuments()
+            } catch (completeError: unknown) {
+              if (!cancelled) setUploadProgress((current) => current === null ? null : {
+                ...current,
+                phase: 'COMPLETING',
+                error: completeError instanceof Error ? completeError : new Error('完成提交失败'),
+              })
+            }
+            return
+          }
+          if (session.status === 'FAILED' || session.status === 'EXPIRED' || session.status === 'ABORTED') {
+            window.localStorage.removeItem(UPLOAD_SESSION_STORAGE_KEY)
+            setUploadProgress({
+              session,
+              phase: 'FAILED',
+              activePart: null,
+              error: new Error(session.failureCode === null ? `上传已结束（${session.status}）` : `上传已结束：${session.failureCode}`),
+            })
+            return
+          }
+          uploadSessionRef.current = session
+          setUploadProgress({ session, phase: 'PAUSED', activePart: null, error: null })
+        } catch (requestError: unknown) {
+          if (requestError instanceof KnowledgeApiError && requestError.code === 'UPLOAD_SESSION_NOT_FOUND') {
+            window.localStorage.removeItem(UPLOAD_SESSION_STORAGE_KEY)
+          }
+        }
+      })()
+    }
+    return () => { cancelled = true }
   }, [refreshDocuments])
 
   const loadDetail = useCallback(async (id: string, silent = false) => {
@@ -242,18 +332,103 @@ function KnowledgeView() {
     event.target.value = ''
     if (file === undefined) return
     mutationGeneration.current += 1
-    setUploading(true)
     setError(null)
+    let policy = uploadPolicy
     try {
+      if (policy === null) {
+        policy = await fetchUploadPolicy()
+        setUploadPolicy(policy)
+      }
+      let activeSession = uploadSessionRef.current
+      if (activeSession !== null) {
+        // Server 不把客户端指纹放进 Session View；重选时用一次轻量 Header 比较，
+        // 再由上传器逐段复核已确认 checksum，避免零已确认 part 时误接续另一文件。
+        activeSession = await fetchUploadSession(activeSession.sessionId, quickFileFingerprint(file))
+        uploadSessionRef.current = activeSession
+      }
+      if (policy.resumableEnabled && (activeSession !== null || file.size > policy.resumableThresholdBytes)) {
+        if (activeSession !== null && (activeSession.fileName !== file.name || activeSession.sizeBytes !== file.size)) {
+          throw new Error('所选文件与已有上传会话不一致，请先取消原会话。')
+        }
+        const session = activeSession ?? await initUploadSession({
+          fileName: file.name,
+          declaredMediaType: file.type || 'application/octet-stream',
+          sizeBytes: file.size,
+          fileFingerprint: quickFileFingerprint(file),
+          lastModifiedMillis: file.lastModified,
+        })
+        uploadSessionRef.current = session
+        window.localStorage.setItem(UPLOAD_SESSION_STORAGE_KEY, session.sessionId)
+        setUploadProgress({ session, phase: 'UPLOADING', activePart: null, error: null })
+        setUploading(true)
+        const uploader = new ResumableKnowledgeUploader(file, session, (progress) => {
+          setUploadProgress(progress)
+        }, { maxConcurrency: policy?.maxConcurrentParts })
+        uploaderRef.current = uploader
+        const accepted = await uploader.start()
+        uploadSessionRef.current = null
+        uploaderRef.current = null
+        window.localStorage.removeItem(UPLOAD_SESSION_STORAGE_KEY)
+        setUploadProgress(null)
+        documentListRequest.current += 1
+        setDocuments((current) => [accepted, ...current.filter((item) => item.id !== accepted.id)])
+        setSelectedId(accepted.id)
+        void refreshDocuments()
+        return
+      }
+      setUploading(true)
       const accepted = await uploadDocument(file)
       // 上传/重试的本地结果优先；使尚未返回的旧列表请求失效，避免回写旧快照。
       documentListRequest.current += 1
       setDocuments((current) => [accepted, ...current.filter((item) => item.id !== accepted.id)])
       setSelectedId(accepted.id)
+      void refreshDocuments()
     } catch (requestError: unknown) {
+      setUploadProgress((current) => current === null ? null : { ...current, phase: 'FAILED', error: requestError instanceof Error ? requestError : new Error('上传失败') })
       setError(messageOf(requestError))
     } finally {
       setUploading(false)
+    }
+  }
+
+  const handlePauseUpload = () => uploaderRef.current?.pause()
+  const handleResumeUpload = () => {
+    if (uploaderRef.current !== null) uploaderRef.current.resume()
+  }
+
+  const handleRetryCompleting = async () => {
+    const session = uploadSessionRef.current
+    if (session === null || session.status !== 'COMPLETING') return
+    try {
+      const accepted = await completeUploadSession(session.sessionId)
+      uploadSessionRef.current = null
+      window.localStorage.removeItem(UPLOAD_SESSION_STORAGE_KEY)
+      setUploadProgress(null)
+      setDocuments((current) => [accepted, ...current.filter((item) => item.id !== accepted.id)])
+      setSelectedId(accepted.id)
+      void refreshDocuments()
+    } catch (requestError: unknown) {
+      setUploadProgress((current) => current === null ? null : {
+        ...current,
+        phase: 'COMPLETING',
+        error: requestError instanceof Error ? requestError : new Error('完成提交失败'),
+      })
+    }
+  }
+
+  const handleCancelUpload = async () => {
+    const session = uploadSessionRef.current
+    if (session === null || session.status === 'COMPLETING') return
+    try {
+      await cancelUploadSession(session.sessionId)
+      uploaderRef.current?.cancel()
+      uploaderRef.current = null
+      uploadSessionRef.current = null
+      window.localStorage.removeItem(UPLOAD_SESSION_STORAGE_KEY)
+      setUploadProgress(null)
+      setError(null)
+    } catch (requestError: unknown) {
+      setError(messageOf(requestError))
     }
   }
 
@@ -344,7 +519,7 @@ function KnowledgeView() {
         </div>
         <label className="knowledge-upload">
           <span>{uploading ? '正在接收…' : '选择文档'}</span>
-          <small>TXT / MD / PDF / DOCX · 最大 50 MiB</small>
+          <small>TXT / MD / PDF / DOCX · {uploadPolicy === null ? '读取服务端策略…' : `最大 ${formatBytes(uploadPolicy.maxObjectBytes)}，超过 ${formatBytes(uploadPolicy.resumableThresholdBytes)} 可恢复`}</small>
           <input
             type="file"
             accept=".txt,.md,.markdown,.pdf,.docx,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -353,6 +528,29 @@ function KnowledgeView() {
           />
         </label>
       </header>
+
+      {uploadProgress !== null && (
+        <section className="knowledge-upload-card" aria-label="可恢复上传" role="status">
+          <div>
+            <strong>{uploadProgress.session.fileName}</strong>
+            <span>{uploadProgress.session.confirmedBytes.toLocaleString('zh-CN')} / {uploadProgress.session.sizeBytes.toLocaleString('zh-CN')} 字节（{Math.round(uploadProgress.session.confirmedBytes / uploadProgress.session.sizeBytes * 100)}%）</span>
+            <small>已确认 {uploadProgress.session.confirmedPartNumbers.length} / {uploadProgress.session.totalParts} 段 · {uploadProgress.phase === 'COMPLETING' ? '正在校验并提交' : uploadProgress.phase === 'PAUSED' ? '已暂停，重新选择同一文件可继续' : uploadProgress.phase === 'FAILED' ? `已结束（${uploadProgress.session.status}）` : '上传中'}</small>
+          </div>
+          <div className="detail-actions">
+            {uploadProgress.phase === 'UPLOADING' && uploaderRef.current !== null && (
+              <button type="button" className="quiet-button" onClick={handlePauseUpload}>暂停</button>
+            )}
+            {uploadProgress.phase === 'PAUSED' && uploaderRef.current !== null && (
+              <button type="button" className="primary-small" onClick={handleResumeUpload}>继续</button>
+            )}
+            {uploadProgress.phase === 'COMPLETING' && uploadSessionRef.current !== null && (
+              <button type="button" className="quiet-button" onClick={() => void handleRetryCompleting()}>重试提交</button>
+            )}
+            {uploadProgress.phase !== 'COMPLETING' && uploadSessionRef.current !== null && <button type="button" className="danger-small" onClick={() => void handleCancelUpload()}>取消</button>}
+          </div>
+          {uploadProgress.error !== null && <p className="detail-error">{uploadProgress.error.message}</p>}
+        </section>
+      )}
 
       {error !== null && (
         <div className="knowledge-alert" role="alert">
@@ -526,6 +724,17 @@ function KnowledgeView() {
                 <div><span>页数</span><strong>{detail.pageCount || '—'}</strong></div>
                 <div className="meta-wide"><span>SHA-256</span><code>{detail.document.sha256}</code></div>
               </div>
+
+              {metadataItems(detail.metadata).length > 0 && (
+                <section className="parsed-metadata" aria-labelledby="parsed-metadata-title">
+                  <div className="section-heading compact"><h3 id="parsed-metadata-title">文档元信息</h3></div>
+                  <dl>
+                    {metadataItems(detail.metadata).map(([label, value]) => (
+                      <div key={label}><dt>{label}</dt><dd>{value}</dd></div>
+                    ))}
+                  </dl>
+                </section>
+              )}
 
               {detail.document.state === 'FAILED' && detail.jobs[0]?.errorMessage && (
                 <div className="failure-note">

@@ -3,6 +3,7 @@ package com.yuyu.salmonmind.knowledge.application.port;
 import com.yuyu.salmonmind.knowledge.domain.DocumentFormat;
 import com.yuyu.salmonmind.knowledge.domain.IngestionJobState;
 import com.yuyu.salmonmind.knowledge.domain.KnowledgeSourceLifecycle;
+import com.yuyu.salmonmind.knowledge.domain.ParsedDocumentMetadata;
 
 import java.time.Instant;
 import java.util.Collection;
@@ -32,6 +33,9 @@ public interface KnowledgeMetadataPort {
             String sha256,
             String objectKey
     );
+
+    /** 按固定 final Object Key 查找已有提交；跨 Workspace 不可见。 */
+    Submission findSubmissionByObjectKey(UUID workspaceId, String objectKey);
 
     /**
      * 记录 Stream 消息身份并尝试把 Job 从 PENDING_DISPATCH 推进到 QUEUED。
@@ -91,8 +95,12 @@ public interface KnowledgeMetadataPort {
      */
     boolean transition(UUID jobId, Collection<IngestionJobState> expected, IngestionJobState target);
 
-    /** 更新解析得到的页数和正文字符数；只写 Revision 元数据，不改变 Job 状态。 */
-    void updateParseMetadata(UUID revisionId, int pageCount, int textCharCount);
+    /**
+     * 在 PARSING 阶段一次性保存页数、正文字符数和白名单元信息；只写不可变 Revision，
+     * 不改变 Job 状态。数据库写入失败时调用方不得继续发布 READY。
+     */
+    void updateParseMetadata(UUID revisionId, int pageCount, int textCharCount,
+                             ParsedDocumentMetadata parsedMetadata);
 
     /** 将当前处理 Job 收束为 OCR_REQUIRED；该状态不可由用户重试。 */
     void markOcrRequired(UUID jobId, String errorCode, String message);
@@ -192,8 +200,19 @@ public interface KnowledgeMetadataPort {
             String objectKey,
             int pageCount,
             int textCharCount,
+            ParsedDocumentMetadata parsedMetadata,
             Instant createdAt
     ) {
+        public StoredRevision(UUID id, UUID sourceId, String name, DocumentFormat format, String mediaType,
+                              String detectedMediaType, long sizeBytes, String sha256, String objectKey,
+                              int pageCount, int textCharCount, Instant createdAt) {
+            this(id, sourceId, name, format, mediaType, detectedMediaType, sizeBytes, sha256, objectKey,
+                    pageCount, textCharCount, ParsedDocumentMetadata.empty(), createdAt);
+        }
+
+        public StoredRevision {
+            parsedMetadata = parsedMetadata == null ? ParsedDocumentMetadata.empty() : parsedMetadata;
+        }
     }
 
     /** 一次处理尝试；state/retryable/error 是 PostgreSQL 业务权威。 */

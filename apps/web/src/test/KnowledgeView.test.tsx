@@ -6,6 +6,8 @@ const api = vi.hoisted(() => ({
   fetchDocuments: vi.fn(),
   fetchDocument: vi.fn(),
   fetchEvidence: vi.fn(),
+  fetchUploadPolicy: vi.fn(),
+  fetchUploadSession: vi.fn(),
   retryDocument: vi.fn(),
   searchKnowledge: vi.fn(),
   deleteDocument: vi.fn(),
@@ -16,6 +18,8 @@ vi.mock('../knowledgeApi.ts', async (importOriginal) => ({
   fetchDocuments: api.fetchDocuments,
   fetchDocument: api.fetchDocument,
   fetchEvidence: api.fetchEvidence,
+  fetchUploadPolicy: api.fetchUploadPolicy,
+  fetchUploadSession: api.fetchUploadSession,
   retryDocument: api.retryDocument,
   searchKnowledge: api.searchKnowledge,
   deleteDocument: api.deleteDocument,
@@ -66,6 +70,16 @@ function detailOf(document: DocumentSummary): DocumentDetail {
     }],
     pageCount: 1,
     textCharCount: 80,
+    metadata: {
+      title: null,
+      authors: [],
+      subject: null,
+      description: null,
+      language: null,
+      createdAt: null,
+      modifiedAt: null,
+      producer: null,
+    },
   }
 }
 
@@ -117,6 +131,14 @@ describe('KnowledgeView', () => {
     first = documentSummary('document-1', '项目说明.md')
     second = documentSummary('document-2', '保留资料.txt', 'READY', 'TEXT')
     api.fetchDocuments.mockResolvedValue([first, second])
+    api.fetchUploadPolicy.mockResolvedValue({
+      resumableEnabled: true,
+      maxObjectBytes: 50 * 1024 * 1024,
+      resumableThresholdBytes: 10 * 1024 * 1024,
+      partSizeBytes: 5 * 1024 * 1024,
+      maxConcurrentParts: 3,
+    })
+    api.fetchUploadSession.mockRejectedValue(new KnowledgeApiError('UPLOAD_SESSION_NOT_FOUND', '上传会话不存在', 404))
     api.fetchDocument.mockImplementation((id: string) => {
       const document = id === first.id ? first : second
       return Promise.resolve(detailOf(document))

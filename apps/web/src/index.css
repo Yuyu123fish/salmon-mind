@@ -1161,6 +1161,56 @@ button {
   line-height: 1.2;
 }
 
+.knowledge-upload-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 18px;
+  border: 1px solid rgba(57, 92, 84, 0.24);
+  border-radius: 10px;
+  padding: 13px 16px;
+  background: rgba(241, 246, 242, 0.78);
+}
+
+.knowledge-upload-card > div:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.knowledge-upload-card span,
+.knowledge-upload-card small {
+  color: var(--muted);
+}
+
+.parsed-metadata {
+  margin-top: 22px;
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+}
+
+.parsed-metadata dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 18px;
+  margin: 0;
+}
+
+.parsed-metadata dl > div {
+  display: grid;
+  gap: 2px;
+}
+
+.parsed-metadata dt {
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+
+.parsed-metadata dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 .knowledge-alert {
   display: flex;
   align-items: center;

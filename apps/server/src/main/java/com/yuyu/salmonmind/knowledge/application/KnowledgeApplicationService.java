@@ -154,7 +154,8 @@ class KnowledgeApplicationService implements KnowledgeService {
         return new DocumentDetail(
                 toSummary(document),
                 document.jobs().stream().map(KnowledgeApplicationService::toJobView).toList(),
-                document.revision().pageCount(), document.revision().textCharCount());
+                document.revision().pageCount(), document.revision().textCharCount(),
+                document.revision().parsedMetadata());
     }
 
     @Override

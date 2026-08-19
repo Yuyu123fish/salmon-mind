@@ -39,11 +39,63 @@ export type IngestionJob = {
   endedAt: string | null
 }
 
+export type ParsedDocumentMetadata = {
+  title: string | null
+  authors: string[]
+  subject: string | null
+  description: string | null
+  language: string | null
+  createdAt: string | null
+  modifiedAt: string | null
+  producer: string | null
+}
+
 export type DocumentDetail = {
   document: DocumentSummary
   jobs: IngestionJob[]
   pageCount: number
   textCharCount: number
+  metadata: ParsedDocumentMetadata
+}
+
+export type UploadPolicy = {
+  resumableEnabled: boolean
+  maxObjectBytes: number
+  resumableThresholdBytes: number
+  partSizeBytes: number
+  maxConcurrentParts: number
+}
+
+export type UploadInitRequest = {
+  fileName: string
+  declaredMediaType: string
+  sizeBytes: number
+  fileFingerprint: string
+  lastModifiedMillis: number
+}
+
+export type UploadPartReceipt = {
+  partNumber: number
+  sizeBytes: number
+  sha256: string
+  confirmedAt: string
+}
+
+export type UploadSessionView = {
+  sessionId: string
+  status: 'UPLOADING' | 'COMPLETING' | 'COMPLETED' | 'FAILED' | 'ABORTED' | 'EXPIRED'
+  fileName: string
+  declaredMediaType: string
+  sizeBytes: number
+  partSizeBytes: number
+  totalParts: number
+  confirmedPartNumbers: number[]
+  receipts: UploadPartReceipt[]
+  confirmedBytes: number
+  expiresAt: string
+  hardExpiresAt: string
+  documentId: string | null
+  failureCode: string | null
 }
 
 export type EvidencePreview = {
@@ -140,6 +192,42 @@ export async function uploadDocument(file: File): Promise<DocumentSummary> {
   const body = new FormData()
   body.append('file', file)
   return request('/api/knowledge/documents', { method: 'POST', body })
+}
+
+export async function fetchUploadPolicy(): Promise<UploadPolicy> {
+  return request('/api/knowledge/uploads/policy')
+}
+
+export async function initUploadSession(body: UploadInitRequest): Promise<UploadSessionView> {
+  return request('/api/knowledge/uploads', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+export async function fetchUploadSession(sessionId: string, fileFingerprint?: string): Promise<UploadSessionView> {
+  const headers = fileFingerprint === undefined ? undefined : { 'X-Upload-File-Fingerprint': fileFingerprint }
+  return request(`/api/knowledge/uploads/${encodeURIComponent(sessionId)}`, { headers })
+}
+
+export async function uploadPart(sessionId: string, partNumber: number, blob: Blob, sha256: string): Promise<UploadSessionView> {
+  return request(`/api/knowledge/uploads/${encodeURIComponent(sessionId)}/parts/${partNumber}`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'X-Upload-Part-SHA256': sha256,
+    },
+    body: blob,
+  })
+}
+
+export async function completeUploadSession(sessionId: string): Promise<DocumentSummary> {
+  return request(`/api/knowledge/uploads/${encodeURIComponent(sessionId)}/complete`, { method: 'POST' })
+}
+
+export async function cancelUploadSession(sessionId: string): Promise<void> {
+  return request(`/api/knowledge/uploads/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
 }
 
 export async function fetchDocument(id: string): Promise<DocumentDetail> {

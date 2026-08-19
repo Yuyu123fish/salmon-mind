@@ -1,6 +1,6 @@
 # Feature 006：会话与知识链路提速及可恢复上传
 
-Status: Draft
+Status: Specified
 
 ## Problem Statement
 
@@ -17,10 +17,10 @@ Knowledge 当前使用单请求上传原件。大文件一旦因刷新、断网�
 - 在 Conversation 模块内部为完整、已解析的会话历史快照增加 Redis 缓存。JSONL 继续是唯一历史权威；每次命中都用来自 JSONL 文件本身的轻量版本标记校验新鲜度，缓存缺失、过期、损坏、过大或 Redis 不可用时透明回退到 JSONL，并在允许时重新填充。
 - 启用 Spring Boot 的 Java 21 虚拟线程支持，让 Spring 管理的请求和适用的阻塞 I/O 在等待期间释放平台线程。业务调用保持同步，Hikari 连接池继续限制数据库并发；Tika、Knowledge Worker 和 Agent 工具并行等有意设置的专用有界执行器不在本 Feature 中替换。
 - 将 Tika 解析得到的白名单文档元信息保存到不可变 Source Revision。最终 Rerank Top 5 排名保持不变，仅为 rank 1 的锚点 Evidence 按同一 Revision 的 `ordinal` 尝试补齐上一段和下一段，并把三段组成一个有界上下文窗口交给模型。
-- 为大文件提供基于 Upload Session 的分片上传和断点续传。实际文件字节与分片由 RustFS Multipart Upload 承载；Redis 只保存会话身份、文件指纹、Multipart Upload ID、已完成 part/ETag、进度、状态和过期时间。完成合并与完整性校验后，才创建 PostgreSQL Source/Revision/Job 并进入既有异步入库链路。
+- 为大文件提供基于 Upload Session 的分片上传和断点续传。每个已校验 part 作为普通、完整的 RustFS Object 写入专属临时前缀；Redis 只保存会话身份、文件指纹、服务端确认的 part object key/大小/SHA-256、进度、状态和过期时间。完成时服务端按 Receipt 顺序把 parts 归并到有界临时文件，完成整文件校验并写入确定性的最终 RustFS Object 后，才创建 PostgreSQL Source/Revision/Job 并进入既有异步入库链路。
 - 在 Assistant 来源区复用已经由 Agent 生成并随历史持久化的 `citationNote` 作为 AI 小来源总结，不增加第二次模型调用。网站来源优先显示同源 favicon，加载失败时使用通用网站图标；本地资料使用通用文档图标。来源区保留 Citation 定位与详细核验入口，但默认视图压缩为来源身份、图标和一句摘要。
 
-Feature 按三个可独立验收的 Stage 实施：Stage 01 完成 Conversation Snapshot Cache 与虚拟线程；Stage 02 完成文档元信息和可恢复分片上传；Stage 03 完成 Top 1 相邻段落扩窗与来源展示收口。当前只形成 Stage 01 Plan，后续 Stage 必须各自确认 Plan 后再实施。
+Feature 按三个可独立验收的 Stage 实施：Stage 01 完成 Conversation Snapshot Cache 与虚拟线程；Stage 02 完成文档元信息和可恢复分片上传；Stage 03 完成 Top 1 相邻段落扩窗与来源展示收口。每个 Stage 都必须先形成并确认自己的 Plan，再取得独立实施授权。
 
 ## Domain Terms
 
@@ -34,7 +34,7 @@ Redis 中一份可丢弃、带版本的完整 `ConversationHistory` 读取快照
 
 ### Upload Session
 
-一次大文件上传的可恢复协调状态。它把客户端文件身份、RustFS Multipart Upload 身份、已确认 parts、可见进度、生命周期和租期绑定在一起，但不保存任何文件分片字节，也不代表文档已经进入知识库。
+一次大文件上传的可恢复协调状态。它把客户端文件身份、服务端生成的 RustFS 临时 part/final object 身份、已确认 parts、可见进度、生命周期和租期绑定在一起，但不保存任何文件分片字节，也不代表文档已经进入知识库。
 
 ### Parsed Document Metadata
 
@@ -68,7 +68,7 @@ Assistant 已持久化 `citationNote` 在紧凑来源视图中的展示形态。
 12. 作为上传者，我希望刷新页面后仍能看到上传进度和可恢复状态，以便知道下一步该继续、重试还是重新选择文件。
 13. 作为浏览器用户，我接受刷新后需要重新选择同一文件，但希望系统先校验文件身份再续传，以免把不同文件拼接到同一上传会话。
 14. 作为维护者，我希望 Redis 只保存轻量上传状态、RustFS 保存真实字节，以免大文件占满 Redis 内存。
-15. 作为知识库用户，我希望只有 RustFS 合并和完整性校验成功的文件才出现在资料记录中，以免半成品进入异步解析。
+15. 作为知识库用户，我希望只有服务端归并、完整性校验和最终 RustFS Object 写入成功的文件才出现在资料记录中，以免半成品进入异步解析。
 16. 作为知识库用户，我希望传输完成后若 Tika 因既有安全上限失败，界面能明确区分“上传完成”和“入库失败”，而不是把两者混为一谈。
 17. 作为回答阅读者，我希望先看到来源图标、名称和一句 AI 摘要，以便快速判断来源用途。
 18. 作为网站来源阅读者，我希望站点图标加载失败时仍有稳定通用图标，以免来源行出现破图。
@@ -96,13 +96,13 @@ Assistant 已持久化 `citationNote` 在紧凑来源视图中的展示形态。
 4. `ConversationExecutionQueue` 的同会话 `ReentrantLock` 继续保证打开、恢复、发送与重试串行；不同 Conversation 才能并行。
 5. Tika 单线程解析器、Knowledge 单 Worker 和 Agent 工具并行池是资源隔离/限流边界，Stage 01 保留这些显式平台线程池。只有真实证据表明某处在 Java 21 下发生持续 pinning，才回到讨论决定是否改造。
 
-### Parsed Document Metadata
+### Parsed Document Metadata（F006-S2-META）
 
-1. 元信息属于不可变 Source Revision，而不是 Source 或 Ingestion Job；同一原件重试复用同一份元信息，新 Revision 独立保存。
-2. 首版白名单覆盖 Tika 能可靠提供的标题、作者、主题/描述、语言、创建/修改时间和生成应用等通用字段。空值、非法时间、超长值和未知键被忽略或有界裁剪；不保存完整原始 Metadata Map。
-3. 已有媒体类型、页数、正文字符数、SHA-256 和大小等专用字段继续保持结构化权威，不依赖 JSON 元信息反向覆盖。
-4. 元信息保存失败属于入库失败，不能发布一个缺少事务一致性的 READY Revision；文档本身没有某个元信息字段则不是失败。
-5. 旧 Revision 以空元信息兼容，不进行全库原件回读和补算。
+1. **F006-S2-META-01**：元信息属于不可变 Source Revision，而不是 Source 或 Ingestion Job；同一原件重试复用同一份元信息，新 Revision 独立保存。
+2. **F006-S2-META-02**：首版白名单覆盖 Tika 能可靠提供的标题、作者、主题/描述、语言、创建/修改时间和生成应用等通用字段。空值、非法时间、超长值和未知键被忽略或有界裁剪；不保存完整原始 Metadata Map。
+3. **F006-S2-META-03**：已有媒体类型、页数、正文字符数、SHA-256 和大小等专用字段继续保持结构化权威，不依赖 JSON 元信息反向覆盖。
+4. **F006-S2-META-04**：元信息保存失败属于入库失败，不能发布一个缺少事务一致性的 READY Revision；文档本身没有某个元信息字段则不是失败。
+5. **F006-S2-META-05**：旧 Revision 以空元信息兼容，不进行全库原件回读和补算。
 
 ### Top 1 Neighbor Window
 
@@ -113,16 +113,16 @@ Assistant 已持久化 `citationNote` 在紧凑来源视图中的展示形态。
 5. 文档首尾不存在某个邻段属于正常降级；邻段查询超时、缺失或校验失败时只返回 Anchor Evidence，不让整次本地检索失败。
 6. 扩窗后的文本继续受现有单次工具结果和每 Run Token/字符预算约束，必须按完整段落边界裁剪，不能借相邻段绕过预算。
 
-### Resumable Multipart Upload
+### Resumable Chunk Upload（F006-S2-UPLOAD）
 
-1. 小文件既有单请求上传可以保留；超过单请求策略阈值的文件使用 Upload Session。阈值、part 大小、并发数、租期和最大文件大小均为服务端有界配置，客户端不得自行突破。
-2. 初始化会话时服务端校验文件名、声明大小、格式与媒体类型，并生成稳定会话 ID 和 RustFS Multipart Upload。Redis 只保存恢复所需元数据；文件 part 字节直接进入 RustFS，不经过 Redis 持久化。
-3. 服务端只在 RustFS 确认某个 part 成功后记录 part number、ETag/校验值和累计进度。重复上传同一 part 必须幂等覆盖或返回已确认结果，不重复累计字节。
-4. 恢复接口返回服务端已确认 parts 和会话状态。页面刷新后可以恢复可见进度；受浏览器文件权限限制，继续读取本地字节前要求用户重新选择文件，并校验文件指纹一致。
-5. 完成请求只能使用 Redis 中服务端确认的 parts；不能信任客户端提交一组任意 ETag。RustFS 完成合并并通过最终大小/SHA-256 等完整性校验后，才复用既有 Knowledge 提交流程创建 PostgreSQL Source、Revision 与 Job。
-6. Redis 短暂不可用时，会话查询、继续和完成返回稳定的“上传暂不可继续”，但不能伪造进度或完成状态；已经 READY 的文档、既有对话和不依赖该会话的浏览能力不受影响。
-7. Redis 数据丢失可能使未完成上传无法继续，这是短期状态边界；系统必须能够把 RustFS 孤儿 Multipart 标记为可清理对象，不得把它当成已上传文档。过期、取消和失败清理都只能作用于精确 Upload ID。
-8. “上传完成”只代表原件传输与校验完成。后续 Tika/Embedding/Index 仍使用既有异步状态机；大文件能力不提高当前解析字符、页数、时限或其他安全上限。
+1. **F006-S2-UPLOAD-01**：小文件既有单请求上传继续保留；超过单请求策略阈值的文件使用 Upload Session。阈值、part 大小/总数、并发数、空闲租期、固定最长生命周期和最大文件大小均为服务端有界配置，客户端不得自行突破。
+2. **F006-S2-UPLOAD-02**：初始化会话时服务端校验文件名、声明大小、格式与媒体类型，并生成稳定会话 ID、服务端拥有的临时 part 前缀和确定性最终 Object Key。Redis 只保存恢复所需元数据；文件 part 字节直接写入普通 RustFS Object，不经过 Redis 或 PostgreSQL 持久化。
+3. **F006-S2-UPLOAD-03**：服务端校验单个 part 的长度与 SHA-256 后，以 part number 和已校验 SHA-256 派生精确 Object Key；只有 RustFS `PutObject` 成功且 Redis Receipt 原子提交后，才记录 part number、object key、大小、SHA-256 和累计进度。相同 Receipt 重试返回原结果，不同内容不得覆盖已确认进度。
+4. **F006-S2-UPLOAD-04**：恢复接口返回服务端已确认 parts 和会话状态。页面刷新后可以恢复可见进度；受浏览器文件权限限制，继续读取本地字节前要求用户重新选择文件，并校验文件指纹以及已确认 part checksum 一致。
+5. **F006-S2-UPLOAD-05**：完成请求只能使用 Redis 冻结的服务端 Receipts。服务端按 part number 顺序把精确 part objects 流式归并到有界临时文件，逐 part 与整文件校验大小/SHA-256/格式/媒体类型，再以确定性 Object Key 写入最终不可变原件；最终对象确认成功后才复用既有 Knowledge 提交流程创建或读取同一 PostgreSQL Source、Revision 与 Job。
+6. **F006-S2-UPLOAD-06**：Redis 短暂不可用时，会话查询、继续和完成返回稳定的“上传暂不可继续”，但不能伪造进度或完成状态；已经 READY 的文档、既有对话和不依赖该会话的浏览能力不受影响。
+7. **F006-S2-UPLOAD-07**：Redis 数据丢失可能使未完成上传无法继续，这是短期状态边界。part objects 与最终 objects 使用分离、版本化的专属前缀；空闲租期续租不得越过初始化时固定的 `hardExpiresAt`。Redis 全失后，Janitor 只能使用已通过真实 Gate 的 `ListObjectsV2` 分页列举专属前缀，按安全年龄筛选后逐个精确删除；part object 永不被 Revision 引用，最终 object 删除前必须由 PostgreSQL 证明没有 Revision 引用。
+8. **F006-S2-UPLOAD-08**：“上传完成”只代表原件传输、归并与校验完成。后续 Tika/Embedding/Index 仍使用既有异步状态机；大文件能力不提高当前解析字符、页数、时限或其他安全上限。
 
 ### Source Digest、favicon 与核验展示
 
@@ -138,9 +138,9 @@ Assistant 已持久化 `citationNote` 在紧凑来源视图中的展示形态。
 
 - Conversation 的应用层继续只依赖现有 `ConversationHistoryRepository` seam。缓存作为该 seam 内部的装饰层，JSONL Adapter 始终是权威实现；不创建跨业务的通用 Cache 模块。
 - Conversation 缓存和 Knowledge Upload Session 复用 `persistence::redis` 提供的共享、惰性 Redisson 客户端，但分别拥有独立 keyspace、codec、TTL 和失败映射。不得新增第二套 Redis 客户端生命周期。
-- Knowledge 模块继续拥有上传、原件、解析、元数据、Evidence 和检索编排。Multipart、Tika 元信息白名单和邻段查询都是 Knowledge 内部变化轴，不向 Agent 暴露 RustFS/Redis/Elasticsearch 技术类型。
+- Knowledge 模块继续拥有上传、原件、解析、元数据、Evidence 和检索编排。普通对象分片/归并、Tika 元信息白名单和邻段查询都是 Knowledge 内部变化轴，不向 Agent 暴露 RustFS/Redis/Elasticsearch 技术类型。
 - Agent 仍只消费 `knowledge::api` 的有界检索结果。Web 只消费 Conversation/Knowledge 公开 HTTP 与 SSE 合同，不读取 Redis 或存储内部状态。
-- 测试优先使用现有公开 seam：Conversation 行为通过 `conversation::api`，Knowledge 工作流通过 `knowledge::api`，前端通过用户可见交互。只有缓存版本判定、Multipart Adapter 和 favicon URL 安全投影需要更低层的聚焦测试。
+- 测试优先使用现有公开 seam：Conversation 行为通过 `conversation::api`，Knowledge 工作流通过 `knowledge::api`，前端通过用户可见交互。只有缓存版本判定、Chunk Object Adapter/Redis Session 和 favicon URL 安全投影需要更低层的聚焦测试。
 
 ### 数据与 Keyspace
 
@@ -160,7 +160,7 @@ Assistant 已持久化 `citationNote` 在紧凑来源视图中的展示形态。
 ### Stage 顺序
 
 1. **Stage 01 — Conversation Cache and Virtual Threads**：先建立缓存一致性与降级合同，再启用和验证虚拟线程；不修改 Knowledge 与 Web。
-2. **Stage 02 — Document Metadata and Resumable Upload**：完成 Tika 白名单元信息、RustFS Multipart、Redis Upload Session 和前端可见恢复；实施前先验证当前 RustFS 版本的 Multipart 兼容性。
+2. **Stage 02 — Document Metadata and Resumable Upload**：完成 Tika 白名单元信息、RustFS 普通对象分片与服务端归并、Redis Upload Session 和前端可见恢复；实施前先验证当前 RustFS 版本的 `Put/Get/Head/ListObjectsV2/Delete`、分页与精确清理兼容性。
 3. **Stage 03 — Top 1 Neighbor Context and Source Digest**：在不改 Top 5 排名与 Citation 身份的前提下补齐邻段，并收口来源图标、摘要和核验层级。
 
 ## Testing Decisions
@@ -170,7 +170,7 @@ Assistant 已持久化 `citationNote` 在紧凑来源视图中的展示形态。
 - 测试外部行为和权威/降级语义，不锁死 Redisson 调用次数、虚拟线程名称、内部类拆分、CSS DOM 层级或低风险序列化实现。
 - Conversation 缓存复用 `JsonlConversationHistoryRepositoryTest`、`ConversationPersistenceIntegrationTest`、`ConversationRedisRecoveryIntegrationTest` 和 `ConversationModuleIntegrationTest` 的既有语义；新增测试证明“第二次读取避免全量解析”时允许使用可计数的权威 Repository 测试替身。
 - 虚拟线程通过 Spring 运行时 seam 证明实际请求/应用任务运行在虚拟线程，并回归 Conversation 与 MyBatis 行为；不写依赖固定线程名的测试，也不使用容易波动的毫秒阈值作为 CI 成败条件。
-- Knowledge 元信息、上传和邻段优先扩展既有 Knowledge Workflow/Infrastructure Gate。Multipart 的状态与幂等性使用真实 Redis + S3 兼容存储验证，模型调用使用确定性替身。
+- Knowledge 元信息、上传和邻段优先扩展既有 Knowledge Workflow/Infrastructure Gate。Upload Session、普通对象分片/归并和清理幂等性使用真实 Redis + S3 兼容存储验证，模型调用使用确定性替身。
 - 前端使用现有 Vitest/Testing Library seam 覆盖刷新恢复、文件重选、进度、图标失败降级、Source Digest 和 Citation 聚焦；真实浏览器只补自动化难以证明的刷新、文件选择和响应式行为。
 
 ### 必须覆盖的关键行为
@@ -180,7 +180,7 @@ Assistant 已持久化 `citationNote` 在紧凑来源视图中的展示形态。
 3. JSONL 领先 PostgreSQL 的恢复不能被旧缓存遮蔽；Compaction 字节偏移、Active Path、发送/重试和 Conversation 隔离不回归。
 4. Spring 管理的代表性请求在 Java 21 上确认 `Thread.isVirtual()`，同会话仍串行，不同会话可并发，数据库连接数仍受 Hikari 限制。
 5. Tika 白名单元信息正常、缺失、非法和超长输入；旧 Revision 空元信息兼容。
-6. Multipart 初始化、乱序/重复 part、刷新恢复、文件不匹配、完成幂等、取消、过期、Redis/RustFS 故障和孤儿清理。
+6. Upload Session 初始化、乱序/重复 part、刷新恢复、文件不匹配、服务端归并、完成幂等、取消、过期、Redis/RustFS 故障和孤儿清理。
 7. Top 1 有两个/一个/零个邻段、跨 Revision 防护、邻段读取失败降级、预算裁剪，以及 Top 2–5 与 Citation 身份不变。
 8. favicon 正常/破图/非法 URL 降级，旧记录无 `citationNote`，紧凑来源与详细核验/Citation 聚焦共存。
 
@@ -188,7 +188,7 @@ Assistant 已持久化 `citationNote` 在紧凑来源视图中的展示形态。
 
 - Conversation Cache 验收比较同一长会话的冷读与重复热读，至少报告全量 JSONL 解析次数、Redis 命中/回源情况和端到端耗时；CI 不设置跨机器绝对延迟门槛。
 - 虚拟线程验收在相同 Hikari 配置下比较并发阻塞请求的线程占用与吞吐，并使用 JFR 或 JDK pinned-thread 诊断检查持续 pinning。它只证明并发资源利用改善，不宣称单条 SQL 更快。
-- Stage 02 必须使用项目实际 RustFS 版本完成真实 Multipart 创建、上传 parts、完成、取消和重启恢复验证；仅用 mock 或 AWS SDK 编译通过不能宣称可用。
+- Stage 02 必须使用项目实际 RustFS 版本完成真实普通对象 part 写入/读取、`ListObjectsV2` 分页、精确删除、服务端归并、最终对象写入和中断恢复验证；仅用 mock 或 AWS SDK 编译通过不能宣称可用。
 - Stage 03 必须进行一次真实浏览器验收；不需要为 Source Digest 调用真实模型，因为数据直接复用持久化 `citationNote`。
 
 ## Out of Scope
@@ -217,8 +217,8 @@ Assistant 已持久化 `citationNote` 在紧凑来源视图中的展示形态。
 8. Neighbor Window 不新增 Citation/排名，并且受既有工具结果和每 Run 预算约束。
 9. 大文件 bytes/parts 存于 RustFS，Redis 只存 Upload Session 元数据；刷新后可恢复服务端确认的进度。
 10. 重复 part、完成、取消和状态读取具有明确幂等语义，不同文件不能续传到同一会话。
-11. 只有 RustFS 合并和最终完整性校验成功后才创建 Knowledge 提交；上传完成后的解析失败仍按既有 Job 状态可见。
-12. Redis/RustFS 故障和 Upload Session 过期不会产生伪完成文档，孤儿 Multipart 有精确清理路径。
+11. 只有服务端归并、最终完整性校验和确定性 RustFS 原件写入成功后才创建 Knowledge 提交；上传完成后的解析失败仍按既有 Job 状态可见。
+12. Redis/RustFS 故障和 Upload Session 过期不会产生伪完成文档；孤儿 part objects 与未提交 final objects 都有可分页发现、按年龄筛选和精确删除的清理路径。
 13. 已引用来源默认显示图标、来源身份和持久化 `citationNote`；整个流程不新增模型调用。
 14. favicon 只尝试安全同源地址，失败时稳定显示内置图标；本地文档始终使用文档图标。
 15. 紧凑来源视图保留 Citation 点击定位、详细摘录、检索位置和 Run Trace 的按需访问。
@@ -227,7 +227,7 @@ Assistant 已持久化 `citationNote` 在紧凑来源视图中的展示形态。
 
 ## Further Notes
 
-- 当前 Spec 和 Stage 01 Plan 都从 `Draft` 开始；开发者确认后才能分别进入 `Specified` / `Planned`，且 `Planned` 仍不代表授权实施。
+- 当前 Spec 已进入 `Specified`；Stage 01 Plan 保持其实际执行状态，Stage 02 Plan 经本次架构修订后进入 `Planned`。文档状态不替代实施、提交或推送的独立授权。
 - Stage 01 以 `main` 的 `d222a82` 为文档基线。后续若 Conversation 权威、Redis 客户端生命周期、Java 版本或 Spring Boot 版本变化，应先重新核对本文合同。
-- 设计参考采用 Spring Boot/Java 21 虚拟线程、S3 Multipart Upload 的服务端确认 part 语义和 tus 的可恢复上传原则；这些参考只用于约束边界，项目当前代码与本文已确认合同仍是实施权威。
+- 设计参考采用 Spring Boot/Java 21 虚拟线程、S3 普通对象的原子写入/分页列举/精确删除语义和 tus 的服务端确认进度原则；这些参考只用于约束边界，项目当前代码与本文已确认合同仍是实施权威。原生 S3 Multipart 因固定 RustFS beta.12 的 `ListMultipartUploads` Gate 阻塞而不属于本 Stage 实现。
 - Feature 验收后再更新稳定 `README.md` / `docs/`；实施日志、临时基准和运行截图不进入本 Spec。

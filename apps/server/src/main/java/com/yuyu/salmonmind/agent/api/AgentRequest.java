@@ -13,13 +13,15 @@ import java.util.UUID;
  * @param modelVisibleMessages  从 JSONL Active Path 投影出的完整模型可见消息
  * @param checkpointPolicy      Checkpoint 复用策略；默认 {@link CheckpointPolicy#REUSE_IF_MATCH}，
  *                              工具启用后的轮次应显式传 {@link CheckpointPolicy#REBUILD_FROM_PROJECTION}
+ * @param callChainAllowed      是否允许本 Run 创建新的调用链；长度续写沿用来源 Assistant 引用，不创建第二条链
  */
 public record AgentRequest(
         String threadId,
         UUID expectedCheckpointLeafId,
         UUID answerLeafId,
         List<AgentMessage> modelVisibleMessages,
-        CheckpointPolicy checkpointPolicy
+        CheckpointPolicy checkpointPolicy,
+        boolean callChainAllowed
 ) {
 
     public AgentRequest {
@@ -44,6 +46,19 @@ public record AgentRequest(
             UUID answerLeafId,
             List<AgentMessage> modelVisibleMessages
     ) {
-        this(threadId, expectedCheckpointLeafId, answerLeafId, modelVisibleMessages, CheckpointPolicy.REUSE_IF_MATCH);
+        this(threadId, expectedCheckpointLeafId, answerLeafId, modelVisibleMessages,
+                CheckpointPolicy.REUSE_IF_MATCH, true);
+    }
+
+    /** 兼容已有调用方；普通主回答允许准备调用链。 */
+    public AgentRequest(
+            String threadId,
+            UUID expectedCheckpointLeafId,
+            UUID answerLeafId,
+            List<AgentMessage> modelVisibleMessages,
+            CheckpointPolicy checkpointPolicy
+    ) {
+        this(threadId, expectedCheckpointLeafId, answerLeafId, modelVisibleMessages,
+                checkpointPolicy, true);
     }
 }

@@ -27,6 +27,20 @@ class WebSearchPolicyTest {
     }
 
     @Test
+    void distinguishesExplicitCodebaseReadBoundaryFromMutationRequests() {
+        assertThat(EvidenceAccessPolicy.decide(List.of(
+                new AgentMessage(AgentMessage.Role.USER, "不要读取本地代码，但可以联网核对"))))
+                .extracting(EvidenceAccessPolicy.Decision::allowLocal, EvidenceAccessPolicy.Decision::allowWeb,
+                        EvidenceAccessPolicy.Decision::allowCodebase)
+                .containsExactly(true, true, false);
+        assertThat(EvidenceAccessPolicy.decide(List.of(
+                new AgentMessage(AgentMessage.Role.USER, "不要修改仓库，只读分析"))))
+                .extracting(EvidenceAccessPolicy.Decision::allowLocal, EvidenceAccessPolicy.Decision::allowWeb,
+                        EvidenceAccessPolicy.Decision::allowCodebase)
+                .containsExactly(true, true, true);
+    }
+
+    @Test
     void distinguishesAllRetrievalAndLocalOnlyRestrictionsFromDiscussion() {
         assertThat(EvidenceAccessPolicy.decide(List.of(
                 new AgentMessage(AgentMessage.Role.USER, "只根据当前对话回答，不要查询任何资料"))))

@@ -19,13 +19,14 @@ final class EvidenceAccessPolicy {
     static Decision decide(List<AgentMessage> messages) {
         String text = latestUserText(messages);
         if (text == null) {
-            return new Decision(true, true);
+            return new Decision(true, true, true);
         }
         String normalized = text.toLowerCase(Locale.ROOT).replaceAll("\\s+", " ").trim();
         boolean allDisabled = containsAnyRetrievalRestriction(normalized);
         boolean localDisabled = allDisabled || containsLocalRestriction(normalized);
         boolean webDisabled = allDisabled || containsWebRestriction(normalized);
-        return new Decision(!localDisabled, !webDisabled);
+        boolean codebaseDisabled = allDisabled || containsCodebaseRestriction(normalized);
+        return new Decision(!localDisabled, !webDisabled, !codebaseDisabled);
     }
 
     private static String latestUserText(List<AgentMessage> messages) {
@@ -58,6 +59,13 @@ final class EvidenceAccessPolicy {
                 "no local search", "do not search local");
     }
 
+    private static boolean containsCodebaseRestriction(String text) {
+        return contains(text, "不要读取本地仓库", "不要搜索本地仓库", "不要读取本地代码",
+                "不要搜索本地代码", "不要查询本地代码", "不要分析本地代码",
+                "不要读取代码库", "不要搜索代码库", "禁止代码库读取",
+                "no local repository", "do not read local code", "do not search local code");
+    }
+
     private static boolean containsWebRestriction(String text) {
         return contains(text,
                 "禁止联网", "不要联网", "不联网", "请勿联网", "请勿上网",
@@ -77,6 +85,6 @@ final class EvidenceAccessPolicy {
         return false;
     }
 
-    record Decision(boolean allowLocal, boolean allowWeb) {
+    record Decision(boolean allowLocal, boolean allowWeb, boolean allowCodebase) {
     }
 }

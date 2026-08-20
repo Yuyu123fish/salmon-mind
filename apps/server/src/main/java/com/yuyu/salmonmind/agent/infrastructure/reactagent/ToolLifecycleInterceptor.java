@@ -7,6 +7,7 @@ import com.alibaba.cloud.ai.graph.agent.interceptor.ToolInterceptor;
 import com.alibaba.cloud.ai.graph.agent.tool.ToolCancelledException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yuyu.salmonmind.agent.api.AgentStreamListener;
 import com.yuyu.salmonmind.agent.api.AgentToolCompleted;
 import com.yuyu.salmonmind.agent.api.AgentToolFailed;
@@ -51,6 +52,9 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
     static final String GOVERNOR_METADATA_KEY = "salmon:agent:tool-governor";
     static final String LOCAL_SEARCH_ALLOWED_METADATA_KEY = "salmon:agent:local-search-allowed";
     static final String WEB_SEARCH_ALLOWED_METADATA_KEY = "salmon:agent:web-search-allowed";
+    static final String CODEBASE_INVOCATION_BUDGET_METADATA_KEY = "salmon:agent:codebase-tool-budget";
+    static final String CODEBASE_RESULT_BUDGET_METADATA_KEY = "salmon:agent:codebase-result-budget";
+    static final String CODEBASE_ACCESS_ALLOWED_METADATA_KEY = "salmon:agent:codebase-allowed";
     static final String TOOL_CALL_BUDGET_EXCEEDED = "TOOL_CALL_BUDGET_EXCEEDED";
     static final String TOOL_CONTEXT_BUDGET_EXCEEDED = "TOOL_CONTEXT_BUDGET_EXCEEDED";
     static final String TOOL_CONCURRENCY_LIMIT_REACHED = "TOOL_CONCURRENCY_LIMIT_REACHED";
@@ -67,14 +71,20 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                     + "\"sourceKind\":\"UNKNOWN\",\"items\":[]}";
 
     private final int maxToolResultChars;
+    private final int codebaseMaxToolResultChars;
     private final ObjectMapper objectMapper;
 
     ToolLifecycleInterceptor(int maxToolResultChars) {
-        this(maxToolResultChars, new ObjectMapper());
+        this(maxToolResultChars, maxToolResultChars, new ObjectMapper());
     }
 
     ToolLifecycleInterceptor(int maxToolResultChars, ObjectMapper objectMapper) {
+        this(maxToolResultChars, maxToolResultChars, objectMapper);
+    }
+
+    ToolLifecycleInterceptor(int maxToolResultChars, int codebaseMaxToolResultChars, ObjectMapper objectMapper) {
         this.maxToolResultChars = Math.max(0, maxToolResultChars);
+        this.codebaseMaxToolResultChars = Math.max(0, codebaseMaxToolResultChars);
         this.objectMapper = objectMapper;
     }
 
@@ -86,6 +96,7 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
     @Override
     public ToolCallResponse interceptToolCall(ToolCallRequest request, ToolCallHandler handler) {
         AgentStreamListener listener = listenerOf(request);
+        boolean codebaseTool = CodebaseToolCallback.isCodebaseToolName(request.getToolName());
         long startedNanos = System.nanoTime();
         AgentToolRequestDetail requestDetail = ToolRequestDetailProjector.project(
                 request.getToolName(), request.getArguments(), objectMapper);
@@ -99,14 +110,22 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                     requestDetail == null ? toolStartSummary(request.getToolName()) : requestDetail.querySummary(),
                     requestDetail));
         }
-        InvocationBudget budget = budgetOf(request);
-        if (budget != null && !budget.tryAcquire()) {
+        if (codebaseTool && !codebaseAccessAllowed(request)) {
             if (listener != null) {
                 emitToolFailed(listener, failedEvent(request, startedNanos,
-                        TOOL_CALL_BUDGET_EXCEEDED, "已达到本轮工具调用上限", null));
+                        "CODEBASE_ACCESS_DISABLED", "用户已禁止读取本地代码", null));
+            }
+            return ToolCallResponse.error(request.getToolCallId(), request.getToolName(),
+                    codebaseUnavailableResult(request, "CODEBASE_ACCESS_DISABLED"));
+        }
+        BudgetAcquisition acquisition = acquireBudget(request, codebaseTool);
+        if (!acquisition.acquired()) {
+            if (listener != null) {
+                emitToolFailed(listener, failedEvent(request, startedNanos,
+                        acquisition.reason(), "已达到本轮工具调用上限", null));
             }
             // 预算耗尽仍返回可被模型理解的结构化结果；不抛异常，避免工具失败制造 Run 双终态。
-            return ToolCallResponse.error(request.getToolCallId(), request.getToolName(), TOOL_CALL_BUDGET_RESULT);
+            return ToolCallResponse.error(request.getToolCallId(), request.getToolName(), budgetResult(request, acquisition.reason()));
         }
         if (isLocalTool(request.getToolName()) && !localSearchAllowed(request)) {
             if (listener != null) {
@@ -124,7 +143,7 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             return ToolCallResponse.error(request.getToolCallId(), request.getToolName(),
                     disabledWebSearchResult(request.getToolName()));
         }
-        ToolResultBudget resultBudget = resultBudgetOf(request);
+        ToolResultBudget resultBudget = resultBudgetOf(request, codebaseTool);
         ToolResultBudget.Reservation reservation = resultBudget == null ? null : resultBudget.reserve();
         if (resultBudget != null && reservation == null) {
             if (listener != null) {
@@ -133,7 +152,7 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             }
             // 预算不足时不执行 handler，外部 Provider 不会被访问。
             return ToolCallResponse.error(request.getToolCallId(), request.getToolName(),
-                    TOOL_CONTEXT_BUDGET_RESULT);
+                    budgetResult(request, TOOL_CONTEXT_BUDGET_EXCEEDED));
         }
         ToolExecutionGovernor governor = governorOf(request);
         ToolExecutionGovernor.Permit permit = governor == null ? null : governor.tryAcquire(request.getToolName());
@@ -150,6 +169,9 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
         }
         try {
             ToolCallResponse raw = handler.call(request);
+            if (codebaseTool) {
+                raw = rebuild(raw, withCodebaseBudget(request, raw.getResult()));
+            }
             // ReactAgent 正式 timeout 可能让框架先收束，而同步 Tool 线程稍后才返回；
             // 终态 Fence 关闭后不再触碰 Source Registry、预算或 SSE。
             if (!runOpen(request)) {
@@ -171,7 +193,7 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                             bounded.decoration()));
                 }
                 return ToolCallResponse.error(request.getToolCallId(), request.getToolName(),
-                        TOOL_CONTEXT_BUDGET_RESULT);
+                        budgetResult(request, TOOL_CONTEXT_BUDGET_EXCEEDED));
             }
             if (resultBudget != null && !resultBudget.commit(reservation, bounded.estimatedTokens())) {
                 rollbackSource(request, bounded.decoration());
@@ -181,9 +203,14 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                             bounded.decoration()));
                 }
                 return ToolCallResponse.error(request.getToolCallId(), request.getToolName(),
-                        TOOL_CONTEXT_BUDGET_RESULT);
+                        budgetResult(request, TOOL_CONTEXT_BUDGET_EXCEEDED));
             }
             ToolCallResponse response = bounded.response();
+            // 只有最终裁剪结果已经成功提交到本 Run 的结果预算后，才把 ReadFile 行登记为
+            // 可用于 prepare 的证据；原始超长结果和预算失败结果永远不能形成调用链。
+            if (codebaseTool && !response.isError()) {
+                registerCodebaseEvidence(request, response.getResult());
+            }
             RunSourceRegistry.Decoration source = bounded.decoration();
             long durationMillis = elapsedMillis(startedNanos);
             if (listener != null) {
@@ -210,7 +237,8 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                         safeFailureSummary(errorCode), null));
             }
             String errorCode = isTimeout(ex) ? TOOL_EXECUTION_TIMEOUT : ERROR_CODE_TOOL_EXECUTION_FAILED;
-            return ToolCallResponse.error(request.getToolCallId(), request.getToolName(), errorCode);
+            return ToolCallResponse.error(request.getToolCallId(), request.getToolName(),
+                    codebaseTool ? codebaseUnavailableResult(request, errorCode) : errorCode);
         } finally {
             if (permit != null) {
                 permit.close();
@@ -299,12 +327,15 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
     }
 
     private static boolean isSearchTool(String toolName) {
-        return isLocalTool(toolName) || isWebTool(toolName);
+        return isLocalTool(toolName) || isWebTool(toolName) || CodebaseToolCallback.isCodebaseToolName(toolName);
     }
 
     private static String providerForTool(String toolName) {
         if (isLocalTool(toolName)) {
             return "LOCAL";
+        }
+        if (CodebaseToolCallback.isCodebaseToolName(toolName)) {
+            return "CODEBASE";
         }
         if ("search_web_bocha".equals(toolName)) {
             return "BOCHA";
@@ -332,6 +363,16 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                 .orElse(null);
     }
 
+    private static InvocationBudget budgetOf(ToolCallRequest request, boolean codebaseTool) {
+        String metadataKey = codebaseTool
+                ? CODEBASE_INVOCATION_BUDGET_METADATA_KEY : INVOCATION_BUDGET_METADATA_KEY;
+        return request.getExecutionContext()
+                .flatMap(context -> context.config().metadata(metadataKey))
+                .filter(InvocationBudget.class::isInstance)
+                .map(InvocationBudget.class::cast)
+                .orElse(null);
+    }
+
     private static boolean webSearchAllowed(ToolCallRequest request) {
         return request.getExecutionContext()
                 .flatMap(context -> context.config().metadata(WEB_SEARCH_ALLOWED_METADATA_KEY))
@@ -343,6 +384,14 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
     private static boolean localSearchAllowed(ToolCallRequest request) {
         return request.getExecutionContext()
                 .flatMap(context -> context.config().metadata(LOCAL_SEARCH_ALLOWED_METADATA_KEY))
+                .filter(Boolean.class::isInstance)
+                .map(Boolean.class::cast)
+                .orElse(true);
+    }
+
+    private static boolean codebaseAccessAllowed(ToolCallRequest request) {
+        return request.getExecutionContext()
+                .flatMap(context -> context.config().metadata(CODEBASE_ACCESS_ALLOWED_METADATA_KEY))
                 .filter(Boolean.class::isInstance)
                 .map(Boolean.class::cast)
                 .orElse(true);
@@ -367,6 +416,21 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                 + "\"sourceKind\":\"LOCAL\",\"provider\":\"LOCAL\",\"items\":[]}";
     }
 
+    private String codebaseUnavailableResult(ToolCallRequest request, String reason) {
+        String toolName = request.getToolName();
+        return withCodebaseBudget(request, "{\"status\":\"UNAVAILABLE\",\"reason\":\"" + reason
+                + "\",\"sourceKind\":\"CODEBASE\",\"provider\":\"CODEBASE\",\"operation\":\""
+                + toolName + "\",\"items\":[]}");
+    }
+
+    private String budgetResult(ToolCallRequest request, String reason) {
+        if (CodebaseToolCallback.isCodebaseToolName(request.getToolName())) {
+            return codebaseUnavailableResult(request, reason);
+        }
+        return TOOL_CONTEXT_BUDGET_EXCEEDED.equals(reason)
+                ? TOOL_CONTEXT_BUDGET_RESULT : TOOL_CALL_BUDGET_RESULT;
+    }
+
     /** 工具结果进入模型上下文前的有界控制点；来源结果必须按完整 item 边界裁剪。 */
     private BoundResult boundResultSize(
             ToolCallResponse response,
@@ -375,12 +439,14 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             ToolResultBudget.Reservation reservation
     ) {
         String result = response.getResult();
+        int maxResultChars = CodebaseToolCallback.isCodebaseToolName(request.getToolName())
+                ? codebaseMaxToolResultChars : maxToolResultChars;
         RunSourceRegistry registry = sourceRegistryOf(request);
         long tokenLimit = resultBudget == null
                 ? Long.MAX_VALUE : resultBudget.availableForCurrent(reservation);
         if (registry != null) {
             RunSourceRegistry.Decoration decoration = registry.decorate(
-                    result, maxToolResultChars, tokenLimit, request.getToolCallId());
+                    result, maxResultChars, tokenLimit, request.getToolCallId());
             if (decoration != null) {
                 return new BoundResult(rebuild(response, decoration.result()), decoration,
                         decoration.estimatedTokens(), !decoration.withinTokenBudget(),
@@ -390,8 +456,8 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
         if (result == null) {
             return new BoundResult(response, null, estimateToolResultTokens(""), false, false);
         }
-        String bounded = result.length() <= maxToolResultChars
-                ? result : result.substring(0, maxToolResultChars);
+        String bounded = result.length() <= maxResultChars
+                ? result : result.substring(0, maxResultChars);
         boolean resultTruncated = !bounded.equals(result);
         long estimatedTokens = estimateToolResultTokens(bounded);
         if (estimatedTokens > tokenLimit) {
@@ -483,6 +549,10 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
     private String structuredErrorCode(String result) {
         try {
             JsonNode root = objectMapper.readTree(result);
+            if ("CODEBASE".equals(root.path("sourceKind").asText())) {
+                String reason = root.path("reason").asText("CODEBASE_UNAVAILABLE");
+                return "USER_DISABLED".equals(reason) ? "CODEBASE_ACCESS_DISABLED" : reason;
+            }
             if ("WEB".equals(root.path("sourceKind").asText())) {
                 return switch (root.path("reason").asText()) {
                     case "NOT_CONFIGURED" -> "WEB_SEARCH_NOT_CONFIGURED";
@@ -513,6 +583,62 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                 .orElse(null);
     }
 
+    private static void registerCodebaseEvidence(ToolCallRequest request, String result) {
+        request.getExecutionContext()
+                .flatMap(context -> context.config().metadata(CodebaseRunContext.METADATA_KEY))
+                .filter(CodebaseRunContext.class::isInstance)
+                .map(CodebaseRunContext.class::cast)
+                .ifPresent(context -> context.registerReadFileResult(result));
+    }
+
+    private BudgetAcquisition acquireBudget(ToolCallRequest request, boolean codebaseTool) {
+        if (codebaseTool) {
+            CodebaseBudget codebaseBudget = request.getExecutionContext()
+                    .flatMap(context -> context.config().metadata(CODEBASE_INVOCATION_BUDGET_METADATA_KEY))
+                    .filter(CodebaseBudget.class::isInstance)
+                    .map(CodebaseBudget.class::cast)
+                    .orElse(null);
+            if (codebaseBudget != null) {
+                CodebaseBudget.AcquireResult result = codebaseBudget.acquire(request.getToolName());
+                return new BudgetAcquisition(result.acquired(), result.reason());
+            }
+        }
+        InvocationBudget budget = budgetOf(request, codebaseTool);
+        if (budget == null) {
+            return new BudgetAcquisition(true, null);
+        }
+        return new BudgetAcquisition(budget.tryAcquire(), TOOL_CALL_BUDGET_EXCEEDED);
+    }
+
+    private String withCodebaseBudget(ToolCallRequest request, String result) {
+        if (!CodebaseToolCallback.isCodebaseToolName(request.getToolName()) || result == null) {
+            return result;
+        }
+        CodebaseBudget codebaseBudget = request.getExecutionContext()
+                .flatMap(context -> context.config().metadata(CODEBASE_INVOCATION_BUDGET_METADATA_KEY))
+                .filter(CodebaseBudget.class::isInstance)
+                .map(CodebaseBudget.class::cast)
+                .orElse(null);
+        if (codebaseBudget == null) {
+            return result;
+        }
+        try {
+            JsonNode parsed = objectMapper.readTree(result);
+            if (parsed == null || !parsed.isObject()) {
+                return result;
+            }
+            ObjectNode envelope = (ObjectNode) parsed.deepCopy();
+            CodebaseBudget.Snapshot snapshot = codebaseBudget.snapshot();
+            ObjectNode budget = envelope.putObject("budget");
+            budget.put("remainingEvidenceCalls", snapshot.remainingEvidenceCalls());
+            budget.put("discoveryAllowed", snapshot.discoveryAllowed());
+            budget.put("stageAvailable", snapshot.stageAvailable());
+            return objectMapper.writeValueAsString(envelope);
+        } catch (Exception ignored) {
+            return result;
+        }
+    }
+
     private static void rollbackSource(ToolCallRequest request, RunSourceRegistry.Decoration decoration) {
         RunSourceRegistry registry = sourceRegistryOf(request);
         if (registry != null) {
@@ -523,6 +649,16 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
     private static ToolResultBudget resultBudgetOf(ToolCallRequest request) {
         return request.getExecutionContext()
                 .flatMap(context -> context.config().metadata(RESULT_BUDGET_METADATA_KEY))
+                .filter(ToolResultBudget.class::isInstance)
+                .map(ToolResultBudget.class::cast)
+                .orElse(null);
+    }
+
+    private static ToolResultBudget resultBudgetOf(ToolCallRequest request, boolean codebaseTool) {
+        String metadataKey = codebaseTool
+                ? CODEBASE_RESULT_BUDGET_METADATA_KEY : RESULT_BUDGET_METADATA_KEY;
+        return request.getExecutionContext()
+                .flatMap(context -> context.config().metadata(metadataKey))
                 .filter(ToolResultBudget.class::isInstance)
                 .map(ToolResultBudget.class::cast)
                 .orElse(null);
@@ -578,6 +714,9 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
     ) {
     }
 
+    private record BudgetAcquisition(boolean acquired, String reason) {
+    }
+
     static long estimateToolResultTokens(String text) {
         return estimateTextTokens(text) + TOOL_MESSAGE_OVERHEAD;
     }
@@ -592,7 +731,18 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
 
     /** 工具开始事件只报告能力状态，任何工具的原始参数都不进入 SSE。 */
     private static String toolStartSummary(String toolName) {
-        return isWebTool(toolName) ? "网页检索" : "工具执行中";
+        return switch (toolName) {
+            case "search_web_bocha", "search_web_searchapi" -> "网页检索";
+            case "select_local_repository" -> "选择本地仓库";
+            case "list_repository_directory" -> "浏览仓库目录";
+            case "glob_repository_files", "grep_repository" -> "搜索仓库源码";
+            case "read_repository_file" -> "读取仓库文件";
+            case "git_repository_status" -> "查看 Git 状态";
+            case "git_repository_diff" -> "查看 Git 差异";
+            case "git_repository_log", "git_repository_show", "git_repository_blame" -> "查看 Git 历史";
+            case CallChainToolCallback.NAME -> "整理临时调用链";
+            default -> "工具执行中";
+        };
     }
 
     /**
@@ -608,6 +758,22 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             case "WEB_SEARCH_DISABLED" -> "用户已禁止联网";
             case "LOCAL_SEARCH_DISABLED" -> "用户已禁止本地检索";
             case "WEB_SEARCH_FAILED", "WEB_SEARCH_PROVIDER_FAILED", "RETRIEVAL_UNAVAILABLE" -> "检索服务暂不可用";
+            case "CODEBASE_ACCESS_DISABLED" -> "用户已禁止读取本地代码";
+            case "REPOSITORY_NOT_SELECTED" -> "尚未选择本地仓库";
+            case "REPOSITORY_SELECTION_REQUIRED" -> "需要选择一个本地仓库";
+            case "MULTIPLE_REPOSITORIES_NOT_SUPPORTED" -> "一次对话只能绑定一个本地仓库";
+            case "REPOSITORY_NOT_FOUND", "REFERENCE_NOT_FOUND" -> "未找到本地仓库";
+            case "CALL_CHAIN_DRAFT_INVALID" -> "调用链草稿不合法";
+            case "CALL_CHAIN_EVIDENCE_INSUFFICIENT" -> "调用链源码证据不足";
+            case "CALL_CHAIN_REPOSITORY_CHANGED" -> "仓库或源码已发生变化";
+            case "CALL_CHAIN_REVISION_UPDATE_REQUIRED" -> "节点已变化，需要后续 Revision 支持";
+            case "CALL_CHAIN_MATCH_AMBIGUOUS" -> "调用链匹配存在歧义";
+            case "CALL_CHAIN_IDENTITY_CONFLICT" -> "调用链版本已变化";
+            case CodebaseBudget.DISCOVERY_RESERVED -> "目录发现额度已保留给方法读取";
+            case "PATH_OUTSIDE_REPOSITORY" -> "查询路径超出仓库边界";
+            case "INVALID_QUERY" -> "代码库查询参数无效";
+            case "CODEBASE_UNAVAILABLE", "PATH_NOT_FOUND", "REPOSITORY_UNAVAILABLE",
+                    "GIT_NOT_AVAILABLE", "GIT_QUERY_FAILED", "GIT_QUERY_TIMEOUT" -> "本地代码库暂不可用";
             case TOOL_CALL_BUDGET_EXCEEDED -> "已达到本轮工具调用上限";
             case TOOL_CONTEXT_BUDGET_EXCEEDED -> "已达到本轮工具结果上下文预算";
             case TOOL_CONCURRENCY_LIMIT_REACHED -> "当前工具并发已达到上限";

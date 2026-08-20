@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import KnowledgeView from './KnowledgeView.tsx'
+import CodebaseView from './CodebaseView.tsx'
 import { MarkdownRenderer } from './MarkdownRenderer.tsx'
+import { CallChainCard } from './CallChainView.tsx'
 import { RunTracePanel } from './RunTracePanel.tsx'
 import { mergeConversation, mergeConversationDetail } from './conversationState.ts'
 import { followModeAfterScroll } from './followMode.ts'
@@ -84,7 +86,7 @@ function App() {
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [sendErrors, setSendErrors] = useState<Record<string, string | null>>({})
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [activeView, setActiveView] = useState<'chat' | 'knowledge'>('chat')
+  const [activeView, setActiveView] = useState<'chat' | 'knowledge' | 'codebase'>('chat')
   const messagesRef = useRef<HTMLDivElement>(null)
   const selectedIdRef = useRef<string | null>(null)
   const followingRef = useRef(true)
@@ -671,12 +673,22 @@ function App() {
           >
             Knowledge
           </button>
+          <button
+            type="button"
+            className="view-switch-button"
+            aria-pressed={activeView === 'codebase'}
+            onClick={() => setActiveView('codebase')}
+          >
+            Codebase
+          </button>
         </nav>
-        <p className="status">
-          {workspaceState.status === 'ready' && '已连接'}
-          {workspaceState.status === 'loading' && '正在连接'}
-          {workspaceState.status === 'error' && '未连接'}
-        </p>
+        <div className="topbar-actions">
+          <p className="status">
+            {workspaceState.status === 'ready' && '已连接'}
+            {workspaceState.status === 'loading' && '正在连接'}
+            {workspaceState.status === 'error' && '未连接'}
+          </p>
+        </div>
       </header>
 
       <div className="workspace" data-view={activeView}>
@@ -863,10 +875,12 @@ function App() {
           )}
         </main>
           </>
-        ) : (
+        ) : activeView === 'knowledge' ? (
           <main className="knowledge-main">
             <KnowledgeView />
           </main>
+        ) : (
+          <CodebaseView />
         )}
       </div>
     </div>
@@ -932,6 +946,9 @@ function MessageEntry({
               />
             )}
           </AssistantEvidenceView>
+          {(entry.payload.callChains ?? []).map((callChain) => (
+            <CallChainCard key={callChain.id} reference={callChain} />
+          ))}
           {entry.payload.completionStatus === 'INCOMPLETE_LENGTH' && (
             <div className="incomplete-answer" role="status">
               <span>回答未完成</span>

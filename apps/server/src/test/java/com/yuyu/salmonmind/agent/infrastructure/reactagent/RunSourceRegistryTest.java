@@ -167,6 +167,27 @@ class RunSourceRegistryTest {
         assertThat(registry.citationsFor("依据 [W1]")).isEmpty();
     }
 
+    @Test
+    void keepsCodebaseResultsOutOfSourceRegistryAndTrimsWholeItems() throws Exception {
+        RunSourceRegistry registry = new RunSourceRegistry(mapper);
+        String longText = "x".repeat(180);
+        String result = "{\"status\":\"SUCCESS\",\"reason\":\"COMPLETE\",\"sourceKind\":\"CODEBASE\","
+                + "\"provider\":\"CODEBASE\",\"operation\":\"read_repository_file\",\"items\":["
+                + "{\"path\":\"src/Main.java\",\"line\":1,\"text\":\"" + longText + "\"},"
+                + "{\"path\":\"src/Main.java\",\"line\":2,\"text\":\"" + longText + "\"}]}";
+
+        RunSourceRegistry.Decoration decoration = registry.decorate(result, 500, Long.MAX_VALUE, "codebase-call");
+        JsonNode bounded = mapper.readTree(decoration.result());
+
+        assertThat(decoration.sourceCount()).isNull();
+        assertThat(decoration.truncated()).isTrue();
+        assertThat(bounded.path("sourceKind").asText()).isEqualTo("CODEBASE");
+        assertThat(bounded.path("items")).hasSize(1);
+        assertThat(bounded.path("items").get(0).has("referenceId")).isFalse();
+        assertThat(registry.retrievedSources()).isEmpty();
+        assertThat(registry.citationsFor("依据 [L1] [W1]")).isEmpty();
+    }
+
     private String envelope(String kind, String provider, String item) {
         return "{\"status\":\"SUCCESS\",\"reason\":\"NONE\",\"sourceKind\":\""
                 + kind + "\",\"provider\":\"" + provider + "\",\"items\":[" + item + "]}";

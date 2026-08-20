@@ -79,7 +79,7 @@ class ConversationRedisRecoveryIntegrationTest {
 
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
-        registry.add("salmon.conversation.data-dir", () -> DATA_DIR.toString());
+        registry.add("salmon.data-dir", () -> DATA_DIR.toString());
         registry.add("salmon.redis.url",
                 () -> "redis://" + REDIS.getHost() + ":" + REDIS.getMappedPort(6379));
     }

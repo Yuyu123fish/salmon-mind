@@ -125,6 +125,14 @@ export type WebRetrievedSource = {
 
 export type RetrievedSourcePayload = LocalRetrievedSource | WebRetrievedSource
 
+export type CallChainReference = {
+  id: string
+  repositoryId: string
+  name: string
+  nodeCount: number
+  edgeCount: number
+}
+
 export type ReasoningTraceItem = {
   kind: 'REASONING'
   text: string
@@ -158,6 +166,7 @@ export type EntryPayload = {
   trace?: RunTraceItem[]
   completionStatus?: 'COMPLETE' | 'INCOMPLETE_LENGTH'
   completionDetailCode?: string | null
+  callChains?: CallChainReference[]
   // TITLE
   title?: string
   sourceRunId?: string
@@ -845,11 +854,31 @@ function requireEntry(
   if (expectedType === 'ASSISTANT_MESSAGE') {
     if (payload.citations !== undefined) requireCitations(payload.citations)
     if (payload.retrievedSources !== undefined) requireRetrievedSources(payload.retrievedSources)
+    if (payload.callChains !== undefined) requireCallChains(payload.callChains)
   }
   if (expectedType === 'TITLE') {
     requireString(payload, 'title')
     requireString(payload, 'sourceRunId')
     requireString(payload, 'sourceAssistantEntryId')
+  }
+}
+
+function requireCallChains(raw: unknown): void {
+  if (!Array.isArray(raw) || raw.length > 1) {
+    throw new ApiError('BAD_SSE_FRAME', '服务端调用链引用不是单项数组', 0)
+  }
+  for (const rawReference of raw) {
+    const reference = objectValue(rawReference)
+    requireString(reference, 'id')
+    requireString(reference, 'repositoryId')
+    requireString(reference, 'name')
+    requireNumber(reference, 'nodeCount')
+    requireNumber(reference, 'edgeCount')
+    if ((reference.name as string).trim() === ''
+      || (reference.nodeCount as number) < 2
+      || (reference.edgeCount as number) < 1) {
+      throw new ApiError('BAD_SSE_FRAME', '服务端调用链引用字段无效', 0)
+    }
   }
 }
 

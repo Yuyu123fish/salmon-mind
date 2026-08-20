@@ -93,6 +93,7 @@ flowchart LR
 | 数据 | 权威位置 | 说明 |
 | --- | --- | --- |
 | Conversation 正文与结构 | JSONL | 保存不可变 Entry 与 Active Path，是会话历史的权威来源 |
+| Repository catalog、调用链与源码快照 | `data/repository-understanding/` | Server-owned 本地代码理解数据，不写入目标仓库 |
 | Workspace、Conversation、Run、知识状态 | PostgreSQL | 保存业务元数据、状态与可修复索引 |
 | Agent Checkpoint、文档处理队列 | Redis | 可恢复的运行态与异步队列，不替代业务权威数据 |
 | 上传文档原件 | RustFS | 文档重建与重新索引的原始来源 |
@@ -178,7 +179,7 @@ docker compose config
 apps/
   server/       Spring Boot 后端、Agent、Conversation 与 Knowledge 模块
   web/          React / Vite 前端
-data/           Conversation JSONL 权威历史（内容不入 Git）
+data/           Server Data Root：conversations/ 与 repository-understanding/（内容不入 Git）
 docs/           架构、开发与运维说明
 infra/data/     本地基础设施数据（内容不入 Git）
 specs/features/ 已确认的 Feature Spec、Plan 与功能报告

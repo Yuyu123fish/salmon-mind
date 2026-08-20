@@ -100,4 +100,76 @@ describe('RunTracePanel', () => {
     expect(screen.getByText('INDEX_UNAVAILABLE')).toBeVisible()
     expect(screen.getByText(/RETRIEVAL_UNAVAILABLE/)).toBeVisible()
   })
+
+  it('labels all codebase tools with safe Chinese summaries', () => {
+    const toolNames = [
+      'select_local_repository',
+      'list_repository_directory',
+      'glob_repository_files',
+      'grep_repository',
+      'read_repository_file',
+      'git_repository_status',
+      'git_repository_diff',
+      'git_repository_log',
+      'git_repository_show',
+      'git_repository_blame',
+    ]
+    const codebaseTrace: RunTraceItem[] = toolNames.map((toolName, index) => ({
+      kind: 'TOOL',
+      toolCallId: `codebase-${index}`,
+      toolName,
+      toolStatus: 'COMPLETED',
+      safeSummary: '只读代码库结果',
+      stableErrorCode: null,
+      truncated: false,
+    }))
+    render(<RunTracePanel trace={codebaseTrace} expanded />)
+
+    expect(screen.getByText('选择本地仓库')).toBeVisible()
+    expect(screen.getByText('浏览仓库目录')).toBeVisible()
+    expect(screen.getAllByText('搜索仓库源码')).toHaveLength(2)
+    expect(screen.getByText('读取仓库文件')).toBeVisible()
+    expect(screen.getByText('查看 Git 状态')).toBeVisible()
+    expect(screen.getByText('查看 Git 差异')).toBeVisible()
+    expect(screen.getAllByText('查看 Git 历史')).toHaveLength(3)
+  })
+
+  it('does not render a source count for codebase status, empty, or degraded results', () => {
+    const codebaseTrace: RunTraceItem[] = [
+      {
+        kind: 'TOOL', toolCallId: 'codebase-success', toolName: 'read_repository_file',
+        toolStatus: 'COMPLETED', safeSummary: 'CODEBASE · 已完成', stableErrorCode: null, truncated: false,
+        outcomeDetail: {
+          provider: 'CODEBASE', resultStatus: 'SUCCESS', stableReasonCode: 'COMPLETE', sourceCount: 0,
+          durationMillis: 10, degraded: false, resultTruncated: false,
+        },
+      },
+      {
+        kind: 'TOOL', toolCallId: 'codebase-empty', toolName: 'grep_repository',
+        toolStatus: 'COMPLETED', safeSummary: 'CODEBASE · 无匹配', stableErrorCode: null, truncated: false,
+        outcomeDetail: {
+          provider: 'CODEBASE', resultStatus: 'EMPTY', stableReasonCode: 'NO_MATCH', sourceCount: 0,
+          durationMillis: 11, degraded: false, resultTruncated: false,
+        },
+      },
+      {
+        kind: 'TOOL', toolCallId: 'codebase-degraded', toolName: 'glob_repository_files',
+        toolStatus: 'COMPLETED', safeSummary: 'CODEBASE · 结果不完整', stableErrorCode: null, truncated: true,
+        outcomeDetail: {
+          provider: 'CODEBASE', resultStatus: 'DEGRADED', stableReasonCode: 'ITEM_LIMIT', sourceCount: 0,
+          durationMillis: 12, degraded: true, resultTruncated: true,
+        },
+      },
+    ]
+    render(<RunTracePanel trace={codebaseTrace} expanded />)
+
+    fireEvent.click(screen.getByRole('button', { name: /工具 #1/ }))
+    expect(screen.getByText('成功')).toBeVisible()
+    expect(screen.queryByText('来源数')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /工具 #2/ }))
+    expect(screen.getByText('空结果')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: /工具 #3/ }))
+    expect(screen.getAllByText('降级').length).toBeGreaterThanOrEqual(2)
+  })
+
 })

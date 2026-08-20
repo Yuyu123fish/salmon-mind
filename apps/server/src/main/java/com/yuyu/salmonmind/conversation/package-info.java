@@ -1,5 +1,6 @@
 @ApplicationModule(allowedDependencies = {
-        "workspace :: api", "agent :: api", "persistence :: mybatis", "persistence :: redis"
+        "workspace :: api", "agent :: api", "persistence :: mybatis", "persistence :: redis",
+        "persistence :: filesystem"
 })
 package com.yuyu.salmonmind.conversation;
 

@@ -6,8 +6,8 @@ import com.yuyu.salmonmind.conversation.application.port.ConversationHistoryRepo
 import com.yuyu.salmonmind.conversation.domain.ConversationHistory;
 import com.yuyu.salmonmind.conversation.infrastructure.jsonl.JsonlCodec.JsonlCorruptedException;
 import com.yuyu.salmonmind.conversation.infrastructure.jsonl.JsonlCodec.TornTailException;
+import com.yuyu.salmonmind.persistence.filesystem.ServerDataRoot;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.io.ByteArrayOutputStream;
@@ -43,10 +43,10 @@ class JsonlConversationHistoryRepository implements ConversationHistoryRepositor
     // Spring 构造器；另一个包私有构造器供测试注入临时数据目录
     @Autowired
     JsonlConversationHistoryRepository(
-            @Value("${salmon.conversation.data-dir:data}") String dataDir,
+            ServerDataRoot serverDataRoot,
             JsonlCodec codec
     ) {
-        this(Path.of(dataDir), codec);
+        this(serverDataRoot.root(), codec);
     }
 
     JsonlConversationHistoryRepository(Path dataRoot, JsonlCodec codec) {

@@ -1,5 +1,7 @@
 package com.yuyu.salmonmind.conversation.application;
 
+import com.yuyu.salmonmind.agent.api.AgentCallChainReference;
+import com.yuyu.salmonmind.agent.api.AgentRunArtifact;
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
 import com.yuyu.salmonmind.conversation.api.AssistantCompletionStatus;
 import com.yuyu.salmonmind.conversation.api.RunResultStatus;
@@ -13,6 +15,7 @@ import com.yuyu.salmonmind.conversation.application.port.ConversationHistoryRepo
 import com.yuyu.salmonmind.conversation.application.port.ConversationMetadataRepository;
 import com.yuyu.salmonmind.conversation.domain.ConversationHistory;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
@@ -34,13 +37,25 @@ class ConversationRecoveryService {
 
     private final ConversationHistoryRepository historyRepository;
     private final ConversationMetadataRepository metadataRepository;
+    private final AgentRunArtifact agentRunArtifact;
 
     ConversationRecoveryService(
             ConversationHistoryRepository historyRepository,
             ConversationMetadataRepository metadataRepository
     ) {
+        this(historyRepository, metadataRepository, (references, answerEntryId) -> {
+        });
+    }
+
+    @Autowired
+    ConversationRecoveryService(
+            ConversationHistoryRepository historyRepository,
+            ConversationMetadataRepository metadataRepository,
+            AgentRunArtifact agentRunArtifact
+    ) {
         this.historyRepository = historyRepository;
         this.metadataRepository = metadataRepository;
+        this.agentRunArtifact = agentRunArtifact;
     }
 
     // 应用就绪时把所有遗留 RUNNING Run 恢复为 INTERRUPTED（进程中断遗留，可重试）；
@@ -164,6 +179,11 @@ class ConversationRecoveryService {
             }
             case ASSISTANT_MESSAGE -> {
                 AssistantMessagePayload payload = (AssistantMessagePayload) entry.payload();
+                agentRunArtifact.confirmCallChains(payload.callChains().stream()
+                        .map(reference -> new AgentCallChainReference(
+                                reference.id(), reference.repositoryId(), reference.name(),
+                                reference.nodeCount(), reference.edgeCount()))
+                        .toList(), entry.id());
                 RunResultStatus expectedResultStatus = payload.completionStatus() == AssistantCompletionStatus.INCOMPLETE_LENGTH
                         ? RunResultStatus.INCOMPLETE_LENGTH : RunResultStatus.COMPLETE;
                 String expectedErrorCode = expectedErrorCode(payload);

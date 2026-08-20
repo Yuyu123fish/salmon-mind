@@ -2,7 +2,7 @@
 
 ## 当前目标
 
-SalmonMind 当前提供单 Workspace 下的可恢复多轮 Agent 对话、本地文档知识库、混合检索与双网页搜索。系统强调两类边界：一类是模块之间只通过小型公开接口协作；另一类是跨 PostgreSQL、JSONL、Redis、RustFS 和 Elasticsearch 时明确谁是权威、谁可以重建。
+SalmonMind 当前提供单 Workspace 下的可恢复多轮 Agent 对话、本地文档知识库、混合检索与 SearchApi.io 网页搜索。系统强调两类边界：一类是模块之间只通过小型公开接口协作；另一类是跨 PostgreSQL、JSONL、Redis、RustFS 和 Elasticsearch 时明确谁是权威、谁可以重建。
 
 知识库、检索和网页搜索已经形成可用闭环；项目代码接入、网络资料入库、OCR、多用户与自主触发 Agent 不属于当前版本。
 
@@ -29,7 +29,7 @@ flowchart LR
 | `workspace` | `api` | 返回本安装唯一的 Workspace |
 | `model` | `chat`、`embedding`、`rerank` | 隔离 Chat、Embedding、Rerank 模型合同及提供方适配 |
 | `knowledge` | `api`、`retrieval` | 文档上传、异步处理、状态查询、Evidence 预览、诊断检索与有界本地召回 |
-| `websearch` | `api` | 统一博查与 SearchApi.io 的结构化搜索合同，隐藏鉴权和响应差异 |
+| `websearch` | `api` | SearchApi.io 的结构化搜索合同，隐藏鉴权和响应差异 |
 | `agent` | `api` | 封装 ReactAgent、工具策略、Run 内来源登记、上下文预算和 Redis Checkpoint |
 | `conversation` | `api` | 会话创建、列表、打开、发送与重试；编排 Agent 并维护 JSONL 权威历史和 PostgreSQL 元数据 |
 
@@ -55,7 +55,7 @@ flowchart LR
 
 ## 检索与回答链路
 
-本地查询分别执行 BM25 与向量召回，在应用层使用 RRF 融合并去重，再调用精排模型生成有限 Evidence。Agent 可以在同一 Run 中选择本地检索、博查、SearchApi.io 或模型已有知识。
+本地查询分别执行 BM25 与向量召回，在应用层使用 RRF 融合并去重，再调用精排模型生成有限 Evidence。Agent 可以在同一 Run 中选择本地检索、SearchApi.io 或模型已有知识。
 
 每次工具运行只登记当前 Run 的有界来源。回答完成后，系统将正文中的短引用编号与本 Run 的真实来源核对，只把合法 Citation 随 Assistant Entry 写入 JSONL。原始工具结果不作为长期历史保存；后续轮次如果需要再次核验原文或实时信息，必须重新检索。
 

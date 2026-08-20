@@ -92,12 +92,9 @@ salmon:
       tool-execution-timeout: ${AGENT_TOOL_EXECUTION_TIMEOUT:60s}
     max-tool-result-chars: ${AGENT_MAX_TOOL_RESULT_CHARS:200000}
     max-tool-calls-per-run: ${AGENT_MAX_TOOL_CALLS_PER_RUN:4}
-    # 一次主调用内所有工具消息的总 token 预算；工具结果在返回模型前按完整 item/文本边界裁剪。
-    max-tool-result-tokens-per-run: ${AGENT_MAX_TOOL_RESULT_TOKENS_PER_RUN:32768}
     codebase:
-      # 本地代码库工具独立预算；三项只能通过部署配置下调。
+      # 本地代码库工具独立调用/字符预算；结果 token 由下一次模型输入实际计量。
       max-tool-calls-per-run: ${SALMON_AGENT_CODEBASE_MAX_TOOL_CALLS_PER_RUN:16}
-      max-tool-result-tokens-per-run: ${SALMON_AGENT_CODEBASE_MAX_TOOL_RESULT_TOKENS_PER_RUN:65536}
       max-tool-result-chars: ${SALMON_AGENT_CODEBASE_MAX_TOOL_RESULT_CHARS:65536}
     trace:
       # 展示/持久化硬上限，不是模型 Token Budget；部署只能下调，代码不会允许突破固定边界。
@@ -107,9 +104,6 @@ salmon:
   websearch:
     connect-timeout: ${WEB_SEARCH_CONNECT_TIMEOUT:5s}
     read-timeout: ${WEB_SEARCH_READ_TIMEOUT:15s}
-    bocha:
-      base-url: ${BOCHA_SEARCH_BASE_URL:https://api.bochaai.com}
-      api-key: ${BOCHA_SEARCH_API_KEY:}
     search-api:
       base-url: ${SEARCH_API_BASE_URL:https://www.searchapi.io}
       api-key: ${SEARCH_API_API_KEY:}
@@ -121,10 +115,9 @@ salmon:
     url: ${REDIS_URL:redis://127.0.0.1:6379}
     password: ${REDIS_PASSWORD:}
   compaction:
-    # 运行时上下文压缩预算：物理窗口是模型能力，工作窗口是产品主动采用的硬预算；
-    # 主输入触发阈值 = working-window − output-reserve（当前 196,712）。五个数值相互独立。
+    # 运行时上下文压缩预算：物理窗口、主输入触发阈值、输出预留和 Tail 相互独立。
     physical-window: ${COMPACTION_PHYSICAL_WINDOW:1000000}
-    working-window: ${COMPACTION_WORKING_WINDOW:262144}
+    trigger-input-tokens: ${COMPACTION_TRIGGER_INPUT_TOKENS:700000}
     output-reserve: ${COMPACTION_OUTPUT_RESERVE:65432}
     retained-tail-target: ${COMPACTION_RETAINED_TAIL_TARGET:65536}
     summary-max-output-tokens: ${COMPACTION_SUMMARY_MAX_OUTPUT_TOKENS:32768}

@@ -4,7 +4,8 @@ package com.yuyu.salmonmind.agent.infrastructure.reactagent;
  * CODEBASE Run 的两段式调用预算。
  *
  * <p>Evidence 总量仍然是 16 次，但前 10 次之后关闭仓库选择与目录发现工具，给
- * ReadFile 与只读 Git 留出最后 6 次。调用链暂存使用独立的一次额度，不会因为目录探索耗尽。</p>
+ * ReadFile 与只读 Git 留出最后 6 次。调用链暂存拥有两次尝试、一次成功额度，允许
+ * 第一次因证据不足返回缺口后补读再试。</p>
  */
 final class CodebaseBudget {
 
@@ -15,7 +16,8 @@ final class CodebaseBudget {
     private final int maximumEvidenceCalls;
     private final int maximumDiscoveryCalls;
     private int evidenceCalls;
-    private boolean stageUsed;
+    private int stageAttempts;
+    private boolean stageSucceeded;
 
     CodebaseBudget(int maximumEvidenceCalls) {
         this.maximumEvidenceCalls = Math.max(0, maximumEvidenceCalls);
@@ -24,10 +26,10 @@ final class CodebaseBudget {
 
     synchronized AcquireResult acquire(String toolName) {
         if ("stage_call_chain".equals(toolName)) {
-            if (stageUsed) {
+            if (stageSucceeded || stageAttempts >= 2) {
                 return AcquireResult.rejected(CALL_LIMIT);
             }
-            stageUsed = true;
+            stageAttempts++;
             return AcquireResult.granted();
         }
         if (isDiscovery(toolName) && !discoveryAllowed()) {
@@ -44,7 +46,23 @@ final class CodebaseBudget {
         return new Snapshot(
                 Math.max(0, maximumEvidenceCalls - evidenceCalls),
                 discoveryAllowed(),
-                !stageUsed);
+                !stageSucceeded && stageAttempts < 2);
+    }
+
+    /** 只有形成有效草稿时才关闭第二次尝试；失败尝试保留给补读后的再次暂存。 */
+    synchronized void completeStage(String result) {
+        if (result == null || result.isBlank()) {
+            return;
+        }
+        try {
+            com.fasterxml.jackson.databind.JsonNode root =
+                    new com.fasterxml.jackson.databind.ObjectMapper().readTree(result);
+            if (root != null && "SUCCESS".equals(root.path("status").asText())) {
+                stageSucceeded = true;
+            }
+        } catch (Exception ignored) {
+            // 非结构化或失败结果不消耗下一次 stage 尝试。
+        }
     }
 
     private boolean discoveryAllowed() {

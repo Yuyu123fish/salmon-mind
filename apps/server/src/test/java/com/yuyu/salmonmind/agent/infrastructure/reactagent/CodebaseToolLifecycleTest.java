@@ -46,10 +46,6 @@ class CodebaseToolLifecycleTest {
                         new ToolLifecycleInterceptor.InvocationBudget(1))
                 .addMetadata(ToolLifecycleInterceptor.INVOCATION_BUDGET_METADATA_KEY,
                         new ToolLifecycleInterceptor.InvocationBudget(1))
-                .addMetadata(ToolLifecycleInterceptor.CODEBASE_RESULT_BUDGET_METADATA_KEY,
-                        new ToolLifecycleInterceptor.ToolResultBudget(32_768))
-                .addMetadata(ToolLifecycleInterceptor.RESULT_BUDGET_METADATA_KEY,
-                        new ToolLifecycleInterceptor.ToolResultBudget(32_768))
                 .build();
         ToolLifecycleInterceptor interceptor = new ToolLifecycleInterceptor(
                 200_000, 20, new ObjectMapper());
@@ -80,8 +76,6 @@ class CodebaseToolLifecycleTest {
                 .addMetadata(ToolLifecycleInterceptor.CODEBASE_ACCESS_ALLOWED_METADATA_KEY, true)
                 .addMetadata(ToolLifecycleInterceptor.CODEBASE_INVOCATION_BUDGET_METADATA_KEY,
                         new CodebaseBudget(16))
-                .addMetadata(ToolLifecycleInterceptor.CODEBASE_RESULT_BUDGET_METADATA_KEY,
-                        new ToolLifecycleInterceptor.ToolResultBudget(32_768))
                 .build();
         ToolLifecycleInterceptor interceptor = new ToolLifecycleInterceptor(
                 200_000, 65_536, new ObjectMapper());
@@ -122,7 +116,7 @@ class CodebaseToolLifecycleTest {
 
         ToolCallResponse staged = interceptor.interceptToolCall(
                 request("stage-1", "stage_call_chain", config), handler);
-        assertThat(staged.getResult()).contains("\"stageAvailable\":false");
+        assertThat(staged.getResult()).contains("\"stageAvailable\":true");
         ToolCallResponse stageRejected = interceptor.interceptToolCall(
                 request("stage-2", "stage_call_chain", config), handler);
         assertThat(stageRejected.getResult()).contains("TOOL_CALL_BUDGET_EXCEEDED");

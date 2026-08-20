@@ -116,7 +116,8 @@ final class CodebaseRunContext {
     }
 
     /**
-     * 登记已经通过结果大小与 token 预算的完整 ReadFile 结果。
+     * 登记已经通过结果大小边界的 ReadFile 实际逐行结果；truncated=true 只表示还有续读，
+     * 已返回且连续的行仍然是本次 Run 可用的证据。
      *
      * @param resultJson 拦截器最终返回给模型的 JSON
      */
@@ -129,8 +130,8 @@ final class CodebaseRunContext {
             if (root == null || !root.isObject()
                     || !"CODEBASE".equals(root.path("sourceKind").asText())
                     || !"read_repository_file".equals(root.path("operation").asText())
-                    || !"SUCCESS".equals(root.path("status").asText())
-                    || root.path("truncated").asBoolean(true)) {
+                    || !("SUCCESS".equals(root.path("status").asText())
+                    || "DEGRADED".equals(root.path("status").asText()))) {
                 return;
             }
             String path = text(root, "path");
@@ -138,22 +139,38 @@ final class CodebaseRunContext {
             int endLine = positive(root, "endLine");
             JsonNode items = root.get("items");
             if (path == null || endLine < startLine || items == null || !items.isArray()
-                    || items.size() != endLine - startLine + 1) {
+                    || items.isEmpty()) {
                 return;
             }
-            Map<Integer, String> lines = readLines.computeIfAbsent(normalizePath(path), ignored -> new LinkedHashMap<>());
+            Map<Integer, String> validated = new LinkedHashMap<>();
             for (int index = 0; index < items.size(); index++) {
                 JsonNode item = items.get(index);
                 if (item == null || !item.isObject()
                         || !path.equals(text(item, "path"))
-                        || item.path("line").asInt(-1) != startLine + index
+                        || item.path("line").asInt(-1) < startLine
+                        || item.path("line").asInt(-1) > endLine
                         || !item.has("text") || !item.get("text").isTextual()) {
                     return;
                 }
+                int line = item.path("line").asInt(-1);
+                if (validated.put(line, item.get("text").asText()) != null) {
+                    return;
+                }
             }
-            for (int index = 0; index < items.size(); index++) {
-                lines.put(startLine + index, items.get(index).get("text").asText());
+            int actualStart = validated.keySet().iterator().next();
+            int actualEnd = actualStart;
+            for (int line : validated.keySet()) {
+                if (line != actualEnd && line != actualEnd + 1) {
+                    return;
+                }
+                actualEnd = line;
             }
+            if (actualEnd - actualStart + 1 != validated.size()) {
+                return;
+            }
+            Map<Integer, String> lines = readLines.computeIfAbsent(
+                    normalizePath(path), ignored -> new LinkedHashMap<>());
+            lines.putAll(validated);
         } catch (Exception ignored) {
             // 工具结果不是调用链证据时保持普通工具语义，不让一次坏结果终止 Agent。
         }
@@ -171,12 +188,19 @@ final class CodebaseRunContext {
             throw failure(CodebaseErrorCode.REPOSITORY_NOT_FOUND, "尚未选择本地仓库");
         }
         validateGraph(name, nodes, edges);
+        List<Map<String, Object>> missing = new ArrayList<>();
         for (DraftNode node : nodes) {
             String source = sourceFor(node.path(), node.startLine(), node.endLine());
             if (source == null || source.isBlank()) {
-                throw failure(CodebaseErrorCode.CALL_CHAIN_EVIDENCE_INSUFFICIENT,
-                        "调用链节点没有被本次 Run 的完整 ReadFile 证据覆盖");
+                missing.add(Map.of(
+                        "key", node.key(), "path", node.path(),
+                        "startLine", node.startLine(), "endLine", node.endLine()));
             }
+        }
+        if (!missing.isEmpty()) {
+            throw new CodebaseException(CodebaseErrorCode.CALL_CHAIN_EVIDENCE_INSUFFICIENT,
+                    "调用链节点没有被本次 Run 的完整 ReadFile 证据覆盖",
+                    Map.of("missing", List.copyOf(missing)));
         }
         draft = new Draft(name.trim(), List.copyOf(nodes), List.copyOf(edges), allowUserNameOverride);
         return new StageSummary(draft.name(), draft.nodes().size(), draft.edges().size());

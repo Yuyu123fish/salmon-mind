@@ -14,16 +14,15 @@ class AgentContextBudgetTest {
     @Test
     void staticBudgetChangesWhenRegisteredToolDefinitionChanges() {
         ToolCallback local = tool("search_local_knowledge", "本地资料");
-        ToolCallback bocha = tool("search_web_bocha", "博查网页");
         ToolCallback searchApi = tool("search_web_searchapi", "SearchApi 网页");
 
         long one = ReactAgentSessionAdapter.estimateStaticInputTokens("system", List.of(local));
         long three = ReactAgentSessionAdapter.estimateStaticInputTokens(
-                "system", List.of(local, bocha, searchApi));
+                "system", List.of(local, searchApi));
 
         assertThat(three).isGreaterThan(one);
         assertThat(ReactAgentSessionAdapter.estimateStaticInputTokens(
-                "system", List.of(local, bocha))).isLessThan(three);
+                "system", List.of(local))).isLessThan(three);
     }
 
     private static ToolCallback tool(String name, String description) {

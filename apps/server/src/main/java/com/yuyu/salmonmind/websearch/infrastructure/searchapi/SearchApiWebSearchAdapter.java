@@ -2,7 +2,6 @@ package com.yuyu.salmonmind.websearch.infrastructure.searchapi;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.yuyu.salmonmind.websearch.api.WebSearchService.WebSearchFreshness;
-import com.yuyu.salmonmind.websearch.api.WebSearchService.WebSearchProvider;
 import com.yuyu.salmonmind.websearch.api.WebSearchService.WebSearchReason;
 import com.yuyu.salmonmind.websearch.application.port.WebSearchProviderException;
 import com.yuyu.salmonmind.websearch.application.port.WebSearchProviderPort;
@@ -50,11 +49,6 @@ public class SearchApiWebSearchAdapter implements WebSearchProviderPort {
         this.safe = safe;
         this.connectTimeout = connectTimeout;
         this.readTimeout = readTimeout;
-    }
-
-    @Override
-    public WebSearchProvider provider() {
-        return WebSearchProvider.SEARCH_API;
     }
 
     @Override

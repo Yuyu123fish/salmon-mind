@@ -392,6 +392,13 @@ class JsonlCodec {
         node.put("durationMillis", detail.durationMillis());
         node.put("degraded", detail.degraded());
         node.put("resultTruncated", detail.resultTruncated());
+        if (detail.estimatedResultTokens() != null) {
+            node.put("estimatedResultTokens", detail.estimatedResultTokens());
+        }
+        if (detail.remainingInputTokens() != null) {
+            node.put("remainingInputTokens", detail.remainingInputTokens());
+        }
+        node.put("contextCleaned", detail.contextCleaned());
         return node;
     }
 
@@ -608,7 +615,10 @@ class JsonlCodec {
                     optionalText(node, "provider"), status, optionalText(node, "stableReasonCode"),
                     optionalNonNegativeInteger(node, "sourceCount"), duration,
                     optionalBoolean(node, "degraded", false),
-                    optionalBoolean(node, "resultTruncated", false));
+                    optionalBoolean(node, "resultTruncated", false),
+                    optionalNonNegativeLong(node, "estimatedResultTokens"),
+                    optionalNonNegativeLong(node, "remainingInputTokens"),
+                    optionalBoolean(node, "contextCleaned", false));
         } catch (RuntimeException ex) {
             return null;
         }
@@ -697,6 +707,14 @@ class JsonlCodec {
             throw corrupted("字段不是整数: " + field);
         }
         return value.asLong();
+    }
+
+    private static Long optionalNonNegativeLong(JsonNode node, String field) {
+        Long value = optionalLong(node, field);
+        if (value != null && value < 0) {
+            throw corrupted("字段不能为负数: " + field);
+        }
+        return value;
     }
 
     private static Integer optionalPositiveInteger(JsonNode node, String field) {

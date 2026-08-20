@@ -14,7 +14,7 @@ import java.util.UUID;
  *
  * <p>Spec 关键合同（本类为唯一实现处）：
  * <ul>
- *   <li>触发阈值 = 工作窗口 − 输出预留（当前 262,144 − 65,432 = 196,712）；达到或超过即压缩。</li>
+ *   <li>主输入触发阈值由部署显式配置（默认 700,000）；达到或超过即压缩，不能从工作窗口反推。</li>
  *   <li>兼容路径可优先取最近一次有效 Assistant usage 锚点；生产工具路径由调用方禁用锚点，
  *       直接按当前 JSONL 投影、Citation 历史摘要和 Agent 动态工具预算完整计量。</li>
  *   <li>Retained Tail 从候选区末尾反向累计，达到目标后把切点移动到 User Entry 边界，
@@ -31,28 +31,34 @@ public final class ConversationCompactionPolicy {
     public ConversationCompactionPolicy() {
     }
 
-    /** 压缩预算。五个数值相互独立，不派生复用：物理窗口、工作窗口、输出预留、Tail 目标、摘要输出上限。 */
+    /** 压缩预算。物理输入上限、触发阈值、输出预留、Tail 目标、摘要输出上限相互独立。 */
     public record Budgets(
             long physicalContextWindow,
-            long workingContextWindow,
+            long compactionTriggerInputTokens,
             long outputReserve,
             long retainedTailTarget,
             long summaryMaxOutputTokens,
             double summaryTemperature
     ) {
         public Budgets {
-            if (physicalContextWindow <= 0 || workingContextWindow <= 0 || outputReserve < 0
+            if (physicalContextWindow <= 0 || compactionTriggerInputTokens <= 0 || outputReserve < 0
                     || retainedTailTarget < 0 || summaryMaxOutputTokens <= 0) {
                 throw new IllegalArgumentException("压缩预算必须为正数且输出预留不能为负");
             }
-            if (workingContextWindow + outputReserve > physicalContextWindow) {
-                throw new IllegalArgumentException("工作窗口与输出预留之和不能超过物理窗口");
+            if (outputReserve > physicalContextWindow
+                    || compactionTriggerInputTokens > physicalContextWindow - outputReserve) {
+                throw new IllegalArgumentException("触发阈值与输出预留不能超过物理输入窗口");
             }
         }
 
         /** 主请求输入触发阈值；输入预计达到或超过该值时必须先压缩。 */
         public long triggerThreshold() {
-            return workingContextWindow - outputReserve;
+            return compactionTriggerInputTokens;
+        }
+
+        /** 主请求输入连同 output reserve 的硬边界。 */
+        public long hardInputCeiling() {
+            return physicalContextWindow - outputReserve;
         }
     }
 

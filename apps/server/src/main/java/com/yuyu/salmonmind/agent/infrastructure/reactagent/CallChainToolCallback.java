@@ -19,7 +19,7 @@ import java.util.Set;
  * 独立的临时调用链 Tool。它只接受节点身份、相对位置和边，不接受源码或 source hash；
  * 源码覆盖与 hash 由同一个 Run 的 ReadFile 证据和 codebase prepare 再次核验。
  */
-final class CallChainToolCallback implements ParallelSafeToolCallback {
+final class CallChainToolCallback implements org.springframework.ai.tool.ToolCallback {
 
     static final String NAME = "stage_call_chain";
     private static final Set<String> FIELDS = Set.of("name", "nodes", "edges", "allowUserNameOverride");
@@ -72,7 +72,7 @@ final class CallChainToolCallback implements ParallelSafeToolCallback {
         } catch (InvalidInput ex) {
             return failure(CodebaseErrorCode.INVALID_QUERY.name());
         } catch (CodebaseException ex) {
-            return failure(ex.code().name());
+            return failure(ex);
         } catch (RuntimeException ex) {
             return failure("CODEBASE_UNAVAILABLE");
         }
@@ -189,6 +189,25 @@ final class CallChainToolCallback implements ParallelSafeToolCallback {
         return "{\"status\":\"UNAVAILABLE\",\"reason\":\"" + reason
                 + "\",\"sourceKind\":\"CODEBASE\",\"provider\":\"CODEBASE\","
                 + "\"operation\":\"" + NAME + "\",\"items\":[]}";
+    }
+
+    private String failure(CodebaseException exception) {
+        try {
+            com.fasterxml.jackson.databind.node.ObjectNode result = mapper.createObjectNode();
+            result.put("status", "UNAVAILABLE");
+            result.put("reason", exception.code().name());
+            result.put("sourceKind", "CODEBASE");
+            result.put("provider", "CODEBASE");
+            result.put("operation", NAME);
+            Object missing = exception.details().get("missing");
+            if (missing != null) {
+                result.set("missing", mapper.valueToTree(missing));
+            }
+            result.putArray("items");
+            return mapper.writeValueAsString(result);
+        } catch (Exception ex) {
+            return failure(exception.code().name());
+        }
     }
 
     private String quote(String value) {

@@ -181,6 +181,20 @@ export async function fetchCallChain(
   )
 }
 
+export async function fetchCallChainRevision(
+  repositoryId: string,
+  callChainId: string,
+  nodeId: string,
+  revisionId: string,
+  signal?: AbortSignal,
+): Promise<CallChainNodeDetail> {
+  return request<CallChainNodeDetail>(
+    `/api/codebase/repositories/${encodeURIComponent(repositoryId)}/call-chains/${encodeURIComponent(callChainId)}` +
+      `/nodes/${encodeURIComponent(nodeId)}/revisions/${encodeURIComponent(revisionId)}`,
+    { signal },
+  )
+}
+
 export async function renameCallChain(
   repositoryId: string,
   callChainId: string,

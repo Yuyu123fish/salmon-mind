@@ -58,7 +58,8 @@ final class RunSourceRegistry {
             "CALL_CHAIN_DRAFT_INVALID", "CALL_CHAIN_EVIDENCE_INSUFFICIENT",
             "CALL_CHAIN_PENDING_NOT_FOUND", "CALL_CHAIN_REPOSITORY_CHANGED",
             "CALL_CHAIN_REVISION_UPDATE_REQUIRED", "CALL_CHAIN_DATA_ROOT_CONFLICT",
-            "CALL_CHAIN_IDENTITY_CONFLICT");
+            "CALL_CHAIN_IDENTITY_CONFLICT", "CALL_CHAIN_MATCH_AMBIGUOUS",
+            "CODEBASE_DISCOVERY_BUDGET_RESERVED");
 
     private final ObjectMapper mapper;
     private final Map<String, AgentCitation> citations = new LinkedHashMap<>();
@@ -239,7 +240,7 @@ final class RunSourceRegistry {
         return new Decoration(
                 serialized,
                 "CODEBASE",
-                0,
+                null,
                 truncated,
                 resultStatus == AgentToolOutcomeDetail.ResultStatus.DEGRADED || truncated,
                 estimatedTokens,
@@ -504,7 +505,7 @@ final class RunSourceRegistry {
     record Decoration(
             String result,
             String provider,
-            int sourceCount,
+            Integer sourceCount,
             boolean truncated,
             boolean degraded,
             long estimatedTokens,

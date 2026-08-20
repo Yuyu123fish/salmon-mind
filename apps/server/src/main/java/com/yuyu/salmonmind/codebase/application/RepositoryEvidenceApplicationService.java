@@ -664,7 +664,7 @@ public final class RepositoryEvidenceApplicationService implements RepositoryEvi
     }
 
     private Pattern compileGlob(String pattern) {
-        if (pattern.startsWith("/") || pattern.contains("..")) {
+        if (pattern.startsWith("/") || pattern.contains("..") || containsUnsupportedGlobSyntax(pattern)) {
             throw new CodebaseException(CodebaseErrorCode.INVALID_QUERY, "Glob pattern 不合法");
         }
         StringBuilder regex = new StringBuilder("^");
@@ -687,6 +687,13 @@ public final class RepositoryEvidenceApplicationService implements RepositoryEvi
             }
         }
         return Pattern.compile(regex.append('$').toString());
+    }
+
+    private boolean containsUnsupportedGlobSyntax(String pattern) {
+        // 当前只实现 *、** 和 ?；未实现方言必须报错，不能把用户意图当成普通文件名。
+        return pattern.indexOf('{') >= 0 || pattern.indexOf('}') >= 0
+                || pattern.indexOf('[') >= 0 || pattern.indexOf(']') >= 0
+                || pattern.indexOf('\\') >= 0;
     }
 
     private String requirePattern(String value, String label) {

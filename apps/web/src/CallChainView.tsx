@@ -3,6 +3,7 @@ import {
   CodebaseApiError,
   deleteCallChain,
   fetchCallChain,
+  fetchCallChainRevision,
   renameCallChain,
   type CallChainDetail,
   type CallChainReference,
@@ -28,7 +29,11 @@ export default function CallChainView(props: CallChainViewProps) {
   const [nameDraft, setNameDraft] = useState(props.fallbackName)
   const [mutation, setMutation] = useState<'rename' | 'delete' | null>(null)
   const [deleteArmed, setDeleteArmed] = useState(false)
+  const [revisionDetails, setRevisionDetails] = useState<Record<string, CallChainDetail['nodes'][number]>>({})
+  const [selectedRevisionIds, setSelectedRevisionIds] = useState<Record<string, string>>({})
+  const [revisionLoading, setRevisionLoading] = useState<string | null>(null)
   const requestSequence = useRef(0)
+  const revisionRequestSequence = useRef(0)
 
   useEffect(() => {
     const sequence = ++requestSequence.current
@@ -36,6 +41,10 @@ export default function CallChainView(props: CallChainViewProps) {
     setState({ status: 'loading', detail: null })
     setMutation(null)
     setDeleteArmed(false)
+    setRevisionDetails({})
+    setSelectedRevisionIds({})
+    setRevisionLoading(null)
+    revisionRequestSequence.current += 1
     void fetchCallChain(props.repositoryId, props.callChainId, controller.signal)
       .then((detail) => {
         if (sequence !== requestSequence.current) return
@@ -47,11 +56,19 @@ export default function CallChainView(props: CallChainViewProps) {
         if (controller.signal.aborted || sequence !== requestSequence.current) return
         setState({ status: 'error', detail: null, message: errorMessage(error), code: errorCode(error) })
       })
-    return () => controller.abort()
+    return () => {
+      controller.abort()
+      revisionRequestSequence.current += 1
+    }
   }, [props.callChainId, props.repositoryId])
 
   const detail = state.status === 'ready' ? state.detail : null
   const selectedNode = detail?.nodes.find((node) => node.nodeId === selectedNodeId) ?? detail?.nodes[0] ?? null
+  const selectedRevisionId = selectedNode === null
+    ? null : (selectedRevisionIds[selectedNode.nodeId] ?? selectedNode.revisionId)
+  const selectedRevision = selectedNode === null
+    ? null
+    : revisionDetails[revisionKey(selectedNode.nodeId, selectedRevisionId ?? selectedNode.revisionId)] ?? selectedNode
   const nodeLabels = useMemo(() => new Map(
     detail?.nodes.map((node) => [node.nodeId, node.qualifiedSymbol]) ?? [],
   ), [detail])
@@ -147,7 +164,7 @@ export default function CallChainView(props: CallChainViewProps) {
                     key={node.nodeId}
                     className="call-chain-node"
                     data-selected={selectedNode?.nodeId === node.nodeId}
-                    onClick={() => setSelectedNodeId(node.nodeId)}
+                    onClick={() => selectNode(node)}
                   >
                     <strong>{index + 1}. {node.qualifiedSymbol}</strong>
                     <small>{node.path}:{node.startLine}-{node.endLine}</small>
@@ -168,25 +185,35 @@ export default function CallChainView(props: CallChainViewProps) {
 
             <section className="call-chain-section call-chain-node-detail" aria-label="节点详情">
               <h4>节点详情</h4>
-              {selectedNode === null ? <p className="repository-hint">请选择一个节点。</p> : (
+              {selectedNode === null || selectedRevision === null
+                ? <p className="repository-hint">请选择一个节点。</p> : (
                 <>
-                  <p className="call-chain-summary">{selectedNode.summary || '未提供说明'}</p>
+                  <p className="call-chain-summary">{selectedRevision.summary || '未提供说明'}</p>
                   <dl className="source-detail-list">
-                    <dt>符号</dt><dd>{selectedNode.qualifiedSymbol}</dd>
-                    <dt>签名</dt><dd><code>{selectedNode.signature}</code></dd>
-                    <dt>位置</dt><dd><code>{selectedNode.path}:{selectedNode.startLine}-{selectedNode.endLine}</code></dd>
-                    <dt>语言</dt><dd>{selectedNode.language}</dd>
-                    <dt>Git</dt><dd>{observationLabel(selectedNode.observation)}</dd>
+                    <dt>符号</dt><dd>{selectedRevision.qualifiedSymbol}</dd>
+                    <dt>签名</dt><dd><code>{selectedRevision.signature}</code></dd>
+                    <dt>位置</dt><dd><code>{selectedRevision.path}:{selectedRevision.startLine}-{selectedRevision.endLine}</code></dd>
+                    <dt>语言</dt><dd>{selectedRevision.language}</dd>
+                    <dt>Git</dt><dd>{observationLabel(selectedRevision.observation)}</dd>
                   </dl>
-                  <pre className="call-chain-source"><code>{selectedNode.source}</code></pre>
+                  <pre className="call-chain-source"><code>{selectedRevision.source}</code></pre>
                   <h5>Revision</h5>
                   <ul className="call-chain-revision-list">
                     {selectedNode.revisions.map((revision) => (
                       <li key={revision.id}>
-                        <code>{revision.sourceHash.slice(0, 12)}</code> · {revision.path}:{revision.startLine}-{revision.endLine}
+                        <button
+                          type="button"
+                          className="call-chain-revision-choice"
+                          data-selected={selectedRevision?.revisionId === revision.id}
+                          disabled={revisionLoading === revisionKey(selectedNode.nodeId, revision.id)}
+                          onClick={() => void selectRevision(selectedNode, revision.id)}
+                        >
+                          <code>{revision.sourceHash.slice(0, 12)}</code> · {revision.path}:{revision.startLine}-{revision.endLine}
+                        </button>
                       </li>
                     ))}
                   </ul>
+                  {revisionLoading !== null && <small className="repository-hint">正在读取历史 Revision…</small>}
                 </>
               )}
             </section>
@@ -195,6 +222,42 @@ export default function CallChainView(props: CallChainViewProps) {
       )}
     </div>
   )
+
+  function selectRevision(node: CallChainDetail['nodes'][number], revisionId: string) {
+    setSelectedRevisionIds((current) => ({ ...current, [node.nodeId]: revisionId }))
+    const revisionSequence = ++revisionRequestSequence.current
+    if (revisionId === node.revisionId) {
+      setRevisionDetails((current) => {
+        const next = { ...current }
+        delete next[revisionKey(node.nodeId, revisionId)]
+        return next
+      })
+      return
+    }
+    const key = revisionKey(node.nodeId, revisionId)
+    const sequence = requestSequence.current
+    const controller = new AbortController()
+    setRevisionLoading(key)
+    void fetchCallChainRevision(props.repositoryId, props.callChainId, node.nodeId, revisionId, controller.signal)
+      .then((revision) => {
+        if (sequence !== requestSequence.current || revisionSequence !== revisionRequestSequence.current) return
+        setRevisionDetails((current) => ({ ...current, [key]: revision }))
+      })
+      .catch(() => {
+        // 历史读取失败时保留当前节点详情，避免旧异步响应替换当前链。
+      })
+      .finally(() => {
+        if (sequence === requestSequence.current && revisionSequence === revisionRequestSequence.current) {
+          setRevisionLoading(null)
+        }
+      })
+  }
+
+  function selectNode(node: CallChainDetail['nodes'][number]) {
+    revisionRequestSequence.current += 1
+    setSelectedNodeId(node.nodeId)
+    setSelectedRevisionIds((current) => ({ ...current, [node.nodeId]: node.revisionId }))
+  }
 }
 
 /** Assistant 下方的紧凑引用卡片；详情名以 API 当前权威值为准。 */
@@ -238,4 +301,8 @@ function errorCode(error: unknown): string | undefined {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '调用链服务请求失败'
+}
+
+function revisionKey(nodeId: string, revisionId: string): string {
+  return `${nodeId}:${revisionId}`
 }

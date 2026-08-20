@@ -164,7 +164,7 @@ function OutcomeDetail({ detail }: { detail: ToolOutcomeDetail }) {
       {detail.stableReasonCode ? (
         <div><dt>稳定原因</dt><dd>{detail.stableReasonCode}</dd></div>
       ) : null}
-      {detail.sourceCount !== null && detail.sourceCount !== undefined ? (
+      {detail.provider !== 'CODEBASE' && detail.sourceCount !== null && detail.sourceCount !== undefined ? (
         <div><dt>来源数</dt><dd>{detail.sourceCount}</dd></div>
       ) : null}
       <div><dt>耗时</dt><dd>{detail.durationMillis} ms</dd></div>

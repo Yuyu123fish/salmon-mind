@@ -8,6 +8,7 @@ Status: Specified
 - [Stage 02：对话式代码库理解闭环](./plan-02-conversational-codebase-understanding.md)
 - [Stage 03：简单调用链沉淀与展示](./plan-03-call-chain-persistence-and-display.md)
 - [Stage 03.5：代码库入口与仓库绑定纠偏](./plan-03-5-codebase-entry-and-binding-correction.md)
+- [Stage 04：调用链演进与代码探索闭环](./plan-04-call-chain-evolution-and-run-closure.md)
 
 ## Problem Statement
 
@@ -172,6 +173,8 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 - 代码探索通常需要 `发现文件 -> 搜索符号 -> 读取实现 -> 查看调用方或历史` 的连续步骤，不能沿用当前本地文档/网页工具固定最多四次的费用边界。
 - Repository 工具使用独立的有界调用预算和结果预算；具体次数、字符数、Token 数与超时在 Plan 中结合现有上下文预算确定。部署可以收紧上限，但 Agent 必须能够完成最小调用链闭环。
 - Active Repository 自动绑定不能消耗一次模型 Tool 调用。预算必须为一次真实的“发现文件 → 定位符号 → 分页读取至少两个方法 → 可选 Git 核实 → stage_call_chain”保留足够空间，不能让仓库选择或无效别名猜测耗尽探索额度。
+- 代码探索预算不能只设置一个总上限，还必须阻止目录、Glob、Grep 等发现动作占满全部额度，为方法级 ReadFile、必要 Git 核实和 `stage_call_chain` 保留确定空间。达到发现边界时要把剩余额度和下一步动作明确返回给 Agent，而不是等到所有工具都不可用后才报错。
+- `sourceCount` 只表达真正进入当前 Run 来源注册表的本地文档或网页来源。CODEBASE Evidence 不进入 `L/W` Citation，因此 Trace 不能用兼容值 `0` 显示成“0 个来源”；代码库工具只展示完成、空结果、降级、截断和稳定原因。若未来需要展示命中项数，必须使用独立结果计数字段。
 - 代码库工具结果不自动进入 Knowledge 文档 RAG，不生成本地文档 `L` Citation，也不写入 Elasticsearch。现有本地文档、网页搜索、Conversation JSONL 权威、Redis Checkpoint 和上下文压缩合同保持不变。
 - 工具启用后的 Run 继续遵守现有 Checkpoint 重建、来源有界和单终态 SSE 规则。代码工具失败只影响本次代码理解，不得破坏 Conversation 历史或其他工具能力。
 
@@ -248,6 +251,8 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 20. 没有注册仓库、代码工具不可用或代码查询失败时，普通对话、Knowledge RAG 和 WebSearch 仍保持既有行为。
 21. 从仓库根、`apps/server` 或 IDE 启动 Server 时只能解析到同一个根数据目录；无效启动配置必须直接失败，不能静默创建第二份 `data`。
 22. Codebase 作为顶部一级视图可完成仓库注册、Active 选择和调用链管理，页面与 API 中不存在 Search Root。
+23. CODEBASE Trace 不显示“0 个来源”；空 Grep 与成功 List/Read 使用各自的结果状态，Knowledge/WebSearch 的真实来源数语义保持不变。
+24. 代码流程 Run 即使前期出现空搜索或截断，也会在发现动作达到边界后保留方法读取与调用链暂存额度；任何截断结果都不能被回答描述为“完整清单”或“全仓库结论”。
 
 ### 真实验证边界
 
@@ -297,3 +302,4 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 - 精确 JSONL 字段、文件名、内容哈希算法、工具调用次数、结果大小、超时、HTTP 路径和 UI 视觉布局属于 Plan/实施选择，不在 Spec 中提前冻结。
 - 第一版的价值判断以“开发者能在自然语言对话中重新理解本地项目，并复用已经核实的简单调用链”为准，不以节点数量、索引规模或图算法复杂度为目标。
 - Stage 03.5 的纠偏依据是 Conversation `9ad96b05-f513-4f52-bc61-2b9272ef407d`：Active Repository 已持久化，但模型连续使用五个错误非空引用并得到 `REFERENCE_NOT_FOUND`；用户补充绝对路径后才成功绑定，随后又在完成调用链前耗尽代码库调用/结果预算。该证据用于修正默认绑定和预算，不把一次模型行为扩展成 Repo Map 或静态索引需求。
+- Stage 04 的运行闭环纠偏依据是 Conversation `6d09d170-9120-4ced-8175-40b8a95bbd97`：16 个已完成 CODEBASE Tool 全部被 Trace 显示成“0 个来源”；Run 使用 7 次 List、3 次 Grep、3 次 Glob 和 3 次 ReadFile 后，又有 4 次调用因总预算耗尽而失败，最终没有读取关键实现方法或调用 `stage_call_chain`。其中一个 `ITEM_LIMIT` Glob 还被回答误述为“408 个 Java 文件的完整清单”。Stage 04 必须修复来源语义、搜索默认值、预算保留和截断表述，不通过继续放大总预算掩盖问题。

@@ -4,7 +4,8 @@ package com.yuyu.salmonmind.agent.api;
  * 一个工具调用成功结束的平台事件；终态展示集中由 {@link AgentToolOutcomeDetail} 承载。
  *
  * <p>调用方应优先读取 {@code outcomeDetail}；旧访问器只为已有监听器保留，
- * {@code sourceCount} 无法证明时以 0 兼容返回，不能据此推断真实来源数。
+ * {@code sourceCount} 无法证明时以 0 兼容返回，不能据此推断真实来源数；新展示应读取
+ * {@link AgentToolOutcomeDetail#sourceCount()}，CODEBASE 结果永远不进入来源计数。
  * {@code safeSummary} 只允许用于紧凑展示，不是模型可重放的工具结果。
  *
  * @param toolCallId    本次 Tool Call 的稳定身份，与 started 事件一一对应
@@ -37,9 +38,10 @@ public record AgentToolCompleted(
             boolean degraded
     ) {
         this(toolCallId, toolName,
-                new AgentToolOutcomeDetail(provider, null, null, sourceCount, durationMillis,
+                new AgentToolOutcomeDetail(provider, legacyStatus(provider, degraded), null,
+                        legacySourceCount(provider, sourceCount), durationMillis,
                         degraded, truncated),
-                summary(provider, sourceCount, degraded));
+                legacySummary(provider, sourceCount, degraded));
     }
 
     public AgentToolCompleted {
@@ -47,7 +49,7 @@ public record AgentToolCompleted(
             outcomeDetail = new AgentToolOutcomeDetail(null, null, null, null, 0, false, false);
         }
         if (safeSummary == null || safeSummary.isBlank()) {
-            safeSummary = summary(outcomeDetail.provider(), outcomeDetail.sourceCount(), outcomeDetail.degraded());
+            safeSummary = summary(outcomeDetail);
         }
     }
 
@@ -78,5 +80,42 @@ public record AgentToolCompleted(
         }
         String count = sourceCount == null ? "来源数未知" : sourceCount + " 个来源";
         return provider + " · " + count + (degraded ? " · 降级结果" : "");
+    }
+
+    private static String summary(AgentToolOutcomeDetail detail) {
+        if ("CODEBASE".equals(detail.provider())) {
+            if (detail.resultTruncated() || detail.degraded()
+                    || detail.resultStatus() == AgentToolOutcomeDetail.ResultStatus.DEGRADED) {
+                return "CODEBASE · 结果不完整";
+            }
+            if (detail.resultStatus() == AgentToolOutcomeDetail.ResultStatus.EMPTY
+                    || "NO_MATCH".equals(detail.stableReasonCode())) {
+                return "CODEBASE · 无匹配";
+            }
+            if (detail.resultStatus() == AgentToolOutcomeDetail.ResultStatus.SUCCESS) {
+                return "CODEBASE · 已完成";
+            }
+            return "CODEBASE · 不可用";
+        }
+        return summary(detail.provider(), detail.sourceCount(), detail.degraded());
+    }
+
+    private static AgentToolOutcomeDetail.ResultStatus legacyStatus(String provider, boolean degraded) {
+        if (!"CODEBASE".equals(provider)) {
+            return null;
+        }
+        return degraded ? AgentToolOutcomeDetail.ResultStatus.DEGRADED
+                : AgentToolOutcomeDetail.ResultStatus.SUCCESS;
+    }
+
+    private static Integer legacySourceCount(String provider, int sourceCount) {
+        return "CODEBASE".equals(provider) ? null : sourceCount;
+    }
+
+    private static String legacySummary(String provider, int sourceCount, boolean degraded) {
+        if ("CODEBASE".equals(provider)) {
+            return degraded ? "CODEBASE · 结果不完整" : "CODEBASE · 已完成";
+        }
+        return summary(provider, sourceCount, degraded);
     }
 }

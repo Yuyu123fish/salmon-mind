@@ -3,6 +3,7 @@ package com.yuyu.salmonmind.codebase.application.port;
 import com.yuyu.salmonmind.codebase.api.CallChainConfirmation;
 import com.yuyu.salmonmind.codebase.api.CallChainDetail;
 import com.yuyu.salmonmind.codebase.api.CallChainEdgeInput;
+import com.yuyu.salmonmind.codebase.api.CallChainNodeDetail;
 import com.yuyu.salmonmind.codebase.api.CallChainNodeInput;
 import com.yuyu.salmonmind.codebase.api.CallChainPrepareRequest;
 import com.yuyu.salmonmind.codebase.api.CallChainReference;
@@ -30,6 +31,9 @@ public interface CallChainStorePort {
     List<CallChainSummary> list(UUID repositoryId, String repositoryName);
 
     CallChainDetail detail(UUID repositoryId, UUID callChainId, String repositoryName);
+
+    /** 仅返回该正式 Chain 历史中实际引用的 Node Revision 及其受校验源码快照。 */
+    CallChainNodeDetail revisionDetail(UUID repositoryId, UUID callChainId, String nodeId, UUID revisionId);
 
     CallChainDetail rename(UUID repositoryId, UUID callChainId, String repositoryName, String name);
 

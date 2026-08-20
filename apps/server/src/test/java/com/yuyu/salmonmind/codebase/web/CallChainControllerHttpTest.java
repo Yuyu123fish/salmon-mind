@@ -1,6 +1,7 @@
 package com.yuyu.salmonmind.codebase.web;
 
 import com.yuyu.salmonmind.codebase.api.CallChainDetail;
+import com.yuyu.salmonmind.codebase.api.CallChainNodeDetail;
 import com.yuyu.salmonmind.codebase.api.CallChainQueryService;
 import com.yuyu.salmonmind.codebase.api.CallChainSummary;
 import com.yuyu.salmonmind.codebase.api.CodebaseErrorCode;
@@ -58,6 +59,27 @@ class CallChainControllerHttpTest {
     }
 
     @Test
+    void historicalRevisionUsesTheRepositoryChainNodeRevisionRoute() throws Exception {
+        UUID repositoryId = UUID.randomUUID();
+        UUID callChainId = UUID.randomUUID();
+        String nodeId = "a".repeat(64);
+        UUID revisionId = UUID.randomUUID();
+        when(callChains.revisionDetail(repositoryId, callChainId, nodeId, revisionId))
+                .thenReturn(new CallChainNodeDetail(
+                        nodeId, revisionId, "java", "Demo.entry", "void entry()", "入口",
+                        "b".repeat(64), "src/Demo.java", 1, 2, "void entry() {}", observation(), List.of()));
+
+        mockMvc.perform(get("/api/codebase/repositories/{repositoryId}/call-chains/{callChainId}"
+                        + "/nodes/{nodeId}/revisions/{revisionId}", repositoryId, callChainId, nodeId, revisionId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.nodeId").value(nodeId))
+                .andExpect(jsonPath("$.revisionId").value(revisionId.toString()))
+                .andExpect(jsonPath("$.source").value("void entry() {}"));
+
+        verify(callChains).revisionDetail(repositoryId, callChainId, nodeId, revisionId);
+    }
+
+    @Test
     void renameAndDeleteUseTheSameRepositoryAndChainIdentity() throws Exception {
         UUID repositoryId = UUID.randomUUID();
         UUID callChainId = UUID.randomUUID();
@@ -102,5 +124,11 @@ class CallChainControllerHttpTest {
         Instant now = Instant.parse("2026-08-20T00:00:00Z");
         return new CallChainDetail(callChainId, repositoryId, "demo", name, 2, 1,
                 UUID.randomUUID(), UUID.randomUUID(), now, now, List.of(), List.of());
+    }
+
+    private static com.yuyu.salmonmind.codebase.api.RepositoryObservation observation() {
+        return new com.yuyu.salmonmind.codebase.api.RepositoryObservation(
+                "main", "0123456789012345678901234567890123456789", true,
+                false, false, false, 0, 0, 0, 0, Instant.parse("2026-08-20T00:00:00Z"));
     }
 }

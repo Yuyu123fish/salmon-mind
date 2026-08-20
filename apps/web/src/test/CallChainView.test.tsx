@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { deleteCallChain, fetchCallChain, renameCallChain } from '../codebaseApi.ts'
+import { deleteCallChain, fetchCallChain, fetchCallChainRevision, renameCallChain, type CallChainNodeDetail } from '../codebaseApi.ts'
 import CallChainView from '../CallChainView.tsx'
 
 vi.mock('../codebaseApi.ts', () => ({
@@ -14,11 +14,13 @@ vi.mock('../codebaseApi.ts', () => ({
   },
   deleteCallChain: vi.fn(),
   fetchCallChain: vi.fn(),
+  fetchCallChainRevision: vi.fn(),
   renameCallChain: vi.fn(),
 }))
 
 const api = {
   fetchCallChain: vi.mocked(fetchCallChain),
+  fetchCallChainRevision: vi.mocked(fetchCallChainRevision),
   renameCallChain: vi.mocked(renameCallChain),
   deleteCallChain: vi.mocked(deleteCallChain),
 }
@@ -48,7 +50,28 @@ const detail = {
       endLine: 2,
       source: 'void entry() {\n  service.run();\n}',
       observation: observation(),
-      revisions: [],
+      revisions: [
+        {
+          id: 'revision-old-1',
+          parentRevisionId: null,
+          sourceHash: 'e'.repeat(64),
+          path: 'src/Demo.java',
+          startLine: 1,
+          endLine: 2,
+          observation: observation(),
+          observedAt: '2026-08-19T00:00:00Z',
+        },
+        {
+          id: 'revision-old-2',
+          parentRevisionId: 'revision-old-1',
+          sourceHash: 'f'.repeat(64),
+          path: 'src/Demo.java',
+          startLine: 1,
+          endLine: 2,
+          observation: observation(),
+          observedAt: '2026-08-20T00:00:00Z',
+        },
+      ],
     },
     {
       nodeId: 'c'.repeat(64),
@@ -108,6 +131,31 @@ describe('CallChainView', () => {
     expect(screen.getByRole('button', { name: '确认删除（只删除 SalmonMind 内部调用链）' })).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: '确认删除（只删除 SalmonMind 内部调用链）' }))
     await waitFor(() => expect(api.deleteCallChain).toHaveBeenCalledWith('repo-1', 'chain-1'))
+  })
+
+  it('shows the selected historical source and ignores an older revision response', async () => {
+    let resolveFirst: ((value: CallChainNodeDetail) => void) | undefined
+    let resolveSecond: ((value: CallChainNodeDetail) => void) | undefined
+    api.fetchCallChainRevision.mockImplementation((_repositoryId, _callChainId, _nodeId, revisionId) => {
+      return new Promise<CallChainNodeDetail>((resolve) => {
+        if (revisionId === 'revision-old-1') resolveFirst = resolve
+        else resolveSecond = resolve
+      })
+    })
+    render(<CallChainView repositoryId="repo-1" callChainId="chain-1" fallbackName="入口调用链" />)
+    await screen.findByRole('button', { name: /1\. Demo\.entry/ })
+
+    fireEvent.click(screen.getByRole('button', { name: /eeeeeeeeeeee/ }))
+    fireEvent.click(screen.getByRole('button', { name: /ffffffffffff/ }))
+    await waitFor(() => expect(api.fetchCallChainRevision).toHaveBeenCalledTimes(2))
+
+    resolveFirst?.({ ...detail.nodes[0], revisionId: 'revision-old-1', source: 'stale historical source' })
+    await waitFor(() => expect(screen.getByRole('region', { name: '节点详情' }).querySelector('pre'))
+      .toHaveTextContent('void entry'))
+
+    resolveSecond?.({ ...detail.nodes[0], revisionId: 'revision-old-2', source: 'latest historical source' })
+    await waitFor(() => expect(screen.getByRole('region', { name: '节点详情' }).querySelector('pre'))
+      .toHaveTextContent('latest historical source'))
   })
 })
 

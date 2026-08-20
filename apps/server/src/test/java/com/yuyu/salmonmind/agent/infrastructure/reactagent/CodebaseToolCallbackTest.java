@@ -2,6 +2,7 @@ package com.yuyu.salmonmind.agent.infrastructure.reactagent;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -14,6 +15,7 @@ import com.yuyu.salmonmind.codebase.api.CodebaseService;
 import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService;
 import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService.DirectoryEntry;
 import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService.EvidenceMetadata;
+import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService.GrepResult;
 import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService.ListDirectoryResult;
 import com.yuyu.salmonmind.codebase.api.RepositoryResolution;
 import org.junit.jupiter.api.Test;
@@ -176,6 +178,29 @@ class CodebaseToolCallbackTest {
 
         assertThat(result.path("reason").asText()).isEqualTo("INVALID_QUERY");
         verifyNoEvidenceCalls(evidence);
+    }
+
+    @Test
+    void usesRegexByDefaultAndAllowsExplicitLiteralSearch() throws Exception {
+        UUID repositoryId = UUID.randomUUID();
+        CodebaseService codebase = mock(CodebaseService.class);
+        RepositoryEvidenceService evidence = mock(RepositoryEvidenceService.class);
+        when(codebase.resolveRepository(null)).thenReturn(
+                RepositoryResolution.resolved(repository(repositoryId, "demo")));
+        when(evidence.grep(any())).thenReturn(new GrepResult(
+                metadata(repositoryId, "demo", "grep"), List.of()));
+        CodebaseRunContext context = new CodebaseRunContext(codebase);
+        ToolContext toolContext = new ToolContext(Map.of(CodebaseRunContext.METADATA_KEY, context));
+        CodebaseToolCallback grep = new CodebaseToolCallback(
+                mapper, codebase, evidence, CodebaseToolCallback.Operation.GREP);
+
+        grep.call("{\"pattern\":\"rag|retrieval\"}", toolContext);
+        grep.call("{\"pattern\":\"Map<String, Value>\",\"fixedString\":true}", toolContext);
+
+        verify(evidence).grep(argThat(query -> !query.fixedString()
+                && query.pattern().equals("rag|retrieval")));
+        verify(evidence).grep(argThat(query -> query.fixedString()
+                && query.pattern().equals("Map<String, Value>")));
     }
 
     @Test

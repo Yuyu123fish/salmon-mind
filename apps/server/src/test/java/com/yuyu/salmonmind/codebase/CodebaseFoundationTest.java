@@ -185,6 +185,10 @@ class CodebaseFoundationTest {
 
         GlobResult glob = evidence.glob(new RepositoryEvidenceService.GlobQuery(id, "**/*.java", 200));
         assertThat(glob.paths()).containsExactly("src/Main.java");
+        assertThatThrownBy(() -> evidence.glob(new RepositoryEvidenceService.GlobQuery(
+                id, "src/{main,test}/**/*.java", 200)))
+                .isInstanceOf(CodebaseException.class)
+                .extracting("code").isEqualTo(CodebaseErrorCode.INVALID_QUERY);
 
         GrepResult grep = evidence.grep(new RepositoryEvidenceService.GrepQuery(
                 id, "needle", true, false, 1, 200));

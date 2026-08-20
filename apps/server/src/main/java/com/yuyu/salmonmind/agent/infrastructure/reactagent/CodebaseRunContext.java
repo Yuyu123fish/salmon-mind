@@ -161,6 +161,12 @@ final class CodebaseRunContext {
 
     /** 一 Run 一草稿；新草稿替换旧草稿，不合并模型可能已经过时的图。 */
     synchronized StageSummary stage(String name, List<DraftNode> nodes, List<DraftEdge> edges) {
+        return stage(name, nodes, edges, false);
+    }
+
+    synchronized StageSummary stage(
+            String name, List<DraftNode> nodes, List<DraftEdge> edges, boolean allowUserNameOverride
+    ) {
         if (binding == null) {
             throw failure(CodebaseErrorCode.REPOSITORY_NOT_FOUND, "尚未选择本地仓库");
         }
@@ -172,7 +178,7 @@ final class CodebaseRunContext {
                         "调用链节点没有被本次 Run 的完整 ReadFile 证据覆盖");
             }
         }
-        draft = new Draft(name.trim(), List.copyOf(nodes), List.copyOf(edges));
+        draft = new Draft(name.trim(), List.copyOf(nodes), List.copyOf(edges), allowUserNameOverride);
         return new StageSummary(draft.name(), draft.nodes().size(), draft.edges().size());
     }
 
@@ -194,7 +200,7 @@ final class CodebaseRunContext {
         return new CallChainPrepareRequest(
                 binding.repositoryId(), binding.observation(), draft.name(), nodes,
                 draft.edges().stream().map(edge -> new CallChainEdgeInput(edge.from(), edge.to())).toList(),
-                conversationId, answerEntryId);
+                conversationId, answerEntryId, draft.allowUserNameOverride());
     }
 
     synchronized Binding binding() {
@@ -311,7 +317,8 @@ final class CodebaseRunContext {
     record DraftEdge(String from, String to) {
     }
 
-    private record Draft(String name, List<DraftNode> nodes, List<DraftEdge> edges) {
+    private record Draft(String name, List<DraftNode> nodes, List<DraftEdge> edges,
+                         boolean allowUserNameOverride) {
     }
 
     record Selection(

@@ -179,7 +179,7 @@ class RunSourceRegistryTest {
         RunSourceRegistry.Decoration decoration = registry.decorate(result, 500, Long.MAX_VALUE, "codebase-call");
         JsonNode bounded = mapper.readTree(decoration.result());
 
-        assertThat(decoration.sourceCount()).isZero();
+        assertThat(decoration.sourceCount()).isNull();
         assertThat(decoration.truncated()).isTrue();
         assertThat(bounded.path("sourceKind").asText()).isEqualTo("CODEBASE");
         assertThat(bounded.path("items")).hasSize(1);

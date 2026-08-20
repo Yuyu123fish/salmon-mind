@@ -49,7 +49,8 @@ class CodebaseExceptionHandler {
             case PATH_OUTSIDE_REPOSITORY, SENSITIVE_FILE_DENIED -> HttpStatus.FORBIDDEN;
             case REPOSITORY_UNAVAILABLE, CALL_CHAIN_EVIDENCE_INSUFFICIENT,
                     CALL_CHAIN_PENDING_NOT_FOUND, CALL_CHAIN_REPOSITORY_CHANGED,
-                    CALL_CHAIN_REVISION_UPDATE_REQUIRED, CALL_CHAIN_DATA_ROOT_CONFLICT,
+                    CALL_CHAIN_REVISION_UPDATE_REQUIRED, CALL_CHAIN_MATCH_AMBIGUOUS,
+                    CALL_CHAIN_DATA_ROOT_CONFLICT,
                     CALL_CHAIN_IDENTITY_CONFLICT -> HttpStatus.CONFLICT;
             case UNSUPPORTED_TEXT_FILE -> HttpStatus.UNSUPPORTED_MEDIA_TYPE;
             case GIT_NOT_AVAILABLE, GIT_QUERY_FAILED, CODEBASE_DATA_UNAVAILABLE -> HttpStatus.SERVICE_UNAVAILABLE;
@@ -76,6 +77,7 @@ class CodebaseExceptionHandler {
             case CALL_CHAIN_PENDING_NOT_FOUND -> "调用链待发布记录不存在";
             case CALL_CHAIN_REPOSITORY_CHANGED -> "仓库或源码已发生变化";
             case CALL_CHAIN_REVISION_UPDATE_REQUIRED -> "节点已变化，需要后续 Revision 支持";
+            case CALL_CHAIN_MATCH_AMBIGUOUS -> "调用链匹配存在歧义";
             case CALL_CHAIN_DATA_ROOT_CONFLICT -> "调用链数据目录与目标仓库冲突";
             case CALL_CHAIN_IDENTITY_CONFLICT -> "调用链身份不一致";
             case PATH_OUTSIDE_REPOSITORY -> "路径超出仓库边界";

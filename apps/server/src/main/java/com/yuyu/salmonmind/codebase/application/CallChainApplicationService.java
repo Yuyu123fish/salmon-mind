@@ -8,6 +8,7 @@ import com.yuyu.salmonmind.codebase.api.CallChainNodeInput;
 import com.yuyu.salmonmind.codebase.api.CallChainPrepareRequest;
 import com.yuyu.salmonmind.codebase.api.CallChainQueryService;
 import com.yuyu.salmonmind.codebase.api.CallChainReference;
+import com.yuyu.salmonmind.codebase.api.CallChainNodeDetail;
 import com.yuyu.salmonmind.codebase.api.CallChainSummary;
 import com.yuyu.salmonmind.codebase.api.CodebaseErrorCode;
 import com.yuyu.salmonmind.codebase.api.CodebaseException;
@@ -111,7 +112,7 @@ public final class CallChainApplicationService implements AgentCallChainService,
         CallChainPrepareRequest normalizedRequest = new CallChainPrepareRequest(
                 request.repositoryId(), request.expectedObservation(), request.name().trim(),
                 verified.stream().map(CallChainStorePort.VerifiedNode::input).toList(), request.edges(),
-                request.originConversationId(), request.originAnswerEntryId());
+                request.originConversationId(), request.originAnswerEntryId(), request.allowUserNameOverride());
         return store.prepare(new CallChainStorePort.PrepareInput(
                 location.root(), registration.name(), normalizedRequest, verified, request.edges()));
     }
@@ -132,6 +133,13 @@ public final class CallChainApplicationService implements AgentCallChainService,
     public CallChainDetail detail(UUID repositoryId, UUID callChainId) {
         StoredRepository repository = requireRepository(repositoryId);
         return store.detail(repositoryId, callChainId, repository.name());
+    }
+
+    @Override
+    public CallChainNodeDetail revisionDetail(UUID repositoryId, UUID callChainId,
+                                               String nodeId, UUID revisionId) {
+        StoredRepository repository = requireRepository(repositoryId);
+        return store.revisionDetail(repositoryId, callChainId, nodeId, revisionId);
     }
 
     @Override

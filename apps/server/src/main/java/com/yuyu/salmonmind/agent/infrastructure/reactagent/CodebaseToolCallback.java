@@ -212,7 +212,7 @@ final class CodebaseToolCallback implements ParallelSafeToolCallback {
 
     private String grep(JsonNode root, java.util.UUID repositoryId) {
         String pattern = requiredText(root, "pattern", MAX_PATH_LENGTH);
-        boolean fixedString = optionalBoolean(root, "fixedString", true);
+        boolean fixedString = optionalBoolean(root, "fixedString", false);
         boolean ignoreCase = optionalBoolean(root, "ignoreCase", false);
         Integer contextLines = optionalInteger(root, "contextLines", 0, 3);
         Integer limit = optionalInteger(root, "limit", 1, 500);
@@ -730,7 +730,7 @@ final class CodebaseToolCallback implements ParallelSafeToolCallback {
                 "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512},\"limit\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":500}},\"required\":[\"pattern\"],\"additionalProperties\":false}"),
         GREP(
                 "grep_repository",
-                "在当前 Run 已绑定仓库的受控候选文件中搜索文本或 POSIX extended regex；首次调用会自动绑定 Run 开始时的 Active Repository。只读，结果可能截断。",
+                "在当前 Run 已绑定仓库的受控候选文件中搜索 POSIX extended regex；fixedString 默认 false。需要完整字面量时显式传 fixedString=true，例如 rag|retrieval 使用 regex，Map<String, Value> 使用字面量。首次调用会自动绑定 Run 开始时的 Active Repository。只读，结果可能截断。",
                 Set.of("pattern", "fixedString", "ignoreCase", "contextLines", "limit"),
                 "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512},\"fixedString\":{\"type\":\"boolean\"},\"ignoreCase\":{\"type\":\"boolean\"},\"contextLines\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":3},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":500}},\"required\":[\"pattern\"],\"additionalProperties\":false}"),
         READ(

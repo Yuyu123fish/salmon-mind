@@ -116,20 +116,30 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
             }
             validateEdges(request.edges(), nodeIds.keySet());
 
-            UUID chainId = UUID.randomUUID();
+            MatchedChain matched = findMatchedChain(repositoryDir, request.repositoryId(),
+                    input.nodes().stream().map(CallChainStorePort.VerifiedNode::nodeId).collect(java.util.stream.Collectors.toSet()));
+
+            UUID chainId = matched == null ? UUID.randomUUID() : matched.header().id();
             Instant now = Instant.now();
-            ChainHeader header = new ChainHeader(request.repositoryId(), chainId, now);
+            ChainHeader header = matched == null
+                    ? new ChainHeader(request.repositoryId(), chainId, now) : matched.header();
+            Map<String, UUID> parentRevisions = matched == null ? Map.of()
+                    : matched.current().nodes().stream().collect(java.util.stream.Collectors.toMap(
+                            ChainNodeRef::nodeId, ChainNodeRef::nodeRevisionId));
             List<ChainNodeRef> refs = new ArrayList<>();
             for (CallChainStorePort.VerifiedNode verified : input.nodes()) {
-                NodeState nodeState = prepareNode(repositoryDir, request.repositoryId(), verified, now);
-                refs.add(new ChainNodeRef(nodeState.header().nodeId(), nodeState.current().id(),
+                PreparedNode prepared = prepareNode(repositoryDir, request.repositoryId(), verified, now,
+                        parentRevisions.get(verified.nodeId()));
+                refs.add(new ChainNodeRef(prepared.nodeId(), prepared.revision().id(),
                         verified.input().summary()));
             }
             List<CallChainEdge> edges = request.edges().stream()
                     .map(edge -> new CallChainEdge(nodeIds.get(edge.from()), nodeIds.get(edge.to())))
                     .toList();
+            NameChoice name = nameChoice(request, matched);
             ChainRevision revision = new ChainRevision(
-                    UUID.randomUUID(), null, request.name().trim(), "AGENT", refs, edges,
+                    UUID.randomUUID(), matched == null ? null : matched.current().id(),
+                    matched == null ? null : matched.current().id(), name.name(), name.source(), refs, edges,
                     request.originConversationId(), request.originAnswerEntryId(), now, null);
             writeChain(pending, header, List.of(revision));
             return reference(header, revision);
@@ -150,16 +160,37 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
             Path repositoryDir = repositoryDir(confirmation.repositoryId());
             Path formal = repositoryDir.resolve("call-chains")
                     .resolve(confirmation.callChainId() + ".jsonl");
+            Path pending = repositoryDir.resolve("pending")
+                    .resolve(confirmation.answerEntryId() + ".jsonl");
             if (Files.exists(formal)) {
                 ChainState state = readChain(formal);
                 verifyChainIdentity(state, confirmation.repositoryId(), confirmation.callChainId());
-                if (!confirmation.answerEntryId().equals(state.current().originAnswerEntryId())) {
+                if (confirmation.answerEntryId().equals(state.current().originAnswerEntryId())) {
+                    Files.deleteIfExists(pending);
+                    return reference(state.header(), state.current());
+                }
+                if (state.current().deletedAt() != null) {
+                    throw new CodebaseException(CodebaseErrorCode.CALL_CHAIN_DELETED, "调用链已删除");
+                }
+                if (!Files.isRegularFile(pending)) {
                     throw conflict("调用链确认来源冲突");
                 }
-                return reference(state.header(), state.current());
+                ChainState pendingState = readChain(pending);
+                verifyChainIdentity(pendingState, confirmation.repositoryId(), confirmation.callChainId());
+                ChainRevision pendingRevision = pendingState.current();
+                if (!confirmation.answerEntryId().equals(pendingRevision.originAnswerEntryId())
+                        || pendingRevision.baseRevisionId() == null
+                        || !pendingRevision.baseRevisionId().equals(state.current().id())) {
+                    throw conflict("调用链正式 Revision 已变化");
+                }
+                verifyNodeReferences(repositoryDir, confirmation.repositoryId(), pendingRevision);
+                ChainRevision published = withoutPendingBase(pendingRevision);
+                List<ChainRevision> revisions = new ArrayList<>(state.revisions());
+                revisions.add(published);
+                writeChain(formal, state.header(), revisions);
+                Files.deleteIfExists(pending);
+                return reference(state.header(), published);
             }
-            Path pending = repositoryDir.resolve("pending")
-                    .resolve(confirmation.answerEntryId() + ".jsonl");
             if (!Files.isRegularFile(pending)) {
                 throw new CodebaseException(CodebaseErrorCode.CALL_CHAIN_PENDING_NOT_FOUND,
                         "调用链待发布记录不存在");
@@ -229,6 +260,36 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
     }
 
     @Override
+    public CallChainNodeDetail revisionDetail(
+            UUID repositoryId, UUID callChainId, String nodeId, UUID revisionId
+    ) {
+        ReentrantReadWriteLock lock = lockOf(repositoryId);
+        lock.readLock().lock();
+        try {
+            Path repositoryDir = repositoryDir(repositoryId);
+            ChainState state = readFormal(repositoryId, callChainId);
+            if (state.current().deletedAt() != null) {
+                throw new CodebaseException(CodebaseErrorCode.CALL_CHAIN_DELETED, "调用链已删除");
+            }
+            ChainNodeRef reference = state.revisions().stream()
+                    .flatMap(revision -> revision.nodes().stream())
+                    .filter(value -> value.nodeId().equals(nodeId) && value.nodeRevisionId().equals(revisionId))
+                    .findFirst().orElse(null);
+            if (reference == null) {
+                throw new CodebaseException(CodebaseErrorCode.CALL_CHAIN_NOT_FOUND, "调用链节点不存在");
+            }
+            NodeState node = readNode(repositoryDir(repositoryId).resolve("nodes").resolve(nodeId + ".jsonl"));
+            NodeRevision selected = node.revisions().stream()
+                    .filter(value -> value.id().equals(revisionId)).findFirst()
+                    .orElseThrow(() -> new CodebaseException(CodebaseErrorCode.CALL_CHAIN_NOT_FOUND,
+                            "调用链节点 Revision 不存在"));
+            return nodeDetail(repositoryDir, node, selected, reference.summary());
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    @Override
     public CallChainDetail rename(UUID repositoryId, UUID callChainId, String repositoryName, String name) {
         validateName(name);
         ReentrantReadWriteLock lock = lockOf(repositoryId);
@@ -240,7 +301,7 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
                 throw new CodebaseException(CodebaseErrorCode.CALL_CHAIN_DELETED, "调用链已删除");
             }
             ChainRevision next = new ChainRevision(
-                    UUID.randomUUID(), current.id(), name.trim(), "USER", current.nodes(), current.edges(),
+                    UUID.randomUUID(), current.id(), null, name.trim(), "USER", current.nodes(), current.edges(),
                     current.originConversationId(), current.originAnswerEntryId(), Instant.now(), null);
             List<ChainRevision> revisions = new ArrayList<>(state.revisions());
             revisions.add(next);
@@ -262,7 +323,7 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
                 throw new CodebaseException(CodebaseErrorCode.CALL_CHAIN_DELETED, "调用链已删除");
             }
             ChainRevision next = new ChainRevision(
-                    UUID.randomUUID(), current.id(), current.name(), current.nameSource(), current.nodes(),
+                    UUID.randomUUID(), current.id(), null, current.name(), current.nameSource(), current.nodes(),
                     current.edges(), current.originConversationId(), current.originAnswerEntryId(), Instant.now(),
                     Instant.now());
             List<ChainRevision> revisions = new ArrayList<>(state.revisions());
@@ -274,8 +335,12 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
         }
     }
 
-    private NodeState prepareNode(
-            Path repositoryDir, UUID repositoryId, CallChainStorePort.VerifiedNode verified, Instant now
+    private PreparedNode prepareNode(
+            Path repositoryDir,
+            UUID repositoryId,
+            CallChainStorePort.VerifiedNode verified,
+            Instant now,
+            UUID parentRevisionId
     ) {
         CallChainNodeInput input = verified.input();
         Path nodesDir = repositoryDir.resolve("nodes");
@@ -286,12 +351,25 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
             if (!repositoryId.equals(state.header().repositoryId())) {
                 throw corrupted("Node Header 仓库身份不一致");
             }
-            NodeRevision latest = state.current();
-            if (!latest.sourceHash().equals(verified.sourceHash()) || !latest.path().equals(input.path())) {
-                throw new CodebaseException(CodebaseErrorCode.CALL_CHAIN_REVISION_UPDATE_REQUIRED,
-                        "已有代码节点需要后续 Revision 处理");
+            NodeRevision same = state.revisions().stream()
+                    .filter(value -> sameMaterial(value, verified))
+                    .findFirst().orElse(null);
+            if (same != null) {
+                ensureSource(repositoryDir, verified.sourceHash(), verified.source());
+                return new PreparedNode(state.header().nodeId(), same);
             }
-            return state;
+            if (parentRevisionId != null && state.revisions().stream()
+                    .noneMatch(value -> value.id().equals(parentRevisionId))) {
+                throw corrupted("节点 Revision 父引用不存在");
+            }
+            NodeRevision revision = new NodeRevision(
+                    UUID.randomUUID(), parentRevisionId, verified.sourceHash(), input.path(),
+                    input.startLine(), input.endLine(), verified.observation(), now);
+            List<NodeRevision> revisions = new ArrayList<>(state.revisions());
+            revisions.add(revision);
+            writeNode(nodeFile, state.header(), revisions);
+            ensureSource(repositoryDir, verified.sourceHash(), verified.source());
+            return new PreparedNode(state.header().nodeId(), revision);
         }
         NodeHeader header = new NodeHeader(
                 repositoryId,
@@ -301,11 +379,107 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
                 UUID.randomUUID(), null, verified.sourceHash(), input.path(), input.startLine(), input.endLine(),
                 verified.observation(), now);
         writeNode(nodeFile, header, List.of(revision));
-        Path source = repositoryDir.resolve("sources").resolve(verified.sourceHash() + ".txt");
+        ensureSource(repositoryDir, verified.sourceHash(), verified.source());
+        return new PreparedNode(header.nodeId(), revision);
+    }
+
+    private boolean sameMaterial(NodeRevision revision, CallChainStorePort.VerifiedNode verified) {
+        CallChainNodeInput input = verified.input();
+        return revision.sourceHash().equals(verified.sourceHash())
+                && revision.path().equals(input.path())
+                && revision.startLine() == input.startLine()
+                && revision.endLine() == input.endLine();
+    }
+
+    private void ensureSource(Path repositoryDir, String sourceHash, String sourceContent) {
+        Path source = repositoryDir.resolve("sources").resolve(sourceHash + ".txt");
         if (!Files.exists(source)) {
-            writeAtomic(source, verified.source(), false);
+            writeAtomic(source, sourceContent, false);
+            return;
         }
-        return new NodeState(header, List.of(revision));
+        try {
+            String existing = Files.readString(source, StandardCharsets.UTF_8);
+            if (!hash(existing).equals(sourceHash)) {
+                throw corrupted("源码快照哈希不一致");
+            }
+        } catch (IOException ex) {
+            throw unavailable("调用链源码快照不可读", ex);
+        }
+    }
+
+    /** 在 Repository 写锁内只按稳定 Node ID 匹配正式链，名称与路径不参与选择。 */
+    private MatchedChain findMatchedChain(Path repositoryDir, UUID repositoryId, Set<String> draftNodeIds) {
+        List<ChainState> active = readFormalChains(repositoryDir, repositoryId).stream()
+                .filter(state -> state.current().deletedAt() == null)
+                .toList();
+        List<ChainState> exact = active.stream()
+                .filter(state -> nodeIds(state.current()).equals(draftNodeIds))
+                .toList();
+        if (exact.size() > 1) {
+            throw new CodebaseException(CodebaseErrorCode.CALL_CHAIN_MATCH_AMBIGUOUS,
+                    "调用链精确匹配存在歧义");
+        }
+        if (exact.size() == 1) {
+            ChainState state = exact.getFirst();
+            return new MatchedChain(state.header(), state.current());
+        }
+        List<ChainState> shared = active.stream()
+                .filter(state -> sharedNodeCount(state.current(), draftNodeIds) >= 2)
+                .toList();
+        if (shared.size() > 1) {
+            throw new CodebaseException(CodebaseErrorCode.CALL_CHAIN_MATCH_AMBIGUOUS,
+                    "调用链共享节点匹配存在歧义");
+        }
+        if (shared.size() == 1) {
+            ChainState state = shared.getFirst();
+            return new MatchedChain(state.header(), state.current());
+        }
+        return null;
+    }
+
+    private List<ChainState> readFormalChains(Path repositoryDir, UUID repositoryId) {
+        Path formalDir = repositoryDir.resolve("call-chains");
+        if (!Files.isDirectory(formalDir)) {
+            return List.of();
+        }
+        List<ChainState> result = new ArrayList<>();
+        try (DirectoryStream<Path> files = Files.newDirectoryStream(formalDir, "*.jsonl")) {
+            for (Path file : files) {
+                ChainState state = readChain(file);
+                verifyChainIdentity(state, repositoryId, state.header().id());
+                result.add(state);
+            }
+            return List.copyOf(result);
+        } catch (IOException ex) {
+            throw unavailable("调用链数据目录不可用", ex);
+        }
+    }
+
+    private Set<String> nodeIds(ChainRevision revision) {
+        return revision.nodes().stream().map(ChainNodeRef::nodeId).collect(java.util.stream.Collectors.toSet());
+    }
+
+    private int sharedNodeCount(ChainRevision revision, Set<String> draftNodeIds) {
+        Set<String> existing = nodeIds(revision);
+        existing.retainAll(draftNodeIds);
+        return existing.size();
+    }
+
+    private NameChoice nameChoice(CallChainPrepareRequest request, MatchedChain matched) {
+        if (matched == null) {
+            return new NameChoice(request.name().trim(), "AGENT");
+        }
+        ChainRevision current = matched.current();
+        if ("USER".equals(current.nameSource()) && !request.allowUserNameOverride()) {
+            return new NameChoice(current.name(), "USER");
+        }
+        return new NameChoice(request.name().trim(), "USER".equals(current.nameSource()) ? "USER" : "AGENT");
+    }
+
+    private ChainRevision withoutPendingBase(ChainRevision revision) {
+        return new ChainRevision(revision.id(), revision.parentRevisionId(), null, revision.name(),
+                revision.nameSource(), revision.nodes(), revision.edges(), revision.originConversationId(),
+                revision.originAnswerEntryId(), revision.createdAt(), revision.deletedAt());
     }
 
     private void verifyNodeReferences(Path repositoryDir, UUID repositoryId, ChainRevision revision) {
@@ -341,20 +515,26 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
             NodeRevision selected = node.revisions().stream()
                     .filter(value -> value.id().equals(reference.nodeRevisionId())).findFirst()
                     .orElseThrow(() -> corrupted("调用链引用了不存在的节点 Revision"));
-            String source = readSource(repositoryDir, selected.sourceHash());
-            List<NodeRevisionView> revisions = node.revisions().stream()
-                    .map(value -> new NodeRevisionView(value.id(), value.parentRevisionId(), value.sourceHash(),
-                            value.path(), value.startLine(), value.endLine(), value.observation(), value.observedAt()))
-                    .toList();
-            nodes.add(new CallChainNodeDetail(
-                    node.header().nodeId(), selected.id(), node.header().language(), node.header().qualifiedSymbol(),
-                    node.header().normalizedSignature(), reference.summary(), selected.sourceHash(), selected.path(),
-                    selected.startLine(), selected.endLine(), source, selected.observation(), revisions));
+            nodes.add(nodeDetail(repositoryDir, node, selected, reference.summary()));
         }
         List<CallChainEdge> edges = List.copyOf(revision.edges());
         return new CallChainDetail(state.header().id(), state.header().repositoryId(), repositoryName,
                 revision.name(), revision.nodes().size(), edges.size(), revision.originConversationId(),
                 revision.originAnswerEntryId(), state.header().createdAt(), revision.createdAt(), nodes, edges);
+    }
+
+    private CallChainNodeDetail nodeDetail(
+            Path repositoryDir, NodeState node, NodeRevision selected, String summary
+    ) {
+        String source = readSource(repositoryDir, selected.sourceHash());
+        List<NodeRevisionView> revisions = node.revisions().stream()
+                .map(value -> new NodeRevisionView(value.id(), value.parentRevisionId(), value.sourceHash(),
+                        value.path(), value.startLine(), value.endLine(), value.observation(), value.observedAt()))
+                .toList();
+        return new CallChainNodeDetail(
+                node.header().nodeId(), selected.id(), node.header().language(), node.header().qualifiedSymbol(),
+                node.header().normalizedSignature(), summary, selected.sourceHash(), selected.path(),
+                selected.startLine(), selected.endLine(), source, selected.observation(), revisions);
     }
 
     private String readSource(Path repositoryDir, String sourceHash) {
@@ -391,9 +571,11 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
     ) {
         verifyChainIdentity(state, request.repositoryId(), state.header().id());
         ChainRevision current = state.current();
+        String expectedName = "USER".equals(current.nameSource()) && !request.allowUserNameOverride()
+                ? current.name() : request.name().trim();
         if (!request.originAnswerEntryId().equals(current.originAnswerEntryId())
                 || !request.originConversationId().equals(current.originConversationId())
-                || !request.name().trim().equals(current.name())
+                || !expectedName.equals(current.name())
                 || input == null || input.nodes() == null
                 || input.nodes().size() != current.nodes().size()
                 || input.edges() == null || input.edges().size() != current.edges().size()) {
@@ -519,19 +701,17 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
                 requiredText(header, "normalizedSignature"), requiredNodeId(header, "nodeId"),
                 requiredInstant(header, "createdAt"));
         List<NodeRevision> revisions = new ArrayList<>();
-        UUID previous = null;
         for (JsonNode line : lines.subList(1, lines.size())) {
             ensureType(line, "REVISION");
             NodeRevision revision = parseNodeRevision(line);
-            if (revision.parentRevisionId() == null ? previous != null
-                    : !revision.parentRevisionId().equals(previous)) {
+            if (revision.parentRevisionId() != null
+                    && revisions.stream().noneMatch(value -> value.id().equals(revision.parentRevisionId()))) {
                 throw corrupted("Node Revision 父链断裂");
             }
             if (revisions.stream().anyMatch(value -> value.id().equals(revision.id()))) {
                 throw corrupted("Node Revision 身份重复");
             }
             revisions.add(revision);
-            previous = revision.id();
         }
         return new NodeState(parsedHeader, List.copyOf(revisions));
     }
@@ -546,19 +726,25 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
         ChainHeader parsedHeader = new ChainHeader(requiredUuid(header, "repositoryId"),
                 requiredUuid(header, "callChainId"), requiredInstant(header, "createdAt"));
         List<ChainRevision> revisions = new ArrayList<>();
-        UUID previous = null;
         for (JsonNode line : lines.subList(1, lines.size())) {
             ensureType(line, "REVISION");
             ChainRevision revision = parseChainRevision(line);
-            if (revision.parentRevisionId() == null ? previous != null
-                    : !revision.parentRevisionId().equals(previous)) {
+            boolean externalPendingParent = revisions.isEmpty()
+                    && revision.baseRevisionId() != null
+                    && revision.baseRevisionId().equals(revision.parentRevisionId());
+            if (revision.parentRevisionId() != null
+                    && revisions.stream().noneMatch(value -> value.id().equals(revision.parentRevisionId()))
+                    && !externalPendingParent) {
                 throw corrupted("Call Chain Revision 父链断裂");
+            }
+            if (revision.baseRevisionId() != null && !externalPendingParent
+                    && revisions.stream().noneMatch(value -> value.id().equals(revision.baseRevisionId()))) {
+                throw corrupted("Call Chain pending 基线断裂");
             }
             if (revisions.stream().anyMatch(value -> value.id().equals(revision.id()))) {
                 throw corrupted("Call Chain Revision 身份重复");
             }
             revisions.add(revision);
-            previous = revision.id();
         }
         return new ChainState(parsedHeader, List.copyOf(revisions));
     }
@@ -653,6 +839,7 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
         node.put("formatVersion", FORMAT_VERSION);
         node.put("revisionId", value.id().toString());
         putUuid(node, "parentRevisionId", value.parentRevisionId());
+        putUuid(node, "baseRevisionId", value.baseRevisionId());
         node.put("name", value.name());
         node.put("nameSource", value.nameSource());
         ArrayNode nodes = node.putArray("nodes");
@@ -727,8 +914,12 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
             }
             edges.add(new CallChainEdge(from, to));
         }
+        String nameSource = requiredText(node, "nameSource");
+        if (!"AGENT".equals(nameSource) && !"USER".equals(nameSource)) {
+            throw corrupted("调用链名称归属无效");
+        }
         return new ChainRevision(requiredUuid(node, "revisionId"), nullableUuid(node, "parentRevisionId"),
-                requiredText(node, "name"), requiredText(node, "nameSource"), nodes, edges,
+                nullableUuid(node, "baseRevisionId"), requiredText(node, "name"), nameSource, nodes, edges,
                 requiredUuid(node, "originConversationId"), requiredUuid(node, "originAnswerEntryId"),
                 requiredInstant(node, "createdAt"), nullableInstant(node, "deletedAt"));
     }
@@ -935,7 +1126,8 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
     private record ChainNodeRef(String nodeId, UUID nodeRevisionId, String summary) {
     }
 
-    private record ChainRevision(UUID id, UUID parentRevisionId, String name, String nameSource,
+    private record ChainRevision(UUID id, UUID parentRevisionId, UUID baseRevisionId,
+                                 String name, String nameSource,
                                  List<ChainNodeRef> nodes, List<CallChainEdge> edges,
                                  UUID originConversationId, UUID originAnswerEntryId,
                                  Instant createdAt, Instant deletedAt) {
@@ -947,6 +1139,15 @@ public final class FileSystemCallChainStore implements CallChainStorePort {
 
     private record ChainState(ChainHeader header, List<ChainRevision> revisions) {
         ChainRevision current() { return revisions.getLast(); }
+    }
+
+    private record PreparedNode(String nodeId, NodeRevision revision) {
+    }
+
+    private record MatchedChain(ChainHeader header, ChainRevision current) {
+    }
+
+    private record NameChoice(String name, String source) {
     }
 
 }

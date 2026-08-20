@@ -37,6 +37,7 @@ mvn -f apps/server/pom.xml spring-boot:run
 - RustFS、Elasticsearch 和模型未配置时不做静默假实现；只有实际调用对应能力时才失败。
 - 网页搜索由 Server 侧 `salmon.websearch.bocha.*` 与 `salmon.websearch.search-api.*` 配置；博查使用原始 Web Search，SearchApi.io 使用 Google `organic_results`。两个 `api-key` 必须只放在被忽略的 `application-dev.yml` 或环境变量 `BOCHA_SEARCH_API_KEY` / `SEARCH_API_API_KEY`，不会发送到浏览器或 URL。
 - Agent 上下文边界可通过 `salmon.agent.max-tool-result-tokens-per-run`（环境变量 `AGENT_MAX_TOOL_RESULT_TOKENS_PER_RUN`，默认 32768）和 `salmon.agent.max-steps`（环境变量 `AGENT_MAX_STEPS`，默认 32）调整；两项均可选，修改后需重启后端，前者不能超过主输入触发阈值。
+- 代码库工具使用独立预算：`salmon.agent.codebase.max-tool-calls-per-run` / `SALMON_AGENT_CODEBASE_MAX_TOOL_CALLS_PER_RUN`（默认 12）、`salmon.agent.codebase.max-tool-result-tokens-per-run` / `SALMON_AGENT_CODEBASE_MAX_TOOL_RESULT_TOKENS_PER_RUN`（默认 32768）和 `salmon.agent.codebase.max-tool-result-chars` / `SALMON_AGENT_CODEBASE_MAX_TOOL_RESULT_CHARS`（默认 65536）；三项只允许下调，修改后需重启后端。
 - 非敏感配置以 [application.yml](../apps/server/src/main/resources/application.yml) 为准；敏感配置以 [application-dev-example.yml](../apps/server/src/main/resources/application-dev-example.yml) 为模板。
 
 ### Conversation Cache 与虚拟线程

@@ -58,6 +58,11 @@ salmon:
       tool-execution-timeout: 60s
     # 可选：一次主调用内所有工具结果的累计 token 上限；默认 32768，修改后重启后端生效
     max-tool-result-tokens-per-run: 32768
+    codebase:
+      # 可选：本地代码库工具独立预算；默认值可下调，修改后重启后端生效
+      max-tool-calls-per-run: 12
+      max-tool-result-tokens-per-run: 32768
+      max-tool-result-chars: 65536
     # 可选：一次 Agent Loop 的模型调用硬上限；默认 32，修改后重启后端生效
     max-steps: 32
   redis:

@@ -100,4 +100,38 @@ describe('RunTracePanel', () => {
     expect(screen.getByText('INDEX_UNAVAILABLE')).toBeVisible()
     expect(screen.getByText(/RETRIEVAL_UNAVAILABLE/)).toBeVisible()
   })
+
+  it('labels all codebase tools with safe Chinese summaries', () => {
+    const toolNames = [
+      'select_local_repository',
+      'list_repository_directory',
+      'glob_repository_files',
+      'grep_repository',
+      'read_repository_file',
+      'git_repository_status',
+      'git_repository_diff',
+      'git_repository_log',
+      'git_repository_show',
+      'git_repository_blame',
+    ]
+    const codebaseTrace: RunTraceItem[] = toolNames.map((toolName, index) => ({
+      kind: 'TOOL',
+      toolCallId: `codebase-${index}`,
+      toolName,
+      toolStatus: 'COMPLETED',
+      safeSummary: '只读代码库结果',
+      stableErrorCode: null,
+      truncated: false,
+    }))
+    render(<RunTracePanel trace={codebaseTrace} expanded />)
+
+    expect(screen.getByText('选择本地仓库')).toBeVisible()
+    expect(screen.getByText('浏览仓库目录')).toBeVisible()
+    expect(screen.getAllByText('搜索仓库源码')).toHaveLength(2)
+    expect(screen.getByText('读取仓库文件')).toBeVisible()
+    expect(screen.getByText('查看 Git 状态')).toBeVisible()
+    expect(screen.getByText('查看 Git 差异')).toBeVisible()
+    expect(screen.getAllByText('查看 Git 历史')).toHaveLength(3)
+  })
+
 })

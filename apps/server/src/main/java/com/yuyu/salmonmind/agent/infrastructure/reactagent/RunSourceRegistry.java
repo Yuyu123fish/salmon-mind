@@ -44,7 +44,16 @@ final class RunSourceRegistry {
             "RERANK_UNAVAILABLE", "INDEX_UNAVAILABLE", "READY_SCOPE_TOO_LARGE", "INVALID_QUERY",
             "RETRIEVAL_UNAVAILABLE", "TOOL_BUDGET_EXCEEDED", "NOT_CONFIGURED", "AUTH_FAILED",
             "RATE_LIMITED", "TIMEOUT", "PROVIDER_FAILED", "INVALID_RESPONSE", "USER_DISABLED",
-            "TOOL_CALL_BUDGET_EXCEEDED", "TOOL_CONTEXT_BUDGET_EXCEEDED");
+            "TOOL_CALL_BUDGET_EXCEEDED", "TOOL_CONTEXT_BUDGET_EXCEEDED",
+            "RESOLVED", "ITEM_LIMIT", "RESPONSE_LIMIT", "SCAN_LIMIT", "CANDIDATE_LIMIT",
+            "INVALID_ABSOLUTE_PATH", "PATH_NOT_DIRECTORY", "PATH_NOT_READABLE", "NOT_GIT_REPOSITORY",
+            "BARE_REPOSITORY_NOT_SUPPORTED", "SENSITIVE_FILE_DENIED", "UNSUPPORTED_TEXT_FILE",
+            "CODEBASE_UNAVAILABLE", "REPOSITORY_NOT_SELECTED", "REPOSITORY_SELECTION_REQUIRED",
+            "MULTIPLE_REPOSITORIES_NOT_SUPPORTED", "REFERENCE_NOT_FOUND",
+            "PATH_NOT_FOUND", "PATH_OUTSIDE_REPOSITORY", "REPOSITORY_NOT_FOUND",
+            "REPOSITORY_UNAVAILABLE", "GIT_NOT_AVAILABLE", "GIT_QUERY_FAILED",
+            "GIT_QUERY_TIMEOUT", "CODEBASE_DATA_CORRUPTED", "CODEBASE_DATA_UNAVAILABLE",
+            "CODEBASE_INTERNAL_ERROR", "CODEBASE_ACCESS_DISABLED");
 
     private final ObjectMapper mapper;
     private final Map<String, AgentCitation> citations = new LinkedHashMap<>();
@@ -96,6 +105,9 @@ final class RunSourceRegistry {
         String provider = text(envelope, "provider");
         AgentToolOutcomeDetail.ResultStatus resultStatus = resultStatus(envelope);
         String stableReasonCode = stableReasonCode(text(envelope, "reason"));
+        if ("CODEBASE".equals(kind)) {
+            return decorateCodebase(envelope, maxChars, maxTokens, resultStatus, stableReasonCode);
+        }
         Set<String> newlyRegistered = new LinkedHashSet<>();
         ArrayNode decoratedItems = mapper.createArrayNode();
         for (JsonNode item : items) {
@@ -167,6 +179,69 @@ final class RunSourceRegistry {
                 resultStatus,
                 stableReasonCode,
                 Set.copyOf(newlyRegistered));
+    }
+
+    private Decoration decorateCodebase(
+            ObjectNode envelope,
+            int maxChars,
+            long maxTokens,
+            AgentToolOutcomeDetail.ResultStatus resultStatus,
+            String stableReasonCode
+    ) {
+        ArrayNode originalItems = envelope.withArray("items");
+        ArrayNode boundedItems = mapper.createArrayNode();
+        for (JsonNode item : originalItems) {
+            if (item != null && item.isObject()) {
+                boundedItems.add(item.deepCopy());
+            }
+        }
+        envelope.set("items", boundedItems);
+        boolean truncated = envelope.path("truncated").asBoolean(false);
+        while ((serializedLength(envelope) > maxChars
+                || ToolLifecycleInterceptor.estimateToolResultTokens(serialize(envelope)) > maxTokens)
+                && boundedItems.size() > 0) {
+            boundedItems.remove(boundedItems.size() - 1);
+            truncated = true;
+        }
+        envelope.put("resultCount", boundedItems.size());
+        JsonNode coverageNode = envelope.get("coverage");
+        if (coverageNode != null && coverageNode.isObject()) {
+            ObjectNode coverage = (ObjectNode) coverageNode;
+            coverage.put("resultCount", boundedItems.size());
+            coverage.put("truncated", truncated);
+            if (truncated && !coverage.has("truncationReason")) {
+                coverage.put("truncationReason", "TOOL_RESULT_LIMIT");
+            }
+        }
+        if (truncated) {
+            envelope.put("truncated", true);
+            if (!envelope.has("truncationReason")) {
+                envelope.put("truncationReason", "TOOL_RESULT_LIMIT");
+            }
+        }
+        if (!envelope.has("continuation")) {
+            envelope.putNull("continuation");
+        }
+        String serialized = serialize(envelope);
+        long estimatedTokens = ToolLifecycleInterceptor.estimateToolResultTokens(serialized);
+        boolean withinTokenBudget = estimatedTokens <= maxTokens && serialized.length() <= maxChars;
+        if (!withinTokenBudget) {
+            envelope.put("status", "UNAVAILABLE");
+            envelope.put("reason", "TOOL_CONTEXT_BUDGET_EXCEEDED");
+            serialized = serialize(envelope);
+            estimatedTokens = ToolLifecycleInterceptor.estimateToolResultTokens(serialized);
+        }
+        return new Decoration(
+                serialized,
+                "CODEBASE",
+                0,
+                truncated,
+                resultStatus == AgentToolOutcomeDetail.ResultStatus.DEGRADED || truncated,
+                estimatedTokens,
+                withinTokenBudget,
+                resultStatus,
+                stableReasonCode,
+                Set.of());
     }
 
     /**

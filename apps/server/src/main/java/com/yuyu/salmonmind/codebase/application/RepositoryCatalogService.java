@@ -5,6 +5,7 @@ import com.yuyu.salmonmind.codebase.api.CodebaseErrorCode;
 import com.yuyu.salmonmind.codebase.api.CodebaseException;
 import com.yuyu.salmonmind.codebase.api.CodebaseService;
 import com.yuyu.salmonmind.codebase.api.PlatformView;
+import com.yuyu.salmonmind.codebase.api.RepositoryResolution;
 import com.yuyu.salmonmind.codebase.api.RepositoryView;
 import com.yuyu.salmonmind.codebase.api.SearchRootView;
 import com.yuyu.salmonmind.codebase.application.port.CatalogState;
@@ -313,4 +314,170 @@ public final class RepositoryCatalogService implements CodebaseService {
         return new PlatformView(os, windows ? "\\\\" : "/", windows,
                 windows ? "D:\\project\\repo" : "/home/user/project/repo");
     }
+
+    @Override
+    public RepositoryResolution resolveRepository(String reference) {
+        lock.writeLock().lock();
+        try {
+            String value = reference == null ? null : reference.trim();
+            if (value == null || value.isBlank()) {
+                return resolveActive();
+            }
+
+            Path absolute = tryAbsolute(value);
+            if (absolute != null) {
+                try {
+                    return RepositoryResolution.resolved(
+                            resolvedRepository(registerForResolution(paths.requireRepositoryRoot(absolute.toString()))));
+                } catch (CodebaseException ex) {
+                    return RepositoryResolution.notFound(ex.code().name());
+                }
+            }
+
+            CatalogState snapshot = store.snapshot();
+            List<StoredRepository> named = snapshot.repositories().values().stream()
+                    .filter(StoredRepository::registered)
+                    .filter(repository -> matchesReference(repository, value))
+                    .toList();
+            if (!named.isEmpty()) {
+                if (distinctRepositoryIds(named).size() > 1) {
+                    return RepositoryResolution.selectionRequired(candidatesOf(named), named.size() > 20);
+                }
+                try {
+                    return RepositoryResolution.resolved(
+                            resolvedRepository(paths.resolveRegistered(named.getFirst()).registration()));
+                } catch (CodebaseException ex) {
+                    return RepositoryResolution.notFound(ex.code().name());
+                }
+            }
+
+            if (!isDirectChildReference(value)) {
+                return RepositoryResolution.notFound("REFERENCE_NOT_FOUND");
+            }
+            List<Path> discovered = discoverDirectChildren(snapshot.searchRoots(), value);
+            if (discovered.size() > 1) {
+                return RepositoryResolution.selectionRequired(
+                        discovered.stream().limit(20).map(this::candidateOf).toList(), discovered.size() > 20);
+            }
+            if (discovered.size() == 1) {
+                try {
+                    return RepositoryResolution.resolved(
+                            resolvedRepository(registerForResolution(discovered.getFirst())));
+                } catch (CodebaseException ex) {
+                    return RepositoryResolution.notFound(ex.code().name());
+                }
+            }
+            return RepositoryResolution.notFound("REFERENCE_NOT_FOUND");
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private RepositoryResolution resolveActive() {
+        UUID activeId = store.snapshot().activeRepositoryId();
+        if (activeId == null) {
+            return RepositoryResolution.notFound("REPOSITORY_NOT_SELECTED");
+        }
+        try {
+            StoredRepository active = requireRegistered(activeId);
+            return RepositoryResolution.resolved(
+                    resolvedRepository(paths.resolveRegistered(active).registration()));
+        } catch (CodebaseException ex) {
+            return RepositoryResolution.notFound(ex.code().name());
+        }
+    }
+
+    /** 解析成功后的唯一写入点；不调用 registerRepository，避免隐式改变 Active。 */
+    private StoredRepository registerForResolution(Path root) {
+        CatalogState snapshot = store.snapshot();
+        StoredRepository existing = findByRealPath(snapshot.repositories().values(), root);
+        Instant now = Instant.now();
+        if (existing != null) {
+            StoredRepository restored = new StoredRepository(existing.id(), root.toString(), existing.name(),
+                    existing.aliases(), true, existing.createdAt(), now);
+            if (!sameRecord(existing, restored)) {
+                store.saveRepository(restored);
+            }
+            return restored;
+        }
+        StoredRepository created = new StoredRepository(UUID.randomUUID(), root.toString(),
+                normalizeName(null, root), List.of(), true, now, now);
+        store.saveRepository(created);
+        return created;
+    }
+
+    private RepositoryResolution.ResolvedRepository resolvedRepository(StoredRepository repository) {
+        RepositoryView view = viewOf(repository);
+        return new RepositoryResolution.ResolvedRepository(view.id(), view.name(), view.path(),
+                !"UNAVAILABLE".equals(view.status()), view.status(), view.branch(), view.head(), view.dirty());
+    }
+
+    private List<Path> discoverDirectChildren(List<StoredSearchRoot> roots, String name) {
+        List<Path> result = new ArrayList<>();
+        for (StoredSearchRoot root : roots) {
+            try {
+                Path rootPath = Path.of(root.path()).toAbsolutePath().normalize();
+                Path candidate = rootPath.resolve(name).normalize();
+                if (!candidate.getParent().equals(rootPath) || !Files.exists(candidate)) {
+                    continue;
+                }
+                Path resolved = paths.requireRepositoryRoot(candidate.toString());
+                if (result.stream().noneMatch(existing -> samePath(existing, resolved))) {
+                    result.add(resolved);
+                }
+            } catch (RuntimeException ignored) {
+                // Search Root 只提供候选目录；不存在、非 Git 或不可访问的子项不是候选。
+            }
+        }
+        return result;
+    }
+
+    private RepositoryResolution.Candidate candidateOf(Path root) {
+        String name = root.getFileName() == null ? root.toString() : root.getFileName().toString();
+        return new RepositoryResolution.Candidate(name, root.toString(), true);
+    }
+
+    private List<RepositoryResolution.Candidate> candidatesOf(List<StoredRepository> repositories) {
+        return repositories.stream()
+                .sorted((left, right) -> left.path().compareToIgnoreCase(right.path()))
+                .limit(20)
+                .map(repository -> {
+                    boolean accessible;
+                    try {
+                        paths.resolveRegistered(repository);
+                        accessible = true;
+                    } catch (RuntimeException ex) {
+                        accessible = false;
+                    }
+                    return new RepositoryResolution.Candidate(repository.name(), repository.path(), accessible);
+                })
+                .toList();
+    }
+
+    private List<UUID> distinctRepositoryIds(List<StoredRepository> repositories) {
+        return repositories.stream().map(StoredRepository::id).distinct().toList();
+    }
+
+    private boolean matchesReference(StoredRepository repository, String reference) {
+        if (repository.name().equalsIgnoreCase(reference)) {
+            return true;
+        }
+        return repository.aliases().stream().anyMatch(alias -> alias.equalsIgnoreCase(reference));
+    }
+
+    private boolean isDirectChildReference(String value) {
+        return !value.equals(".") && !value.equals("..")
+                && !value.contains("/") && !value.contains("\\")
+                && !value.contains("\0");
+    }
+
+    private Path tryAbsolute(String value) {
+        try {
+            Path path = Path.of(value);
+            return path.isAbsolute() ? path.normalize() : null;
+        } catch (RuntimeException ex) {
+            return null;
+        }
+    }
+
 }

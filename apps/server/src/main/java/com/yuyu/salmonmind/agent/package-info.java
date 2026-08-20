@@ -1,5 +1,5 @@
 @ApplicationModule(allowedDependencies = {
-        "model :: chat", "persistence :: redis", "knowledge :: retrieval", "websearch :: api"
+        "model :: chat", "persistence :: redis", "knowledge :: retrieval", "websearch :: api", "codebase :: api"
 })
 package com.yuyu.salmonmind.agent;
 

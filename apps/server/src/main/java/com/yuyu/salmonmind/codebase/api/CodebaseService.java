@@ -26,6 +26,9 @@ public interface CodebaseService {
     /** 选择已注册且当前可解析的仓库，传 null 显式清空 Active。 */
     CodebaseCatalogView setActiveRepository(UUID repositoryId);
 
+    /** 按一次用户消息中的完整引用精确解析；空白引用使用 Active，非空失败不回退 Active。 */
+    RepositoryResolution resolveRepository(String reference);
+
     /** 授权一个绝对 Search Root；重复真实目录返回既有授权。 */
     SearchRootView addSearchRoot(String absolutePath);
 

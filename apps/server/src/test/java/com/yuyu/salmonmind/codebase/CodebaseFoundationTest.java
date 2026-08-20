@@ -5,6 +5,7 @@ import com.yuyu.salmonmind.codebase.api.CodebaseErrorCode;
 import com.yuyu.salmonmind.codebase.api.CodebaseException;
 import com.yuyu.salmonmind.codebase.api.CodebaseCatalogView;
 import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService;
+import com.yuyu.salmonmind.codebase.api.RepositoryResolution;
 import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService.GitBlameResult;
 import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService.GitDiffResult;
 import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService.GitLogResult;
@@ -33,6 +34,7 @@ import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -109,6 +111,38 @@ class CodebaseFoundationTest {
                 .isEqualTo(repository.toRealPath().toString());
     }
 
+    @Test
+    void resolvesExactReferencesWithoutChangingActiveOrFallingBack() throws Exception {
+        var active = catalog.catalog().repositories().getFirst();
+        catalog.updateRepository(active.id(), "primary", List.of("main-alias"));
+        UUID activeId = active.id();
+
+        assertThat(catalog.resolveRepository(null).status()).isEqualTo(RepositoryResolution.Status.RESOLVED);
+        assertThat(catalog.resolveRepository("MAIN-ALIAS").repository().id()).isEqualTo(activeId);
+        assertThat(catalog.resolveRepository(repository.toString().replace('\\', '/')).repository().id())
+                .isEqualTo(activeId);
+        assertThat(catalog.catalog().activeRepositoryId()).isEqualTo(activeId);
+
+        Path discovered = createGitRepository("discovered-repository");
+        catalog.addSearchRoot(temporaryDirectory.toString());
+        RepositoryResolution discoveredResolution = catalog.resolveRepository(discovered.getFileName().toString());
+        assertThat(discoveredResolution.status()).isEqualTo(RepositoryResolution.Status.RESOLVED);
+        assertThat(discoveredResolution.repository().path()).isEqualTo(discovered.toRealPath().toString());
+        assertThat(catalog.catalog().activeRepositoryId()).isEqualTo(activeId);
+
+        Path second = createGitRepository("second-repository");
+        catalog.registerRepository(second.toString(), "primary", List.of());
+        RepositoryResolution ambiguous = catalog.resolveRepository("primary");
+        assertThat(ambiguous.status()).isEqualTo(RepositoryResolution.Status.SELECTION_REQUIRED);
+        assertThat(ambiguous.candidates()).hasSize(2);
+        assertThat(catalog.catalog().activeRepositoryId()).isEqualTo(activeId);
+
+        RepositoryResolution missing = catalog.resolveRepository("does-not-exist");
+        assertThat(missing.status()).isEqualTo(RepositoryResolution.Status.NOT_FOUND);
+        assertThat(missing.reason()).isEqualTo("REFERENCE_NOT_FOUND");
+        assertThat(missing.repository()).isNull();
+        assertThat(catalog.catalog().activeRepositoryId()).isEqualTo(activeId);
+    }
     @Test
     void rejectsRelativePathsAndCorruptedCatalogWithoutFallingBack() throws Exception {
         assertThatThrownBy(() -> catalog.registerRepository("relative/repository", null, List.of()))
@@ -195,16 +229,32 @@ class CodebaseFoundationTest {
         assertThat(repositoryFingerprintByFile(repository)).containsExactlyInAnyOrderEntriesOf(before);
     }
 
+    private Path createGitRepository(String name) throws IOException, InterruptedException {
+        Path root = temporaryDirectory.resolve(name);
+        Files.createDirectories(root);
+        write(root.resolve("README.md"), name + "\n");
+        runGitAt(root, "init", "-q");
+        runGitAt(root, "config", "user.name", "SalmonMind Test");
+        runGitAt(root, "config", "user.email", "salmonmind-test@example.invalid");
+        runGitAt(root, "add", "README.md");
+        runGitAt(root, "commit", "-qm", "initial repository");
+        return root;
+    }
+
     private void write(Path path, String content) throws IOException {
         Files.createDirectories(path.getParent());
         Files.writeString(path, content, StandardCharsets.UTF_8);
     }
 
     private String runGit(String... arguments) throws IOException, InterruptedException {
+        return runGitAt(repository, arguments);
+    }
+
+    private String runGitAt(Path root, String... arguments) throws IOException, InterruptedException {
         List<String> command = new java.util.ArrayList<>();
         command.add("git");
         command.addAll(List.of(arguments));
-        Process process = new ProcessBuilder(command).directory(repository.toFile()).start();
+        Process process = new ProcessBuilder(command).directory(root.toFile()).start();
         String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         String error = new String(process.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
         assertThat(process.waitFor()).as(error).isZero();

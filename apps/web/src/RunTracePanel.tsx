@@ -178,6 +178,13 @@ function toolLabel(toolName: string): string {
   if (toolName === 'search_web_bocha') return '博查网页搜索'
   if (toolName === 'search_web_searchapi') return 'SearchApi.io 网页搜索'
   if (toolName === 'search_local_knowledge') return '本地知识库检索'
+  if (toolName === 'select_local_repository') return '选择本地仓库'
+  if (toolName === 'list_repository_directory') return '浏览仓库目录'
+  if (toolName === 'glob_repository_files' || toolName === 'grep_repository') return '搜索仓库源码'
+  if (toolName === 'read_repository_file') return '读取仓库文件'
+  if (toolName === 'git_repository_status') return '查看 Git 状态'
+  if (toolName === 'git_repository_diff') return '查看 Git 差异'
+  if (toolName === 'git_repository_log' || toolName === 'git_repository_show' || toolName === 'git_repository_blame') return '查看 Git 历史'
   return toolName || '工具调用'
 }
 

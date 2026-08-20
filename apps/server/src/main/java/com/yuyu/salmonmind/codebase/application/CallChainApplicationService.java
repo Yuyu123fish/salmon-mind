@@ -216,9 +216,11 @@ public final class CallChainApplicationService implements AgentCallChainService,
     }
 
     private void rejectDataRootOverlap(Path repositoryRoot) {
-        Path data = normalizeRealOrAbsolute(store.dataDir());
+        Path data = normalizeRealOrAbsolute(catalogStore.serverDataRoot());
         Path repository = normalizeRealOrAbsolute(repositoryRoot);
-        if (data.equals(repository) || data.startsWith(repository) || repository.startsWith(data)) {
+        // Server Data Root 位于 SalmonMind Repository 内时是应用自身的受控写入例外；
+        // 目标根等于数据根，或目标根位于数据根内，仍然会把应用数据当作目标项目而拒绝。
+        if (data.equals(repository) || repository.startsWith(data)) {
             throw new CodebaseException(CodebaseErrorCode.CALL_CHAIN_DATA_ROOT_CONFLICT,
                     "调用链数据目录不能位于目标仓库内或覆盖目标仓库");
         }

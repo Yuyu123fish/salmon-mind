@@ -18,8 +18,11 @@ public interface CatalogStorePort {
     void saveRepository(StoredRepository repository);
 
     /** 原子发布 settings.json；active 必须为空或指向已注册仓库。 */
-    void saveSettings(UUID activeRepositoryId, List<StoredSearchRoot> searchRoots);
+    void saveSettings(UUID activeRepositoryId);
 
     /** 返回 Server-owned catalog 数据根，仅用于配置状态检查，不是目标仓库路径。 */
     Path dataDir();
+
+    /** 返回完整 Server Data Root，用于判断调用链写入是否与目标仓库重叠。 */
+    Path serverDataRoot();
 }

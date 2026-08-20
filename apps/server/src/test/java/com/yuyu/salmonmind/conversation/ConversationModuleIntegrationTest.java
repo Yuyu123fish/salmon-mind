@@ -121,7 +121,7 @@ class ConversationModuleIntegrationTest {
 
     @DynamicPropertySource
     static void dataDir(DynamicPropertyRegistry registry) {
-        registry.add("salmon.conversation.data-dir", () -> DATA_DIR.toString());
+        registry.add("salmon.data-dir", () -> DATA_DIR.toString());
     }
 
     @TestConfiguration

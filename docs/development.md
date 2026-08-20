@@ -29,6 +29,12 @@ mvn -f apps/server/pom.xml spring-boot:run
 
 本地开发敏感配置写在 `apps/server/src/main/resources/application-dev.yml`（不入库），覆盖数据库账号、模型 API key 等；非敏感默认值保留在 `application.yml`，后端默认激活 `dev` profile 自动加载。Chat 默认走 DeepSeek（`deepseek-v4-flash`，key 在 `application-dev.yml` 的 `salmon.model.chat.api-key`）。对话能力需要 Redis（Checkpoint 短期状态）与模型配置；模型或 Redis 未配置时服务仍可启动，调用对话时才报错。
 
+### Server Data Root
+
+Conversation JSONL 与本地代码库理解数据共用一个 Server-owned 数据根：配置键是 `salmon.data-dir`，环境变量是 `SALMON_DATA_DIR`。该配置可选；未设置时，Server 从 JVM 工作目录向上寻找同时包含 `compose.yaml` 和 `apps/server/pom.xml` 的 SalmonMind 项目根，并使用项目根 `data/`。显式配置必须是绝对路径；设置后需要重启 Server。
+
+数据根只由应用写入，固定派生两个子目录：`conversations/` 与 `repository-understanding/`。Compose 中固定使用 `/app/data` 并挂载宿主机 `./data`；`infra/data/` 仍只属于 PostgreSQL、Redis、Elasticsearch 和 RustFS。旧的 `CONVERSATION_DATA_DIR`、`CODEBASE_DATA_DIR` 不再兼容，发现后会明确失败，避免再次产生两份数据。
+
 ## 配置原则
 
 - `MODEL_CHAT_BASE_URL` 指向 OpenAI-compatible API 根路径，代码会追加 `/chat/completions`；默认值 `https://api.deepseek.com` 已写在 `application.yml`。
@@ -37,7 +43,7 @@ mvn -f apps/server/pom.xml spring-boot:run
 - RustFS、Elasticsearch 和模型未配置时不做静默假实现；只有实际调用对应能力时才失败。
 - 网页搜索由 Server 侧 `salmon.websearch.bocha.*` 与 `salmon.websearch.search-api.*` 配置；博查使用原始 Web Search，SearchApi.io 使用 Google `organic_results`。两个 `api-key` 必须只放在被忽略的 `application-dev.yml` 或环境变量 `BOCHA_SEARCH_API_KEY` / `SEARCH_API_API_KEY`，不会发送到浏览器或 URL。
 - Agent 上下文边界可通过 `salmon.agent.max-tool-result-tokens-per-run`（环境变量 `AGENT_MAX_TOOL_RESULT_TOKENS_PER_RUN`，默认 32768）和 `salmon.agent.max-steps`（环境变量 `AGENT_MAX_STEPS`，默认 32）调整；两项均可选，修改后需重启后端，前者不能超过主输入触发阈值。
-- 代码库工具使用独立预算：`salmon.agent.codebase.max-tool-calls-per-run` / `SALMON_AGENT_CODEBASE_MAX_TOOL_CALLS_PER_RUN`（默认 12）、`salmon.agent.codebase.max-tool-result-tokens-per-run` / `SALMON_AGENT_CODEBASE_MAX_TOOL_RESULT_TOKENS_PER_RUN`（默认 32768）和 `salmon.agent.codebase.max-tool-result-chars` / `SALMON_AGENT_CODEBASE_MAX_TOOL_RESULT_CHARS`（默认 65536）；三项只允许下调，修改后需重启后端。
+- 代码库工具使用独立预算：`salmon.agent.codebase.max-tool-calls-per-run` / `SALMON_AGENT_CODEBASE_MAX_TOOL_CALLS_PER_RUN`（默认 16）、`salmon.agent.codebase.max-tool-result-tokens-per-run` / `SALMON_AGENT_CODEBASE_MAX_TOOL_RESULT_TOKENS_PER_RUN`（默认 65536）和 `salmon.agent.codebase.max-tool-result-chars` / `SALMON_AGENT_CODEBASE_MAX_TOOL_RESULT_CHARS`（默认 65536）；三项只允许下调，修改后需重启后端。
 - 非敏感配置以 [application.yml](../apps/server/src/main/resources/application.yml) 为准；敏感配置以 [application-dev-example.yml](../apps/server/src/main/resources/application-dev-example.yml) 为模板。
 
 ### Conversation Cache 与虚拟线程

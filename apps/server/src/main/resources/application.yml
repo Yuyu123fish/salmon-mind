@@ -4,7 +4,6 @@ server:
 
 # 本地代码库只读底座：路径按 Server 所在机器解释；修改后需重启 Server。
 codebase:
-  data-dir: ${CODEBASE_DATA_DIR:data/repository-understanding}
   git-command: ${CODEBASE_GIT_COMMAND:git}
   git-timeout: ${CODEBASE_GIT_TIMEOUT:10s}
 
@@ -56,6 +55,8 @@ management:
       show-details: never
 
 salmon:
+  # 唯一 Server-owned 使用数据根。未设置时从启动目录向上定位项目根并使用 data/。
+  data-dir: ${SALMON_DATA_DIR:__SALMON_DATA_DIR_UNSET__}
   model:
     connect-timeout: ${MODEL_CONNECT_TIMEOUT:5s}
     read-timeout: ${MODEL_READ_TIMEOUT:60s}
@@ -95,8 +96,8 @@ salmon:
     max-tool-result-tokens-per-run: ${AGENT_MAX_TOOL_RESULT_TOKENS_PER_RUN:32768}
     codebase:
       # 本地代码库工具独立预算；三项只能通过部署配置下调。
-      max-tool-calls-per-run: ${SALMON_AGENT_CODEBASE_MAX_TOOL_CALLS_PER_RUN:12}
-      max-tool-result-tokens-per-run: ${SALMON_AGENT_CODEBASE_MAX_TOOL_RESULT_TOKENS_PER_RUN:32768}
+      max-tool-calls-per-run: ${SALMON_AGENT_CODEBASE_MAX_TOOL_CALLS_PER_RUN:16}
+      max-tool-result-tokens-per-run: ${SALMON_AGENT_CODEBASE_MAX_TOOL_RESULT_TOKENS_PER_RUN:65536}
       max-tool-result-chars: ${SALMON_AGENT_CODEBASE_MAX_TOOL_RESULT_CHARS:65536}
     trace:
       # 展示/持久化硬上限，不是模型 Token Budget；部署只能下调，代码不会允许突破固定边界。
@@ -131,8 +132,7 @@ salmon:
     # Agent 报告的实际 system/tool schema 开销下限；256 不是完整 system/tool token 数
     system-prompt-tokens: ${COMPACTION_SYSTEM_PROMPT_TOKENS:256}
   conversation:
-    # 权威会话历史目录，Server 容器必须显式挂载；不与 infra/data/ 混用
-    data-dir: ${CONVERSATION_DATA_DIR:data}
+    # 权威会话历史由 ServerDataRoot 派生为 <salmon.data-dir>/conversations
     cache:
       # Redis 只保存可丢弃的完整快照；关闭后完全回退 JSONL，不触碰 Redis
       enabled: ${CONVERSATION_CACHE_ENABLED:true}

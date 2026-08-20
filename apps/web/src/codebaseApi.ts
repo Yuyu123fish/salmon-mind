@@ -29,12 +29,6 @@ export type Repository = {
   updatedAt: string
 }
 
-export type SearchRoot = {
-  id: string
-  path: string
-  createdAt: string
-}
-
 export type RepositoryObservation = {
   branch: string | null
   head: string | null
@@ -109,7 +103,6 @@ export type CodebaseCatalog = {
   gitAvailable: boolean
   activeRepositoryId: string | null
   repositories: Repository[]
-  searchRoots: SearchRoot[]
 }
 
 export class CodebaseApiError extends Error {
@@ -166,21 +159,6 @@ export async function setActiveRepository(
   return request<CodebaseCatalog>('/api/codebase/active-repository', {
     method: 'PUT',
     body: JSON.stringify({ repositoryId }),
-    signal,
-  })
-}
-
-export async function addSearchRoot(path: string, signal?: AbortSignal): Promise<SearchRoot> {
-  return request<SearchRoot>('/api/codebase/search-roots', {
-    method: 'POST',
-    body: JSON.stringify({ path }),
-    signal,
-  })
-}
-
-export async function removeSearchRoot(id: string, signal?: AbortSignal): Promise<CodebaseCatalog> {
-  return request<CodebaseCatalog>(`/api/codebase/search-roots/${encodeURIComponent(id)}`, {
-    method: 'DELETE',
     signal,
   })
 }

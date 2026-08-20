@@ -2,15 +2,14 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   CodebaseApiError,
-  addSearchRoot,
   fetchCodebase,
+  listCallChains,
   registerRepository,
-  removeSearchRoot,
   setActiveRepository,
   unregisterRepository,
   updateRepository,
 } from '../codebaseApi.ts'
-import RepositoryMenu from '../RepositoryMenu.tsx'
+import CodebaseView from '../CodebaseView.tsx'
 
 vi.mock('../codebaseApi.ts', () => ({
   CodebaseApiError: class CodebaseApiError extends Error {
@@ -21,10 +20,9 @@ vi.mock('../codebaseApi.ts', () => ({
       this.code = code
     }
   },
-  addSearchRoot: vi.fn(),
   fetchCodebase: vi.fn(),
+  listCallChains: vi.fn(),
   registerRepository: vi.fn(),
-  removeSearchRoot: vi.fn(),
   setActiveRepository: vi.fn(),
   unregisterRepository: vi.fn(),
   updateRepository: vi.fn(),
@@ -32,9 +30,8 @@ vi.mock('../codebaseApi.ts', () => ({
 
 const api = {
   fetchCodebase: vi.mocked(fetchCodebase),
+  listCallChains: vi.mocked(listCallChains),
   registerRepository: vi.mocked(registerRepository),
-  addSearchRoot: vi.mocked(addSearchRoot),
-  removeSearchRoot: vi.mocked(removeSearchRoot),
   setActiveRepository: vi.mocked(setActiveRepository),
   unregisterRepository: vi.mocked(unregisterRepository),
   updateRepository: vi.mocked(updateRepository),
@@ -50,16 +47,14 @@ const emptyCatalog = {
   gitAvailable: true,
   activeRepositoryId: null,
   repositories: [],
-  searchRoots: [],
 }
 
-describe('RepositoryMenu', () => {
+describe('CodebaseView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     api.fetchCodebase.mockResolvedValue(emptyCatalog)
+    api.listCallChains.mockResolvedValue([])
     api.registerRepository.mockResolvedValue(repository)
-    api.addSearchRoot.mockResolvedValue({ id: 'root-1', path: 'D:\\projects', createdAt: '2026-08-19T00:00:00Z' })
-    api.removeSearchRoot.mockResolvedValue(emptyCatalog)
     api.setActiveRepository.mockResolvedValue({ ...emptyCatalog, activeRepositoryId: repository.id, repositories: [repository] })
     api.unregisterRepository.mockResolvedValue(emptyCatalog)
     api.updateRepository.mockResolvedValue(repository)
@@ -67,29 +62,29 @@ describe('RepositoryMenu', () => {
 
   afterEach(() => cleanup())
 
-  it('shows the empty state and sends the server-provided path unchanged', async () => {
-    render(<RepositoryMenu />)
-    const trigger = await screen.findByRole('button', { name: /选择本地仓库/ })
-    fireEvent.click(trigger)
+  it('renders as a top-level codebase page and registers an explicit path', async () => {
+    render(<CodebaseView />)
 
-    expect(screen.getByRole('dialog', { name: '本地仓库管理' })).toBeVisible()
+    expect(await screen.findByRole('region', { name: 'Codebase' })).toBeVisible()
     const input = screen.getByRole('textbox', { name: '仓库绝对路径' })
     fireEvent.change(input, { target: { value: 'D:/Projects/demo' } })
     fireEvent.click(screen.getByRole('button', { name: '添加' }))
 
     await waitFor(() => expect(api.registerRepository).toHaveBeenCalledWith('D:/Projects/demo'))
     expect(input).toHaveValue('')
+    expect(screen.queryByText(/Search Root/i)).not.toBeInTheDocument()
   })
 
-  it('keeps codebase failures inside the repository panel', async () => {
-    api.registerRepository.mockRejectedValue(new CodebaseApiError('PATH_NOT_FOUND', '路径不存在'))
-    render(<RepositoryMenu />)
-    fireEvent.click(await screen.findByRole('button', { name: /选择本地仓库/ }))
-    fireEvent.change(screen.getByRole('textbox', { name: '仓库绝对路径' }), { target: { value: 'D:/missing' } })
-    fireEvent.click(screen.getByRole('button', { name: '添加' }))
+  it('selects an existing repository and keeps failures in the page', async () => {
+    api.fetchCodebase.mockResolvedValue({ ...emptyCatalog, repositories: [repository] })
+    api.setActiveRepository.mockRejectedValue(new CodebaseApiError('PATH_NOT_FOUND', '路径不存在'))
+    render(<CodebaseView />)
 
+    fireEvent.click(await screen.findByRole('button', { name: /demo.*main/ }))
+
+    await waitFor(() => expect(api.setActiveRepository).toHaveBeenCalledWith(repository.id))
     expect(await screen.findByRole('alert')).toHaveTextContent('路径不存在')
-    expect(screen.getByRole('dialog', { name: '本地仓库管理' })).toBeVisible()
+    expect(screen.getByRole('region', { name: 'Codebase' })).toBeVisible()
   })
 })
 

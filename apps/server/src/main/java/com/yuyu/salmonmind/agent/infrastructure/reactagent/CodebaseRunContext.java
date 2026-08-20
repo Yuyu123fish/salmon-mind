@@ -36,6 +36,8 @@ final class CodebaseRunContext {
 
     private final CodebaseService service;
     private final ObjectMapper mapper;
+    private final RepositoryResolution defaultResolution;
+    private final RepositoryObservation defaultObservation;
     private final Map<String, Map<Integer, String>> readLines = new LinkedHashMap<>();
     private Binding binding;
     private Draft draft;
@@ -47,13 +49,35 @@ final class CodebaseRunContext {
     CodebaseRunContext(CodebaseService service, ObjectMapper mapper) {
         this.service = service;
         this.mapper = mapper == null ? new ObjectMapper() : mapper;
+        this.defaultResolution = snapshotActive(service);
+        this.defaultObservation = defaultResolution.status() == RepositoryResolution.Status.RESOLVED
+                ? observationOf(defaultResolution.repository()) : null;
     }
 
     synchronized Selection select(String reference) {
         if (service == null) {
             return Selection.resolution(RepositoryResolution.notFound("CODEBASE_UNAVAILABLE"));
         }
+        if (reference == null || reference.isBlank()) {
+            return bindDefault();
+        }
         RepositoryResolution resolution = service.resolveRepository(reference);
+        return bindResolution(resolution, "EXPLICIT_REFERENCE", null);
+    }
+
+    /** 将 Run 创建时的 Active 快照绑定为默认仓库；不会重新读取当前 catalog。 */
+    synchronized Selection bindDefault() {
+        return bindResolution(defaultResolution, "ACTIVE_REPOSITORY", defaultObservation);
+    }
+
+    private Selection bindResolution(
+            RepositoryResolution resolution,
+            String selectionSource,
+            RepositoryObservation snapshotObservation
+    ) {
+        if (resolution == null) {
+            return Selection.resolution(RepositoryResolution.notFound("CODEBASE_UNAVAILABLE"));
+        }
         if (resolution.status() != RepositoryResolution.Status.RESOLVED) {
             return Selection.resolution(resolution);
         }
@@ -62,15 +86,33 @@ final class CodebaseRunContext {
             return Selection.conflict();
         }
         if (binding == null) {
-            String selectionSource = reference == null || reference.isBlank()
-                    ? "ACTIVE_REPOSITORY" : "EXPLICIT_REFERENCE";
             binding = new Binding(resolved.id(), resolved.name(), selectionSource,
-                    new RepositoryObservation(
-                            resolved.branch(), resolved.head(), resolved.dirty(),
-                            resolved.head() == null, false, false,
-                            0, 0, 0, 0, Instant.now()));
+                    snapshotObservation == null ? observationOf(resolved) : snapshotObservation);
         }
         return Selection.bound(resolution, binding);
+    }
+
+    private static RepositoryResolution snapshotActive(CodebaseService service) {
+        if (service == null) {
+            return RepositoryResolution.notFound("CODEBASE_UNAVAILABLE");
+        }
+        try {
+            RepositoryResolution resolution = service.resolveRepository(null);
+            return resolution == null
+                    ? RepositoryResolution.notFound("CODEBASE_UNAVAILABLE") : resolution;
+        } catch (RuntimeException ex) {
+            return RepositoryResolution.notFound("CODEBASE_UNAVAILABLE");
+        }
+    }
+
+    private static RepositoryObservation observationOf(RepositoryResolution.ResolvedRepository resolved) {
+        if (resolved == null) {
+            return null;
+        }
+        return new RepositoryObservation(
+                resolved.branch(), resolved.head(), resolved.dirty(),
+                resolved.head() == null, false, false,
+                0, 0, 0, 0, Instant.now());
     }
 
     /**

@@ -100,7 +100,7 @@ services:
       KNOWLEDGE_UPLOAD_API_ATTEMPT_TIMEOUT: ${KNOWLEDGE_UPLOAD_API_ATTEMPT_TIMEOUT:-10s}
       REDIS_URL: redis://redis:6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-      CONVERSATION_DATA_DIR: ${CONVERSATION_DATA_DIR:-data}
+      SALMON_DATA_DIR: /app/data
       # Chat 模型不敏感默认值（base-url / model-name）已写在 application.yml；
       # 这里只注入敏感 key，由宿主环境变量提供（不写入仓库）
       MODEL_CHAT_API_KEY: ${MODEL_CHAT_API_KEY:-}
@@ -117,7 +117,7 @@ services:
     ports:
       - "127.0.0.1:${SERVER_PORT:-8080}:8080"
     volumes:
-      # 权威会话历史（JSONL）独立于 infra/data/，容器重建后仍保留
+      # 唯一 Server Data Root：conversations/ 与 repository-understanding/；独立于 infra/data/
       - ./data:/app/data
     depends_on:
       postgres:

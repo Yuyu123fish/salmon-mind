@@ -8,8 +8,8 @@ import com.yuyu.salmonmind.codebase.api.CodebaseException;
 import com.yuyu.salmonmind.codebase.application.port.CatalogState;
 import com.yuyu.salmonmind.codebase.application.port.CatalogStorePort;
 import com.yuyu.salmonmind.codebase.application.port.StoredRepository;
-import com.yuyu.salmonmind.codebase.application.port.StoredSearchRoot;
-import org.springframework.beans.factory.annotation.Value;
+import com.yuyu.salmonmind.persistence.filesystem.ServerDataRoot;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -33,32 +33,54 @@ import java.util.UUID;
 /**
  * codebase catalog 的本地文件权威存储。
  *
- * <p>只写 Server 自己的数据目录。每次发布先完整写入同目录临时文件、force 后原子替换；
- * 读取遇到未知版本、非法 JSON 或身份断裂时直接失败，绝不静默清空 catalog。</p>
+ * <p>仓库注册资料和 settings 只写统一 Server Data Root 的
+ * {@code repository-understanding/} 子目录。settings 从旧 v1 读取时只校验其 JSON
+ * 形状和 Search Root 字段，不访问那些路径，然后原子收敛为只保留 Active 的 v2。</p>
  */
 @Component
 public final class CatalogStore implements CatalogStorePort {
 
-    static final int FORMAT_VERSION = 1;
+    private static final int REPOSITORY_FORMAT_VERSION = 1;
+    private static final int SETTINGS_FORMAT_VERSION = 2;
+    private static final int LEGACY_SETTINGS_FORMAT_VERSION = 1;
 
     private final ObjectMapper mapper;
     private final Path dataDir;
+    private final Path serverDataRoot;
     private final Path repositoriesDir;
     private CatalogState state;
 
-    public CatalogStore(
-            ObjectMapper objectMapper,
-            @Value("${codebase.data-dir:data/repository-understanding}") String configuredDataDir
-    ) {
-        mapper = objectMapper.copy().findAndRegisterModules();
-        dataDir = absoluteConfiguredPath(configuredDataDir);
-        repositoriesDir = dataDir.resolve("repositories");
-        state = load();
+    @Autowired
+    public CatalogStore(ObjectMapper objectMapper, ServerDataRoot serverDataRoot) {
+        this(objectMapper, serverDataRoot.repositoryUnderstandingRoot(), serverDataRoot.root());
+    }
+
+    /** 测试注入独立 catalog 目录；生产路径由 {@link ServerDataRoot} 统一派生。 */
+    public CatalogStore(ObjectMapper objectMapper, String configuredDataDir) {
+        Path data = absoluteConfiguredPath(configuredDataDir);
+        this.mapper = objectMapper.copy().findAndRegisterModules();
+        this.dataDir = data;
+        this.serverDataRoot = data;
+        this.repositoriesDir = data.resolve("repositories");
+        this.state = load();
+    }
+
+    private CatalogStore(ObjectMapper objectMapper, Path dataDir, Path serverDataRoot) {
+        this.mapper = objectMapper.copy().findAndRegisterModules();
+        this.dataDir = dataDir.toAbsolutePath().normalize();
+        this.serverDataRoot = serverDataRoot.toAbsolutePath().normalize();
+        this.repositoriesDir = this.dataDir.resolve("repositories");
+        this.state = load();
     }
 
     @Override
     public Path dataDir() {
         return dataDir;
+    }
+
+    @Override
+    public Path serverDataRoot() {
+        return serverDataRoot;
     }
 
     @Override
@@ -75,15 +97,15 @@ public final class CatalogStore implements CatalogStorePort {
     }
 
     @Override
-    public synchronized void saveSettings(UUID activeRepositoryId, List<StoredSearchRoot> searchRoots) {
+    public synchronized void saveSettings(UUID activeRepositoryId) {
         ensureDirectories();
-        writeJson(dataDir.resolve("settings.json"), settingsJson(activeRepositoryId, searchRoots));
-        state = new CatalogState(state.repositories(), activeRepositoryId, searchRoots);
+        writeJson(dataDir.resolve("settings.json"), settingsJson(activeRepositoryId));
+        state = new CatalogState(state.repositories(), activeRepositoryId);
     }
 
     public synchronized void replaceState(CatalogState next) {
         ensureDirectories();
-        writeJson(dataDir.resolve("settings.json"), settingsJson(next.activeRepositoryId(), next.searchRoots()));
+        writeJson(dataDir.resolve("settings.json"), settingsJson(next.activeRepositoryId()));
         for (StoredRepository repository : next.repositories().values()) {
             writeJson(repositoriesDir.resolve(repository.id().toString()).resolve("repository.json"),
                     repositoryJson(repository));
@@ -118,20 +140,28 @@ public final class CatalogStore implements CatalogStorePort {
         validateRepositoryIdentities(repositories.values());
 
         UUID active = null;
-        List<StoredSearchRoot> roots = List.of();
+        boolean migrateSettings = false;
         Path settings = dataDir.resolve("settings.json");
         if (Files.exists(settings)) {
             ParsedSettings parsed = parseSettings(settings);
             active = parsed.activeRepositoryId();
-            roots = parsed.searchRoots();
+            migrateSettings = parsed.legacy();
         }
+        validateActive(active, repositories);
+        if (migrateSettings) {
+            // 只有旧 JSON 完整通过校验且 Active 合法后才替换，损坏文件不会被覆盖。
+            writeJson(settings, settingsJson(active));
+        }
+        return new CatalogState(repositories, active);
+    }
+
+    private void validateActive(UUID active, Map<UUID, StoredRepository> repositories) {
         if (active != null) {
             StoredRepository activeRepository = repositories.get(active);
             if (activeRepository == null || !activeRepository.registered()) {
                 throw corrupted("Active Repository 不存在或未注册");
             }
         }
-        return new CatalogState(repositories, active, roots);
     }
 
     private void validateRepositoryIdentities(Iterable<StoredRepository> values) {
@@ -169,21 +199,22 @@ public final class CatalogStore implements CatalogStorePort {
     private CatalogState withRepository(StoredRepository repository) {
         Map<UUID, StoredRepository> next = new HashMap<>(state.repositories());
         next.put(repository.id(), repository);
-        return new CatalogState(next, state.activeRepositoryId(), state.searchRoots());
+        return new CatalogState(next, state.activeRepositoryId());
     }
 
     private StoredRepository parseRepository(Path file) {
         JsonNode node = readObject(file);
         requireFields(node, Set.of("formatVersion", "id", "path", "name", "aliases", "registered",
                 "createdAt", "updatedAt"));
-        if (node.path("formatVersion").asInt(-1) != FORMAT_VERSION) {
-            throw corrupted("catalog 格式版本不受支持");
+        if (node.path("formatVersion").asInt(-1) != REPOSITORY_FORMAT_VERSION) {
+            throw corrupted("仓库 catalog 格式版本不受支持");
         }
         try {
             ObjectNode repositoryFields = (ObjectNode) node.deepCopy();
             repositoryFields.remove("formatVersion");
             StoredRepository result = mapper.treeToValue(repositoryFields, StoredRepository.class);
-            if (result.id() == null || result.path() == null || result.createdAt() == null || result.updatedAt() == null) {
+            if (result.id() == null || result.path() == null || result.createdAt() == null
+                    || result.updatedAt() == null) {
                 throw corrupted("仓库 catalog 字段缺失");
             }
             return result;
@@ -198,44 +229,82 @@ public final class CatalogStore implements CatalogStorePort {
 
     private ParsedSettings parseSettings(Path file) {
         JsonNode node = readObject(file);
-        requireFields(node, Set.of("formatVersion", "activeRepositoryId", "searchRoots"));
-        if (node.path("formatVersion").asInt(-1) != FORMAT_VERSION) {
-            throw corrupted("catalog 格式版本不受支持");
-        }
+        int version = node.path("formatVersion").asInt(-1);
         try {
-            JsonNode activeNode = node.get("activeRepositoryId");
-            UUID active = activeNode == null || activeNode.isNull() ? null : UUID.fromString(activeNode.asText());
-            List<StoredSearchRoot> roots = new ArrayList<>();
-            JsonNode rootsNode = node.get("searchRoots");
-            if (rootsNode == null || !rootsNode.isArray()) {
-                throw corrupted("Search Root catalog 字段无效");
+            if (version == SETTINGS_FORMAT_VERSION) {
+                requireFields(node, Set.of("formatVersion", "activeRepositoryId"));
+                return new ParsedSettings(parseActive(node), false);
             }
-            Set<UUID> ids = new HashSet<>();
-            Set<String> paths = new HashSet<>();
-            for (JsonNode rootNode : rootsNode) {
-                requireFields(rootNode, Set.of("id", "path", "createdAt"));
-                StoredSearchRoot root = mapper.treeToValue(rootNode, StoredSearchRoot.class);
-                Path path = Path.of(root.path()).toAbsolutePath().normalize();
-                if (root.id() == null || root.createdAt() == null || !path.isAbsolute()
-                        || !ids.add(root.id())
-                        || !paths.add(identityKey(path))) {
-                    throw corrupted("Search Root catalog 身份或路径重复");
-                }
-                roots.add(root);
+            if (version == LEGACY_SETTINGS_FORMAT_VERSION) {
+                requireFields(node, Set.of("formatVersion", "activeRepositoryId", "searchRoots"));
+                validateLegacySearchRoots(node.get("searchRoots"));
+                return new ParsedSettings(parseActive(node), true);
             }
-            return new ParsedSettings(active, roots);
+            throw corrupted("代码库 settings 格式版本不受支持");
         } catch (IOException | RuntimeException ex) {
             if (ex instanceof CodebaseException codebaseException) {
                 throw codebaseException;
             }
             throw new CodebaseException(CodebaseErrorCode.CODEBASE_DATA_CORRUPTED,
-                    "代码库 catalog 已损坏", ex);
+                    "代码库 settings 已损坏", ex);
         }
+    }
+
+    private UUID parseActive(JsonNode node) {
+        JsonNode activeNode = node.get("activeRepositoryId");
+        if (activeNode == null || activeNode.isNull()) {
+            return null;
+        }
+        if (!activeNode.isTextual() || activeNode.asText().isBlank()) {
+            throw corrupted("Active Repository 字段无效");
+        }
+        try {
+            return UUID.fromString(activeNode.asText());
+        } catch (IllegalArgumentException ex) {
+            throw corrupted("Active Repository 字段无效");
+        }
+    }
+
+    /** 只校验 v1 的 Search Root JSON 结构，不读取或解析其指向的文件系统目录。 */
+    private void validateLegacySearchRoots(JsonNode rootsNode) throws IOException {
+        if (rootsNode == null || !rootsNode.isArray()) {
+            throw corrupted("旧 Search Root catalog 字段无效");
+        }
+        Set<UUID> ids = new HashSet<>();
+        Set<String> paths = new HashSet<>();
+        for (JsonNode rootNode : rootsNode) {
+            requireFields(rootNode, Set.of("id", "path", "createdAt"));
+            UUID id;
+            try {
+                id = UUID.fromString(requiredText(rootNode, "id"));
+                Instant.parse(requiredText(rootNode, "createdAt"));
+            } catch (RuntimeException ex) {
+                throw corrupted("旧 Search Root catalog 字段无效");
+            }
+            String rawPath = requiredText(rootNode, "path");
+            Path path;
+            try {
+                path = Path.of(rawPath).toAbsolutePath().normalize();
+            } catch (RuntimeException ex) {
+                throw corrupted("旧 Search Root catalog 路径无效");
+            }
+            if (!path.isAbsolute() || !ids.add(id) || !paths.add(identityKey(path))) {
+                throw corrupted("旧 Search Root catalog 身份或路径重复");
+            }
+        }
+    }
+
+    private String requiredText(JsonNode node, String field) {
+        JsonNode value = node.get(field);
+        if (value == null || !value.isTextual() || value.asText().isBlank()) {
+            throw corrupted("catalog 字段无效");
+        }
+        return value.asText();
     }
 
     private JsonNode repositoryJson(StoredRepository repository) {
         var node = mapper.createObjectNode();
-        node.put("formatVersion", FORMAT_VERSION);
+        node.put("formatVersion", REPOSITORY_FORMAT_VERSION);
         node.put("id", repository.id().toString());
         node.put("path", repository.path());
         node.put("name", repository.name());
@@ -246,20 +315,13 @@ public final class CatalogStore implements CatalogStorePort {
         return node;
     }
 
-    private JsonNode settingsJson(UUID activeRepositoryId, List<StoredSearchRoot> searchRoots) {
+    private JsonNode settingsJson(UUID activeRepositoryId) {
         var node = mapper.createObjectNode();
-        node.put("formatVersion", FORMAT_VERSION);
+        node.put("formatVersion", SETTINGS_FORMAT_VERSION);
         if (activeRepositoryId == null) {
             node.putNull("activeRepositoryId");
         } else {
             node.put("activeRepositoryId", activeRepositoryId.toString());
-        }
-        var roots = node.putArray("searchRoots");
-        for (StoredSearchRoot root : searchRoots) {
-            var item = roots.addObject();
-            item.put("id", root.id().toString());
-            item.put("path", root.path());
-            item.put("createdAt", root.createdAt().toString());
         }
         return node;
     }
@@ -280,6 +342,9 @@ public final class CatalogStore implements CatalogStorePort {
     }
 
     private void requireFields(JsonNode node, Set<String> allowed) {
+        if (node == null || !node.isObject()) {
+            throw corrupted("catalog 字段结构无效");
+        }
         var fields = node.fieldNames();
         while (fields.hasNext()) {
             if (!allowed.contains(fields.next())) {
@@ -343,8 +408,16 @@ public final class CatalogStore implements CatalogStorePort {
                     "代码库 catalog 数据目录不可用");
         }
         try {
-            return Path.of(configuredDataDir).toAbsolutePath().normalize();
+            Path path = Path.of(configuredDataDir).normalize();
+            if (!path.isAbsolute()) {
+                throw new CodebaseException(CodebaseErrorCode.CODEBASE_DATA_UNAVAILABLE,
+                        "代码库 catalog 数据目录必须是绝对路径");
+            }
+            return path;
         } catch (RuntimeException ex) {
+            if (ex instanceof CodebaseException codebaseException) {
+                throw codebaseException;
+            }
             throw new CodebaseException(CodebaseErrorCode.CODEBASE_DATA_UNAVAILABLE,
                     "代码库 catalog 数据目录不可用", ex);
         }
@@ -361,6 +434,6 @@ public final class CatalogStore implements CatalogStorePort {
                 : value;
     }
 
-    private record ParsedSettings(UUID activeRepositoryId, List<StoredSearchRoot> searchRoots) {
+    private record ParsedSettings(UUID activeRepositoryId, boolean legacy) {
     }
 }

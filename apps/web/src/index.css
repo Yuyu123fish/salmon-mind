@@ -101,37 +101,6 @@ button {
   min-width: 0;
 }
 
-.repository-menu {
-  position: relative;
-  min-width: 0;
-}
-
-.repository-trigger {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  max-width: min(330px, 30vw);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 6px 11px;
-  color: var(--river);
-  background: rgba(255, 255, 255, 0.5);
-  text-align: left;
-}
-
-.repository-trigger-label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 0.82rem;
-}
-
-.repository-trigger-status {
-  flex-shrink: 0;
-  color: var(--muted);
-  font-size: 0.7rem;
-}
-
 .repository-panel {
   position: absolute;
   top: calc(100% + 10px);
@@ -172,7 +141,6 @@ button {
   font-size: 1.2rem;
 }
 
-.repository-close,
 .text-button {
   border: 0;
   padding: 4px 7px;
@@ -181,7 +149,6 @@ button {
   font-size: 0.78rem;
 }
 
-.repository-close:hover,
 .text-button:hover {
   color: var(--river);
 }
@@ -207,8 +174,7 @@ button {
 }
 
 .repository-platform code,
-.repository-card code,
-.search-root-list code {
+.repository-card code {
   font-family: var(--font-mono);
   font-size: 0.7rem;
   overflow-wrap: anywhere;
@@ -233,8 +199,7 @@ button {
 
 .repository-error button,
 .repository-add-row button,
-.repository-card-actions button,
-.search-root-list button {
+.repository-card-actions button {
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 5px 9px;
@@ -353,25 +318,6 @@ button {
   flex: 1;
 }
 
-.search-root-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.search-root-list li {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 6px 8px;
-  border: 1px solid rgba(197, 210, 205, 0.8);
-  border-radius: 6px;
-}
-
 .view-switch {
   display: flex;
   align-items: center;
@@ -426,6 +372,93 @@ button {
   display: block;
   min-height: 0;
   overflow: hidden;
+}
+
+.workspace[data-view='codebase'] {
+  display: block;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.codebase-main {
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.codebase-view {
+  width: min(1120px, 100%);
+  margin: 0 auto;
+  padding: 28px 28px 48px;
+}
+
+.codebase-panel {
+  position: static;
+  width: auto;
+  max-height: none;
+  overflow: visible;
+  border-radius: 14px;
+  box-shadow: none;
+}
+
+.codebase-panel .repository-panel-body {
+  overflow: visible;
+}
+
+.codebase-panel h1,
+.codebase-panel h2 {
+  margin: 0;
+  font-family: var(--font-brand);
+  font-weight: 600;
+}
+
+.codebase-panel h1 {
+  font-size: 1.55rem;
+}
+
+.codebase-panel h2 {
+  font-size: 1.05rem;
+}
+
+.codebase-data-note {
+  max-width: 360px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-align: right;
+}
+
+.codebase-active {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 14px 15px;
+  border: 1px solid var(--river);
+  border-radius: 10px;
+  background: rgba(47, 79, 72, 0.06);
+}
+
+.codebase-active .kicker {
+  margin-bottom: 3px;
+}
+
+.codebase-active-meta {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-align: right;
+}
+
+.codebase-active-meta code {
+  max-width: 52vw;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
 }
 
 .sidebar {
@@ -2317,19 +2350,6 @@ button:focus-visible {
     min-width: 0;
   }
 
-  .repository-trigger {
-    max-width: min(50vw, 260px);
-  }
-
-  .repository-panel {
-    position: fixed;
-    top: 64px;
-    right: 12px;
-    left: 12px;
-    width: auto;
-    max-height: calc(100dvh - 76px);
-  }
-
   .repository-edit {
     grid-template-columns: 1fr;
   }
@@ -2340,6 +2360,33 @@ button:focus-visible {
 
   .knowledge-main {
     height: 100%;
+  }
+
+  .codebase-view {
+    padding: 18px 12px 36px;
+  }
+
+  .codebase-panel .repository-panel-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .codebase-data-note {
+    max-width: none;
+    text-align: left;
+  }
+
+  .codebase-active {
+    flex-direction: column;
+  }
+
+  .codebase-active-meta {
+    align-items: flex-start;
+    text-align: left;
+  }
+
+  .codebase-active-meta code {
+    max-width: 100%;
   }
 
   .knowledge-view {

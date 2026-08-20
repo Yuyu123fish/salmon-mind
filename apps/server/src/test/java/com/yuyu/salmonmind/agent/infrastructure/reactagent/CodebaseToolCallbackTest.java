@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -77,6 +78,92 @@ class CodebaseToolCallbackTest {
         assertThat(listed.path("items").get(0).path("path").asText()).isEqualTo("src");
         assertThat(conflict.path("reason").asText()).isEqualTo("MULTIPLE_REPOSITORIES_NOT_SUPPORTED");
         verify(evidence).listDirectory(any());
+    }
+
+    @Test
+    void bindsRunActiveSnapshotOnFirstEvidenceWithoutSelectionToolCall() throws Exception {
+        UUID repositoryId = UUID.randomUUID();
+        CodebaseService codebase = mock(CodebaseService.class);
+        RepositoryEvidenceService evidence = mock(RepositoryEvidenceService.class);
+        when(codebase.resolveRepository(null)).thenReturn(RepositoryResolution.resolved(repository(repositoryId, "active")));
+        when(evidence.listDirectory(any())).thenReturn(new ListDirectoryResult(
+                metadata(repositoryId, "active", "list"),
+                List.of(new DirectoryEntry("src", "src", true, false))));
+
+        CodebaseRunContext context = new CodebaseRunContext(codebase);
+        ToolContext toolContext = new ToolContext(Map.of(CodebaseRunContext.METADATA_KEY, context));
+        CodebaseToolCallback list = new CodebaseToolCallback(
+                mapper, codebase, evidence, CodebaseToolCallback.Operation.LIST);
+
+        JsonNode result = mapper.readTree(list.call("{}", toolContext));
+
+        assertThat(result.path("status").asText()).isEqualTo("SUCCESS");
+        assertThat(context.binding()).isNotNull();
+        assertThat(context.binding().selectionSource()).isEqualTo("ACTIVE_REPOSITORY");
+        verify(codebase, times(1)).resolveRepository(null);
+        verify(evidence).listDirectory(any());
+    }
+
+    @Test
+    void freezesActiveSnapshotAndDoesNotFallBackAfterActiveChanges() throws Exception {
+        UUID firstId = UUID.randomUUID();
+        UUID secondId = UUID.randomUUID();
+        CodebaseService codebase = mock(CodebaseService.class);
+        RepositoryEvidenceService evidence = mock(RepositoryEvidenceService.class);
+        when(codebase.resolveRepository(null)).thenReturn(
+                RepositoryResolution.resolved(repository(firstId, "first")),
+                RepositoryResolution.resolved(repository(secondId, "second")));
+
+        CodebaseRunContext context = new CodebaseRunContext(codebase);
+        CodebaseRunContext.Selection first = context.bindDefault();
+
+        assertThat(first.binding().repositoryId()).isEqualTo(firstId);
+        verify(codebase, times(1)).resolveRepository(null);
+    }
+
+    @Test
+    void explicitReferenceOverridesSnapshotBeforeFirstEvidence() throws Exception {
+        UUID activeId = UUID.randomUUID();
+        UUID explicitId = UUID.randomUUID();
+        CodebaseService codebase = mock(CodebaseService.class);
+        RepositoryEvidenceService evidence = mock(RepositoryEvidenceService.class);
+        when(codebase.resolveRepository(null)).thenReturn(RepositoryResolution.resolved(repository(activeId, "active")));
+        when(codebase.resolveRepository("other"))
+                .thenReturn(RepositoryResolution.resolved(repository(explicitId, "other")));
+        when(evidence.listDirectory(any())).thenReturn(new ListDirectoryResult(
+                metadata(explicitId, "other", "list"), List.of()));
+        CodebaseRunContext context = new CodebaseRunContext(codebase);
+        ToolContext toolContext = new ToolContext(Map.of(CodebaseRunContext.METADATA_KEY, context));
+        CodebaseToolCallback select = new CodebaseToolCallback(
+                mapper, codebase, evidence, CodebaseToolCallback.Operation.SELECT);
+        CodebaseToolCallback list = new CodebaseToolCallback(
+                mapper, codebase, evidence, CodebaseToolCallback.Operation.LIST);
+
+        JsonNode selected = mapper.readTree(select.call("{\"reference\":\"other\"}", toolContext));
+        JsonNode listed = mapper.readTree(list.call("{}", toolContext));
+
+        assertThat(selected.path("repositoryName").asText()).isEqualTo("other");
+        assertThat(listed.path("repositoryName").asText()).isEqualTo("other");
+        assertThat(context.binding().selectionSource()).isEqualTo("EXPLICIT_REFERENCE");
+        verify(codebase, times(1)).resolveRepository(null);
+        verify(codebase, times(1)).resolveRepository("other");
+    }
+
+    @Test
+    void reportsStableNoActiveErrorWhenEvidenceHasNoDefault() throws Exception {
+        CodebaseService codebase = mock(CodebaseService.class);
+        RepositoryEvidenceService evidence = mock(RepositoryEvidenceService.class);
+        when(codebase.resolveRepository(null)).thenReturn(
+                RepositoryResolution.notFound("REPOSITORY_NOT_SELECTED"));
+        CodebaseRunContext context = new CodebaseRunContext(codebase);
+        ToolContext toolContext = new ToolContext(Map.of(CodebaseRunContext.METADATA_KEY, context));
+        CodebaseToolCallback list = new CodebaseToolCallback(
+                mapper, codebase, evidence, CodebaseToolCallback.Operation.LIST);
+
+        JsonNode result = mapper.readTree(list.call("{}", toolContext));
+
+        assertThat(result.path("reason").asText()).isEqualTo("REPOSITORY_NOT_SELECTED");
+        verifyNoEvidenceCalls(evidence);
     }
 
     @Test

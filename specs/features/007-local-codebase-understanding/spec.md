@@ -7,6 +7,7 @@ Status: Specified
 - [Stage 01：本地仓库接入与只读工具底座](./plan-01-repository-access-and-readonly-foundation.md)
 - [Stage 02：对话式代码库理解闭环](./plan-02-conversational-codebase-understanding.md)
 - [Stage 03：简单调用链沉淀与展示](./plan-03-call-chain-persistence-and-display.md)
+- [Stage 03.5：代码库入口与仓库绑定纠偏](./plan-03-5-codebase-entry-and-binding-correction.md)
 
 ## Problem Statement
 
@@ -14,20 +15,23 @@ AI 生成代码的速度已经明显快于开发者理解代码的速度。开�
 
 SalmonMind 需要补上一个小而完整的本地代码库理解闭环：开发者可以添加本地 Git 仓库，在对话中自然提到“本地 xx 项目”，Agent 能定位仓库、按需读取代码和只读 Git 证据，并回答调用流程、当前变化或历史原因。遇到真正的代码流程问题时，Agent 还应把已经核实的方法节点和简单调用关系沉淀为可继续更新的调用链。
 
+Stage 01–03 的真实使用暴露了一个体验断点：顶部已经选择 Active Repository，但 Agent Run 并不会自动绑定它，模型仍要猜测 `select_local_repository` 的参数；猜错后，安全规则又禁止回退到 Active Repository。仓库管理被收在右上角弹层，Search Root 与具体仓库同时出现，也让“我到底绑定了什么”变得不直观。Server 数据目录使用相对路径还会随启动工作目录变化，在仓库根和 `apps/server` 下形成两份互不相通的数据。
+
 该能力的目标是帮助开发者重新掌握项目，不是把 SalmonMind 变成代码修改器或完整程序分析平台。目标仓库必须严格只读；任何源码、配置、Git 状态或外部笔记都不能被 SalmonMind 修改。调用链只保留理解所需的简单节点、分支、源码快照与历史 Revision，不引入全仓库 Repo Map、复杂静态分析图或向量索引。
 
 ## Solution
 
 在单 Workspace 中增加本地仓库管理与代码库理解能力：
 
-1. 前端顶部提供本地仓库入口，允许开发者通过绝对路径添加具体 Git 仓库，也允许添加经过授权的仓库搜索目录。
-2. Server 规范化 Windows 路径，统一识别 `\` 与 `/`，解析真实路径和 Git 根，并把注册结果保存在 Server 自己管理的数据目录中。
-3. 顶部选择的仓库作为对话默认上下文；用户在消息中明确提到另一个已注册项目、别名或绝对路径时，本次 Run 使用明确提到的仓库。
+1. 前端顶部把 `Codebase` 作为与“对话”“Knowledge”同级的一级视图；用户在该页面通过绝对路径添加具体 Git 仓库、查看状态、选择 Active Repository，并管理已有调用链。
+2. Server 规范化 Windows 路径，统一识别 `\` 与 `/`，解析真实路径和 Git 根，并把所有 Server 使用数据统一保存在 SalmonMind 根数据目录中，不再根据启动工作目录产生第二份 `data`。
+3. 每次 Agent Run 在开始时快照 Active Repository；用户没有明确指定其他仓库时，第一个代码库 Evidence Tool 自动绑定该快照，不再要求模型先猜一次选择参数。用户在消息中明确提到另一个已注册项目、别名或绝对路径时，本次 Run 可以在首次读取代码前覆盖默认值。
 4. Agent 获得有界、只读的目录、Glob、Grep、ReadFile 和 Git 查询能力，按需读取当前代码、工作树和历史证据，不暴露任意 Shell。
 5. 当问题实际涉及至少两个相关方法或函数的流程时，Agent 在成功回答后自动沉淀一条简单调用链；普通单文件、单方法或配置查询不创建调用链。
 6. 调用链以方法或函数作为默认节点，只保存简单的 `fromNodeId -> toNodeId` 关系并允许分支。每个节点保存相关源码快照、Git 观察状态和不可变 Revision；源码变化后追加新 Revision，旧版本不删除。
-7. 调用链、节点历史和源码快照以 Server 管理的本地文件系统为权威，不为每个仓库或节点建立 PostgreSQL 表。用户可以查看、重命名和删除调用链；删除永远不影响目标仓库。
-8. Repo Map、向量索引和一键代码知识库留给后续 Feature。本 Feature 不后台扫描仓库，只有在用户提问和 Agent 实际使用调用链时按需检查与更新。
+7. Conversation JSONL、Repository Catalog、调用链、节点历史和源码快照统一位于根 `data/` 的明确子目录；不为每个仓库或节点建立 PostgreSQL 表。用户可以查看、重命名和删除调用链；删除永远不影响目标仓库源码或 Git 状态。
+8. 不提供 Search Root 或目录发现授权。Agent 只使用用户已经注册的 Repository，或用户在消息中明确提供并通过校验的绝对 Git 仓库路径。
+9. Repo Map、向量索引和一键代码知识库留给后续 Feature。本 Feature 不后台扫描仓库，只有在用户提问和 Agent 实际使用调用链时按需检查与更新。
 
 ## Domain Terms
 
@@ -35,13 +39,15 @@ SalmonMind 需要补上一个小而完整的本地代码库理解闭环：开发
 
 用户明确注册、由 SalmonMind 只读访问的本地 Git 工作树。每个 Local Repository 在 SalmonMind 内拥有稳定 Repository ID；绝对路径、Git 分支、HEAD 和 dirty 状态是可变化的观察信息，不作为其目录身份。
 
-### Repository Search Root
+### Server Data Root
 
-用户明确授权 SalmonMind 用于发现 Git 仓库的本地绝对目录。Agent 只能在已授权 Search Root 中查找项目，不能扫描整块磁盘、用户目录或其他未授权位置。
+SalmonMind 当前运行实例唯一的使用数据根。源码开发环境固定为项目根的 `data/`，容器环境固定映射为 `/app/data`；Conversation JSONL 位于 `conversations/`，Repository Catalog、Call Chain、Node Revision 与 Source Snapshot 位于 `repository-understanding/`。`infra/data/` 仍只保存 PostgreSQL、Redis、Elasticsearch 和 RustFS 数据，不属于 Server Data Root。
+
+Server Data Root 是应用自身唯一允许写入的文件系统命名空间，永远不能被代码库 List、Glob、Grep、ReadFile、Git 内容查询或 Source Snapshot 读取。分析 SalmonMind 自身仓库时，即使该目录物理上位于 Repository 内，也仍按 Server-owned 数据处理；除这个明确目录外，目标 Repository 保持严格只读。
 
 ### Active Repository
 
-前端当前选择、作为新问题默认上下文的 Local Repository。它不是 Conversation 的永久绑定；用户在消息中明确提到其他仓库时，本次 Run 可以覆盖默认值。第一版一次 Run 只分析一个仓库。
+Codebase 一级视图当前选择、作为新问题默认上下文的 Local Repository。每个 Run 在开始时快照该选择，并在首次代码 Evidence 查询时自动形成 Run Binding；Run 中途切换 Active Repository 只影响下一 Run。它不是 Conversation 的永久绑定；用户在消息中明确提到其他仓库时，可以在首次代码读取前覆盖默认值。第一版一次 Run 只分析一个仓库。
 
 ### Code Node
 
@@ -73,8 +79,8 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 
 1. 作为本地开发者，我希望通过绝对路径添加一个 Git 仓库，以便 SalmonMind 能理解我的真实项目。
 2. 作为 Windows 用户，我希望 `D:\project\demo` 与 `D:/project/demo` 被识别为同一个路径，以便不用关心分隔符差异。
-3. 作为拥有多个项目的开发者，我希望添加一个项目搜索目录，以便 Agent 能在我授权的范围内找到“本地 xx 项目”。
-4. 作为开发者，我希望在顶部查看并切换默认仓库，以便后续问题具有明确的项目上下文。
+3. 作为开发者，我希望从与“对话”“Knowledge”同级的 Codebase 页面集中管理仓库和调用链，以便仓库能力不是藏在右上角的小工具。
+4. 作为开发者，我希望选择 Active Repository 后，Agent 在下一次代码问题中自动使用它，以便不需要再次输入项目名或绝对路径。
 5. 作为开发者，我希望在对话中直接提到仓库名称、别名或绝对路径，以便不必每次操作仓库选择器。
 6. 作为开发者，我希望仓库名称匹配不唯一时由系统让我选择，以免 Agent 静默分析错误项目。
 7. 作为开发者，我希望 Agent 能通过目录、Glob、Grep 和分页 ReadFile 逐步查找代码，以便回答基于当前源码而不是模型印象。
@@ -91,18 +97,21 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 18. 作为开发者，我希望手动重命名后名称默认不再被 Agent 覆盖，并且可以随时删除调用链，以便保持最终控制权。
 19. 作为开发者，我希望仓库被移动或暂时不可访问时历史调用链仍然存在，以便已有理解不会随本地路径失效而消失。
 20. 作为开发者，我希望工具结果被截断时看到明确范围和继续方式，以免 Agent 把部分搜索误报成全仓库结论。
+21. 作为开发者，我希望 Server 使用数据只落在项目根 `data/`，以免不同启动方式在仓库里形成多份互不相通的数据目录。
 
 ## Behavior and Failure Semantics
 
-### 仓库注册、发现与解析
+### 仓库注册与解析
 
-- 添加仓库和 Search Root 只接受绝对路径。Server 使用平台 Path 能力完成绝对化、规范化和真实路径解析，不通过字符串前缀或简单替换判断路径归属。
-- Windows 下 `\` 与 `/` 均为合法输入。多余分隔符、`.`、`..`、盘符大小写、符号链接和 junction 在身份比较前必须被规范化；解析后的真实目标不能逃出已授权根。
+- 添加仓库只接受绝对路径。Server 使用平台 Path 能力完成绝对化、规范化和真实路径解析，不通过字符串前缀或简单替换判断路径归属。
+- Windows 下 `\` 与 `/` 均为合法输入。多余分隔符、`.`、`..`、盘符大小写、符号链接和 junction 在身份比较前必须被规范化；所有后续文件访问仍受真实 Git 根约束。
 - 添加仓库时解析 Git 工作树根。重复添加同一真实工作树返回既有 Repository，而不是创建重复身份。目录不存在、不可读或不是 Git 工作树时返回明确错误，不生成半份注册信息。
 - Repository ID 由 SalmonMind 在首次注册时生成并保持稳定。它不能使用 HEAD、分支或源码内容哈希，因为这些值会随开发变化；绝对路径变化后允许用户重新关联同一内部 Repository。
-- Search Root 只用于发现其范围内的 Git 仓库。系统不扫描整块磁盘，也不把发现仓库自动扩大成外部目录读取授权。
-- 对话解析顺序为：消息中的明确绝对路径 → 已注册名称或用户别名 → Search Root 下的精确目录名 → 候选列表。存在多个候选时暂停仓库相关工具并让用户选择，不静默采用模糊匹配结果。
-- Active Repository 只是默认值。消息中的明确仓库引用覆盖默认值；第一版同一 Run 解析到多个仓库时要求用户缩小到一个，不执行跨仓库比较。
+- 不再保存或解析 Search Root，不扫描父目录、用户目录或整块磁盘，也不根据未注册目录名发现 Repository。
+- 显式仓库引用的解析顺序为：消息中的绝对路径 → 已注册名称或用户别名。名称或别名存在多个候选时暂停仓库工具并让用户选择，不静默采用模糊匹配结果；未注册普通名称直接提示用户到 Codebase 页面添加仓库。
+- 每次 Run 创建时快照 Active Repository。模型未显式选择其他仓库时，第一个 List、Glob、Grep、ReadFile 或 Git Evidence Tool 自动绑定该快照；模型不需要也不应该用 `.`, `workspace`, `project`, `repo` 等猜测“当前仓库”。
+- 显式仓库引用只允许在本 Run 第一次代码读取前覆盖默认快照。一旦任何 Evidence Tool 已经绑定 Repository，本 Run 不再切换；显式非空引用解析失败时仍不得回退 Active Repository。
+- 当前没有 Active Repository 时，代码 Evidence Tool 返回稳定未选择错误，并引导用户到 Codebase 页面选择；不让模型反复试探不存在的引用。
 - 仓库被移动、删除或暂时不可读时标记为不可访问，保留其内部调用链与源码快照。重新绑定路径不重写旧 Revision。
 
 ### 只读文件与 Git 工具
@@ -115,7 +124,7 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 - Git 能力至少覆盖 status、diff、log、show 和 blame，并限制 ref、path、数量和输出大小。blame 只作为历史定位线索，Agent 不能把最后修改者直接解释为设计者或责任人。
 - Git Adapter 必须使用固定操作和结构化参数，不接受任意命令文本或未校验参数。禁止 commit、checkout、switch、stash、tag、reset、clean、merge、rebase、push、update-index、Git Notes、隐藏 ref、临时 worktree，以及任何会写入工作树、索引、引用或对象库的操作。
 - 工具输出按字符、字节、行数和结果数量保持有界。达到上限时必须返回 `truncated`、实际覆盖范围和继续查询方式；Agent 不能把有界结果表述成完整扫描结论。
-- 目标仓库始终是只读事实源。SalmonMind 不修改源码、配置、README、项目笔记、用户知识库或 Git 状态；内部调用链沉淀不构成向目标仓库写入。
+- 目标仓库的源码、配置、README、项目笔记、工作树、index、refs、对象和 Git 配置始终是只读事实源。SalmonMind 只允许写 Server Data Root；当分析 SalmonMind 自身时，该明确子树从代码 Evidence 和零写入指纹中排除，除此之外不能修改目标 Repository 的任何路径。
 
 ### 调用链触发与展示
 
@@ -139,7 +148,8 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 
 ### 文件系统权威与恢复
 
-- Repository 注册、Code Node Revision、Call Chain 历史和 Source Snapshot 的权威位置是 Server 管理的可配置本地数据根；本 Feature 不把这些数据写入 PostgreSQL、Redis、Elasticsearch、RustFS 或目标仓库。
+- Conversation JSONL、Repository 注册、Code Node Revision、Call Chain 历史和 Source Snapshot 统一使用一个 Server Data Root。源码开发时只能落在项目根 `data/`，不能因从 `apps/server`、IDE 或其他工作目录启动而生成第二份相对 `data`；容器使用显式 `/app/data` 挂载。
+- Conversation 使用 `data/conversations/`，Repository Understanding 使用 `data/repository-understanding/`。`infra/data/` 的基础设施数据职责不变；本 Feature 不把代码理解数据写入 PostgreSQL、Redis、Elasticsearch 或 RustFS。
 - 每个 Repository 使用稳定 Repository ID 对应独立目录。仓库级统一节点池保存每个 Code Node 的独立 JSONL；Call Chain 文件引用 Node Revision；源码按内容哈希单独保存并跨调用链去重。
 - Node JSONL 使用追加式完整单行记录表达 Header 和 Revision。父 Revision ID 允许形成历史分支。精确字段名、哈希算法和文件名在 Plan 中确定，不改变“单节点 JSONL + 独立源码快照 + 调用链引用”的合同。
 - 一次成功 Run 可能更新多个节点。实现必须先写入源码快照和节点 Revision，最后原子发布 Call Chain 新版本；未被已发布 Call Chain 引用的中间文件或 Revision 不得成为前端和 Agent 的当前理解。
@@ -150,7 +160,8 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 
 ### 前端交互
 
-- 前端顶部增加本地仓库入口，至少支持添加具体仓库、添加 Search Root、查看仓库名称与规范路径、选择 Active Repository，以及看到当前分支、HEAD 摘要、dirty 或不可访问状态。
+- 前端顶部增加与“对话”“Knowledge”同级的 `Codebase` 一级视图，不再在右上角放置仓库管理弹层。
+- Codebase 页面至少支持添加具体仓库、查看仓库名称与规范路径、选择 Active Repository、编辑名称/别名、取消注册，以及看到当前分支、HEAD 摘要、dirty 或不可访问状态；不显示 Search Root。
 - 仓库入口不得伪装成浏览器原生目录权限。第一版允许用户输入或粘贴绝对路径，由本地 Server 校验和注册；原生目录选择器属于未来桌面壳能力。
 - Agent 成功沉淀调用链后，在当前回答中显示紧凑 Call Chain 卡片。普通代码问答没有链时不显示空卡片。
 - Call Chain 详情以简单节点与分支展示；点击节点可以查看源码快照、仓库相对路径、当时的 Git Observation 和历史 Revision。第一版不要求复杂自动布局、全仓库画布或可视化编辑器。
@@ -160,6 +171,7 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 
 - 代码探索通常需要 `发现文件 -> 搜索符号 -> 读取实现 -> 查看调用方或历史` 的连续步骤，不能沿用当前本地文档/网页工具固定最多四次的费用边界。
 - Repository 工具使用独立的有界调用预算和结果预算；具体次数、字符数、Token 数与超时在 Plan 中结合现有上下文预算确定。部署可以收紧上限，但 Agent 必须能够完成最小调用链闭环。
+- Active Repository 自动绑定不能消耗一次模型 Tool 调用。预算必须为一次真实的“发现文件 → 定位符号 → 分页读取至少两个方法 → 可选 Git 核实 → stage_call_chain”保留足够空间，不能让仓库选择或无效别名猜测耗尽探索额度。
 - 代码库工具结果不自动进入 Knowledge 文档 RAG，不生成本地文档 `L` Citation，也不写入 Elasticsearch。现有本地文档、网页搜索、Conversation JSONL 权威、Redis Checkpoint 和上下文压缩合同保持不变。
 - 工具启用后的 Run 继续遵守现有 Checkpoint 重建、来源有界和单终态 SSE 规则。代码工具失败只影响本次代码理解，不得破坏 Conversation 历史或其他工具能力。
 
@@ -189,7 +201,7 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 
 ### HTTP、SSE 与前端
 
-- Server 提供仓库列表/注册/移除、Search Root 管理、Active Repository 选择、Call Chain 列表/详情/重命名/删除所需的本地 HTTP 合同。具体 URL 在 Plan 中与现有 `/api` 风格对齐。
+- Server 提供仓库列表/注册/移除、Active Repository 选择、Call Chain 列表/详情/重命名/删除所需的本地 HTTP 合同；Search Root HTTP 合同移除。具体 URL 在 Plan 中与现有 `/api` 风格对齐。
 - Repository 工具运行继续进入现有 Tool Trace；只展示安全、裁剪后的查询摘要、仓库名、相对路径、命中数和截断状态，不展示敏感候选路径、绝对路径全集或完整 Git 原始输出。
 - Agent 成功发布 Call Chain 后，通过现有 SSE 生命周期向前端返回稳定 Call Chain ID 与显示信息；刷新后从持久化历史恢复同一引用。
 - 前端以当前仓库和当前 Run 隔离异步结果。切换仓库、删除调用链或开始新 Run 后，旧响应不得覆盖当前选择。
@@ -197,7 +209,7 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 ### 兼容与配置
 
 - 本 Feature 不需要 PostgreSQL Migration，也不改变现有 Knowledge、Conversation 或 Workspace 表。
-- Repository Understanding 数据位于现有 Server 数据根下的独立命名空间，并继续通过宿主目录或容器卷持久化。精确配置键和目录名在 Plan 中确定；不得写入源码仓库受 Git 跟踪的位置。
+- Server 只接受一个统一数据根配置；Conversation 与 Repository Understanding 从该根派生固定子目录，不再接受能让两者分叉到不同工作目录的独立相对配置。源码开发默认项目根 `data/`，容器固定 `/app/data`，均不得写入 Git 跟踪文件。
 - 现有安装升级后没有 Local Repository 时行为保持不变；代码工具不可用不影响普通对话、文档 RAG 或网页搜索。
 - Research 只作为设计依据；Spec、Plan、实施、提交和发布继续是独立授权步骤。
 
@@ -215,11 +227,11 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 ### 必须覆盖的行为
 
 1. Windows `\` 与 `/` 形式的同一绝对路径解析为同一 Repository；相对路径、缺失目录和非 Git 目录被明确拒绝。
-2. `..`、符号链接和 junction 不能逃出 Repository 或 Search Root；重复注册不会产生重复身份。
-3. Repository 名称、别名和 Search Root 精确目录名能够解析；多候选时停止代码工具并返回选择要求。
+2. `..`、符号链接和 junction 不能逃出 Repository；重复注册不会产生重复身份，系统不会通过父目录发现未注册仓库。
+3. Active Repository 在新 Run 中可以被 Evidence Tool 自动绑定；已注册名称、别名和绝对路径能够显式覆盖，多个名称候选时停止代码工具并返回选择要求。
 4. List、Glob、Grep 和 ReadFile 只读取授权仓库，尊重 ignore、覆盖普通未跟踪文件，并正确报告分页与截断。
 5. Sensitive File 无法通过直接读取、搜索、Glob、符号链接或 Git 历史绕过；模板文件仍可正常读取。
-6. Git status、diff、log、show 和 blame 返回结构化、有界结果；完成前后目标仓库工作树、索引、refs 和对象库没有被工具修改。
+6. Git status、diff、log、show 和 blame 返回结构化、有界结果；除明确的 Server Data Root 外，完成前后目标仓库工作树、索引、refs、对象库和 Git 配置没有被工具修改。
 7. 任意 Shell 或禁止的 Git 写操作不能通过模型参数进入进程执行。
 8. 代码流程问题在核实至少两个方法后自动沉淀简单 Call Chain；单方法、配置或存在性查询不生成链。
 9. 成功 Call Chain 支持分支、汇合或循环引用，且只使用简单 `from -> to`，不要求复杂关系类型。
@@ -234,6 +246,8 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 18. 仓库不可访问时历史 Call Chain、Source Snapshot 和 Node Revision 仍可查看；重新绑定后不重写旧历史。
 19. Assistant 中的 Call Chain 卡片在 SSE 完成和重新打开 Conversation 后指向同一内部链。
 20. 没有注册仓库、代码工具不可用或代码查询失败时，普通对话、Knowledge RAG 和 WebSearch 仍保持既有行为。
+21. 从仓库根、`apps/server` 或 IDE 启动 Server 时只能解析到同一个根数据目录；无效启动配置必须直接失败，不能静默创建第二份 `data`。
+22. Codebase 作为顶部一级视图可完成仓库注册、Active 选择和调用链管理，页面与 API 中不存在 Search Root。
 
 ### 真实验证边界
 
@@ -249,6 +263,7 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 - 任意 Shell、终端执行、构建、测试、包安装或运行目标项目。
 - Repo Map、Tree-sitter/LSP 全量符号图、AST/控制流分析、动态分派解析和复杂调用边类型。
 - 全仓库后台扫描、文件监听、自动刷新全部 Call Chain 或不可见索引。
+- Search Root、父目录授权、按普通目录名发现未注册仓库或扫描本机项目集合。
 - 向量索引、Embedding、Rerank、代码知识库一键构建和把代码写入现有 Knowledge RAG。
 - 跨仓库调用链、同一 Run 比较多个仓库、远程 GitHub 仓库或 SSH/容器内仓库。
 - 敏感文件临时授权、关闭 Sensitive File Policy 或把真实秘密送入模型。
@@ -259,9 +274,9 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 
 ## Acceptance Criteria
 
-1. 用户可以从顶部仓库入口通过绝对路径注册至少两个本地 Git 仓库，并选择默认仓库。
+1. 用户可以从顶部 `Codebase` 一级视图通过绝对路径注册至少两个本地 Git 仓库，并选择 Active Repository。
 2. Windows 下反斜杠与正斜杠路径能够规范化为同一仓库；相对路径、无效路径和越界路径被拒绝。
-3. 用户可以添加 Search Root，并在对话中用项目名或别名定位唯一仓库；重名时系统要求选择。
+3. 用户询问“当前仓库”时，Agent 不需要额外选择 Tool 就能自动使用 Run 开始时的 Active Repository；明确项目名、别名或绝对路径仍可在首次读取前覆盖，重名时系统要求选择。
 4. Agent 可以使用 List、Glob、Grep、分页 ReadFile 以及只读 Git status/diff/log/show/blame 回答当前代码与历史问题。
 5. 所有代码库工具都不能修改目标仓库；敏感文件在所有读取入口中不可访问且不能进入模型或 Source Snapshot。
 6. 用户询问真实代码流程时，Agent 能基于至少两个源码方法返回带路径和源码证据的解释，并自动沉淀简单 Call Chain。
@@ -270,7 +285,7 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 9. 已有节点源码变化后，下一次实际使用能够追加新 Revision 并保留旧版本；不同 Git 分支可以保留不同后续 Revision。
 10. Agent 可以改进自动生成的链名称；用户手动命名后保持优先，并可以删除 Call Chain。
 11. Run 失败、取消、证据不足或仓库在分析期间变化时不会发布半条或混合状态的 Call Chain。
-12. Repository Understanding 数据在 Server 管理的文件系统中独立持久化；服务重启和 Conversation 重新打开后仓库、调用链和源码快照仍可读取。
+12. Conversation 与 Repository Understanding 数据统一持久化在项目根 `data/`；从不同工作目录启动不会再生成 `apps/server/data`，服务重启和 Conversation 重新打开后仓库、调用链和源码快照仍可读取。
 13. 仓库移动或暂时不可访问时历史理解仍可查看；删除内部理解数据不影响目标仓库。
 14. 工具结果达到上限时 UI 和 Agent 都能看到截断范围，最终回答不会把部分结果描述为完整仓库结论。
 15. 未注册仓库或代码工具失败不会破坏普通 Conversation、本地文档 RAG、WebSearch、现有 Citation 和恢复链路。
@@ -281,3 +296,4 @@ Node Revision 形成时记录的只读 Git 与工作树事实，至少能够区�
 - 当前 Spec 已由开发者确认，状态为 `Specified`；编写 Plan、实施、验证、提交和发布仍需分别授权。
 - 精确 JSONL 字段、文件名、内容哈希算法、工具调用次数、结果大小、超时、HTTP 路径和 UI 视觉布局属于 Plan/实施选择，不在 Spec 中提前冻结。
 - 第一版的价值判断以“开发者能在自然语言对话中重新理解本地项目，并复用已经核实的简单调用链”为准，不以节点数量、索引规模或图算法复杂度为目标。
+- Stage 03.5 的纠偏依据是 Conversation `9ad96b05-f513-4f52-bc61-2b9272ef407d`：Active Repository 已持久化，但模型连续使用五个错误非空引用并得到 `REFERENCE_NOT_FOUND`；用户补充绝对路径后才成功绑定，随后又在完成调用链前耗尽代码库调用/结果预算。该证据用于修正默认绑定和预算，不把一次模型行为扩展成 Repo Map 或静态索引需求。

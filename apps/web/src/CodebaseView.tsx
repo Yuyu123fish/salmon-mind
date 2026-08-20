@@ -1,15 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  addSearchRoot,
   fetchCodebase,
   listCallChains,
   registerRepository,
-  removeSearchRoot,
   setActiveRepository,
   unregisterRepository,
   updateRepository,
-  type CodebaseCatalog,
   type CallChainSummary,
+  type CodebaseCatalog,
   type Repository,
 } from './codebaseApi.ts'
 import CallChainView from './CallChainView.tsx'
@@ -22,15 +20,14 @@ type LoadState =
 type EditDraft = { name: string; aliases: string }
 
 /**
- * 顶部本地仓库入口。catalog 状态独立于 Conversation cache/run state，
- * 旧的加载或 mutation 响应不能覆盖当前 catalog。
+ * Codebase 一级视图：统一承载具体 Repository 的注册、Active 选择与调用链查看。
+ * catalog 是唯一状态来源；每类请求都用序号和 AbortController 隔离过期响应。
  */
-export default function RepositoryMenu() {
+export default function CodebaseView() {
   const [catalog, setCatalog] = useState<CodebaseCatalog | null>(null)
   const [loadState, setLoadState] = useState<LoadState>({ status: 'loading' })
-  const [open, setOpen] = useState(false)
+  const [selectedRepositoryId, setSelectedRepositoryId] = useState<string | null>(null)
   const [repositoryPath, setRepositoryPath] = useState('')
-  const [searchRootPath, setSearchRootPath] = useState('')
   const [editDrafts, setEditDrafts] = useState<Record<string, EditDraft>>({})
   const [mutation, setMutation] = useState(false)
   const [mutationError, setMutationError] = useState<string | null>(null)
@@ -67,34 +64,41 @@ export default function RepositoryMenu() {
   }, [refresh])
 
   useEffect(() => {
-    if (open) void refresh()
-  }, [open, refresh])
+    setSelectedRepositoryId((current) => {
+      if (current !== null && catalog?.repositories.some((repository) => repository.id === current)) {
+        return current
+      }
+      return catalog?.activeRepositoryId ?? catalog?.repositories[0]?.id ?? null
+    })
+  }, [catalog])
+
+  const selected = catalog?.repositories.find((repository) => repository.id === selectedRepositoryId) ?? null
+  const active = catalog?.repositories.find((repository) => repository.id === catalog?.activeRepositoryId) ?? null
 
   useEffect(() => {
     const sequence = ++callChainSequence.current
-    const repositoryId = activeRepositoryId(catalog)
     callChainAbort.current?.abort()
-    if (!open || repositoryId === null) {
+    setOpenCallChainId(null)
+    if (selectedRepositoryId === null) {
       setCallChains([])
-      setOpenCallChainId(null)
       setCallChainState({ status: 'ready' })
       return
     }
     const controller = new AbortController()
     callChainAbort.current = controller
     setCallChainState({ status: 'loading' })
-    void listCallChains(repositoryId, controller.signal)
+    void listCallChains(selectedRepositoryId, controller.signal)
       .then((next) => {
         if (controller.signal.aborted || sequence !== callChainSequence.current) return
         setCallChains(next)
         setCallChainState({ status: 'ready' })
       })
       .catch((error: unknown) => {
-        if (controller.signal.aborted) return
+        if (controller.signal.aborted || sequence !== callChainSequence.current) return
         setCallChainState({ status: 'error', message: errorMessage(error) })
       })
     return () => controller.abort()
-  }, [catalog, callChainRefresh, open])
+  }, [selectedRepositoryId, callChainRefresh])
 
   const runMutation = useCallback(async (action: () => Promise<void>) => {
     const sequence = ++mutationSequence.current
@@ -110,9 +114,6 @@ export default function RepositoryMenu() {
     }
   }, [refresh])
 
-  const active = catalog?.repositories.find((repository) => repository.id === catalog.activeRepositoryId) ?? null
-  const triggerLabel = active === null ? '选择本地仓库' : `本地仓库：${active.name}`
-
   const addRepository = () => {
     const path = repositoryPath.trim()
     if (path === '') {
@@ -120,26 +121,22 @@ export default function RepositoryMenu() {
       return
     }
     void runMutation(async () => {
-      await registerRepository(path)
+      const repository = await registerRepository(path)
       setRepositoryPath('')
+      setSelectedRepositoryId(repository.id)
     })
   }
 
-  const addRoot = () => {
-    const path = searchRootPath.trim()
-    if (path === '') {
-      setMutationError('请输入 Search Root 绝对路径')
-      return
-    }
-    void runMutation(async () => {
-      await addSearchRoot(path)
-      setSearchRootPath('')
-    })
-  }
-
-  const chooseActive = (repositoryId: string | null) => {
+  const chooseActive = (repositoryId: string) => {
+    setSelectedRepositoryId(repositoryId)
     void runMutation(async () => {
       await setActiveRepository(repositoryId)
+    })
+  }
+
+  const clearActive = () => {
+    void runMutation(async () => {
+      await setActiveRepository(null)
     })
   }
 
@@ -157,28 +154,15 @@ export default function RepositoryMenu() {
   }
 
   return (
-    <div className="repository-menu">
-      <button
-        type="button"
-        className="repository-trigger"
-        aria-expanded={open}
-        aria-haspopup="dialog"
-        onClick={() => setOpen((current) => !current)}
-      >
-        <span className="repository-trigger-label">{triggerLabel}</span>
-        <span className="repository-trigger-status">{active === null ? '未选择' : statusLabel(active)}</span>
-      </button>
-
-      {open && (
-        <section className="repository-panel" role="dialog" aria-label="本地仓库管理">
+    <main className="codebase-main">
+      <div className="codebase-view">
+        <section className="repository-panel codebase-panel" role="region" aria-label="Codebase">
           <header className="repository-panel-head">
             <div>
               <p className="kicker">只读代码库入口</p>
-              <h2>本地仓库</h2>
+              <h1>Codebase</h1>
             </div>
-            <button type="button" className="repository-close" aria-label="关闭本地仓库管理" onClick={() => setOpen(false)}>
-              关闭
-            </button>
+            <p className="codebase-data-note">只读取目标代码；使用数据写入 SalmonMind 根 data。</p>
           </header>
 
           {loadState.status === 'loading' && <p className="repository-hint">正在读取仓库 catalog…</p>}
@@ -192,6 +176,21 @@ export default function RepositoryMenu() {
 
           {catalog !== null && (
             <div className="repository-panel-body">
+              <section className="codebase-active" aria-label="当前 Active Repository">
+                <div>
+                  <p className="kicker">当前 Active Repository</p>
+                  <h2>{active?.name ?? '未选择'}</h2>
+                </div>
+                {active !== null ? (
+                  <div className="codebase-active-meta">
+                    <span>{statusLabel(active)}</span>
+                    <code>{active.path}</code>
+                  </div>
+                ) : (
+                  <p className="repository-hint">选择一个已注册仓库后，下一次 Agent Run 会以它作为默认代码上下文。</p>
+                )}
+              </section>
+
               <p className="repository-platform">
                 Server：{catalog.platform.operatingSystem} · 路径示例：<code>{catalog.platform.pathExample}</code>
                 {!catalog.gitAvailable && <span className="repository-unavailable"> · Git 不可用</span>}
@@ -199,26 +198,26 @@ export default function RepositoryMenu() {
 
               <div className="repository-section">
                 <div className="repository-section-title">
-                  <h3>已注册仓库</h3>
-                  {active !== null && <button type="button" className="text-button" disabled={mutation} onClick={() => chooseActive(null)}>清空 Active</button>}
+                  <h2>已注册仓库</h2>
+                  {active !== null && <button type="button" className="text-button" disabled={mutation} onClick={clearActive}>清空 Active</button>}
                 </div>
                 {catalog.repositories.length === 0 && <p className="repository-hint">还没有仓库。添加一个 Server 所在机器上的绝对路径。</p>}
                 <div className="repository-list">
                   {catalog.repositories.map((repository) => {
                     const draft = editDrafts[repository.id] ?? { name: repository.name, aliases: repository.aliases.join(', ') }
-                    const selected = repository.id === catalog.activeRepositoryId
+                    const isSelected = repository.id === selectedRepositoryId
                     return (
-                      <article key={repository.id} className="repository-card" data-selected={selected}>
+                      <article key={repository.id} className="repository-card" data-selected={isSelected}>
                         <button
                           type="button"
                           className="repository-choice"
-                          aria-pressed={selected}
+                          aria-pressed={isSelected}
                           disabled={mutation || repository.status === 'UNAVAILABLE'}
                           onClick={() => chooseActive(repository.id)}
                         >
                           <span className="repository-choice-main">
                             <strong>{repository.name}</strong>
-                            <small>{statusLabel(repository)}</small>
+                            <small>{repository.id === catalog.activeRepositoryId ? 'Active · ' : ''}{statusLabel(repository)}</small>
                           </span>
                           <code>{repository.path}</code>
                         </button>
@@ -259,7 +258,7 @@ export default function RepositoryMenu() {
               </div>
 
               <div className="repository-section">
-                <h3>添加仓库</h3>
+                <h2>添加仓库</h2>
                 <div className="repository-add-row">
                   <input
                     aria-label="仓库绝对路径"
@@ -275,39 +274,14 @@ export default function RepositoryMenu() {
               </div>
 
               <div className="repository-section">
-                <h3>Search Root</h3>
-                <div className="repository-add-row">
-                  <input
-                    aria-label="Search Root 绝对路径"
-                    placeholder={catalog.platform.pathExample}
-                    value={searchRootPath}
-                    disabled={mutation}
-                    onChange={(event) => setSearchRootPath(event.target.value)}
-                    onKeyDown={(event) => { if (event.key === 'Enter') addRoot() }}
-                  />
-                  <button type="button" disabled={mutation} onClick={addRoot}>授权目录</button>
-                </div>
-                {catalog.searchRoots.length > 0 ? (
-                  <ul className="search-root-list">
-                    {catalog.searchRoots.map((root) => (
-                      <li key={root.id}>
-                        <code>{root.path}</code>
-                        <button type="button" disabled={mutation} onClick={() => void runMutation(async () => { await removeSearchRoot(root.id) })}>移除</button>
-                      </li>
-                    ))}
-                  </ul>
-                ) : <p className="repository-hint">尚未授权发现目录。</p>}
-              </div>
-
-              <div className="repository-section">
                 <div className="repository-section-title">
-                  <h3>当前仓库调用链</h3>
-                  {active !== null && <button type="button" className="text-button" onClick={() => setCallChainRefresh((current) => current + 1)}>刷新</button>}
+                  <h2>当前选中仓库的调用链</h2>
+                  {selected !== null && <button type="button" className="text-button" onClick={() => setCallChainRefresh((current) => current + 1)}>刷新</button>}
                 </div>
-                {active === null && <p className="repository-hint">选择一个当前仓库后，这里会显示已保存的调用链。</p>}
-                {active !== null && callChainState.status === 'loading' && <p className="repository-hint">正在读取调用链…</p>}
-                {active !== null && callChainState.status === 'error' && <p className="repository-error" role="alert">{callChainState.message}</p>}
-                {active !== null && callChainState.status === 'ready' && callChains.length === 0 && <p className="repository-hint">当前仓库还没有已保存的调用链。</p>}
+                {selected === null && <p className="repository-hint">选择一个仓库后，这里会显示已保存的调用链。</p>}
+                {selected !== null && callChainState.status === 'loading' && <p className="repository-hint">正在读取调用链…</p>}
+                {selected !== null && callChainState.status === 'error' && <p className="repository-error" role="alert">{callChainState.message}</p>}
+                {selected !== null && callChainState.status === 'ready' && callChains.length === 0 && <p className="repository-hint">当前仓库还没有已保存的调用链。</p>}
                 {callChains.length > 0 && (
                   <div className="call-chain-menu-list">
                     {callChains.map((callChain) => (
@@ -321,9 +295,9 @@ export default function RepositoryMenu() {
                     ))}
                   </div>
                 )}
-                {active !== null && openCallChainId !== null && (
+                {selected !== null && openCallChainId !== null && (
                   <CallChainView
-                    repositoryId={active.id}
+                    repositoryId={selected.id}
                     callChainId={openCallChainId}
                     fallbackName={callChains.find((callChain) => callChain.id === openCallChainId)?.name ?? '调用链'}
                     onClose={() => {
@@ -340,8 +314,8 @@ export default function RepositoryMenu() {
             </div>
           )}
         </section>
-      )}
-    </div>
+      </div>
+    </main>
   )
 }
 
@@ -358,8 +332,4 @@ function statusLabel(repository: Repository): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '代码库服务请求失败'
-}
-
-function activeRepositoryId(catalog: CodebaseCatalog | null): string | null {
-  return catalog?.activeRepositoryId ?? null
 }

@@ -1,6 +1,5 @@
 package com.yuyu.salmonmind.codebase.application.port;
 
-import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -10,10 +9,8 @@ import java.util.UUID;
  * <p>Active 只能指向已注册仓库或为空；应用层据此串行编排注册和选择操作。</p>
  */
 public record CatalogState(Map<UUID, StoredRepository> repositories,
-                           UUID activeRepositoryId,
-                           List<StoredSearchRoot> searchRoots) {
+                           UUID activeRepositoryId) {
     public CatalogState {
         repositories = repositories == null ? Map.of() : Map.copyOf(repositories);
-        searchRoots = searchRoots == null ? List.of() : List.copyOf(searchRoots);
     }
 }

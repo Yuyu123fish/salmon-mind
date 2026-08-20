@@ -1,6 +1,11 @@
 package com.yuyu.salmonmind.agent.infrastructure.reactagent;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -11,6 +16,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
 import com.yuyu.salmonmind.agent.api.AgentRequest;
@@ -22,8 +28,12 @@ import com.yuyu.salmonmind.agent.api.AgentToolFailed;
 import com.yuyu.salmonmind.agent.api.AgentToolOutcomeDetail;
 import com.yuyu.salmonmind.agent.api.AgentToolStarted;
 import com.yuyu.salmonmind.agent.api.CheckpointPolicy;
+import com.yuyu.salmonmind.codebase.api.CodebaseService;
+import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService;
+import com.yuyu.salmonmind.codebase.api.RepositoryResolution;
 import com.yuyu.salmonmind.model.chat.ChatModelHandle;
 import com.yuyu.salmonmind.model.chat.ChatModelProvider;
+import com.yuyu.salmonmind.persistence.redis.RedissonClientProvider;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -137,9 +147,55 @@ class AgentToolRuntimeIntegrationTest {
                 item -> assertThat(item).extracting(
                         AgentRunTraceItem::kind, AgentRunTraceItem::toolCallId, AgentRunTraceItem::toolStatus)
                         .containsExactly(AgentRunTraceItem.Kind.TOOL, ToolCallingChatModel.TOOL_CALL_ID,
-                                AgentRunTraceItem.ToolStatus.COMPLETED),
+                        AgentRunTraceItem.ToolStatus.COMPLETED),
                 item -> assertThat(item).extracting(AgentRunTraceItem::kind, AgentRunTraceItem::text)
                         .containsExactly(AgentRunTraceItem.Kind.REASONING, "资料足够，可以作答。"));
+    }
+
+    @Test
+    void completesCurrentRepositoryFlowWithAutomaticBindingTwoReadsAndStagedChain() {
+        UUID repositoryId = UUID.randomUUID();
+        CodebaseService codebase = mock(CodebaseService.class);
+        when(codebase.resolveRepository((String) null)).thenReturn(RepositoryResolution.resolved(
+                new RepositoryResolution.ResolvedRepository(
+                        repositoryId, "salmon-mind", "D:/salmon-mind", true,
+                        "READY", "main", "abc123", false)));
+
+        RepositoryEvidenceService evidence = mock(RepositoryEvidenceService.class);
+        RepositoryEvidenceService.EvidenceMetadata metadata = new RepositoryEvidenceService.EvidenceMetadata(
+                repositoryId, "salmon-mind", "test", "main", "abc123", false,
+                true, false, 1, 1, false, null, null);
+        when(evidence.listDirectory(any())).thenReturn(new RepositoryEvidenceService.ListDirectoryResult(
+                metadata, List.of(new RepositoryEvidenceService.DirectoryEntry("src", "src", true, false))));
+        when(evidence.readFile(any())).thenAnswer(invocation -> {
+            RepositoryEvidenceService.ReadFileQuery query = invocation.getArgument(0);
+            return switch (query.relativePath()) {
+                case "src/Entry.java" -> new RepositoryEvidenceService.ReadFileResult(
+                        metadata, query.relativePath(), false, query.startLine(), query.startLine() + 1,
+                        "void enter() {\n  run();");
+                case "src/Service.java" -> new RepositoryEvidenceService.ReadFileResult(
+                        metadata, query.relativePath(), false, query.startLine(), query.startLine() + 1,
+                        "void run() {\n  return; ");
+                default -> throw new AssertionError("unexpected read path: " + query.relativePath());
+            };
+        });
+
+        CodebaseFlowChatModel model = new CodebaseFlowChatModel();
+        ReactAgentSessionAdapter adapter = newCodebaseAdapter(model, codebase, evidence);
+        RecordingListener events = new RecordingListener();
+
+        AgentResult result = completeSync(adapter, events, new AgentRequest(
+                UUID.randomUUID().toString(), null, UUID.randomUUID(),
+                userList("请分析当前仓库的入口到服务流程"), CheckpointPolicy.REBUILD_FROM_PROJECTION));
+
+        assertThat(result.text()).isEqualTo(CodebaseFlowChatModel.FINAL_ANSWER);
+        assertThat(model.toolNames).containsExactly(
+                "list_repository_directory", "read_repository_file", "read_repository_file", "stage_call_chain");
+        assertThat(events.started).extracting(AgentToolStarted::toolName).containsExactly(
+                "list_repository_directory", "read_repository_file", "read_repository_file", "stage_call_chain");
+        assertThat(events.completed).hasSize(4);
+        verify(codebase, times(1)).resolveRepository((String) null);
+        verify(evidence, times(2)).readFile(any());
     }
 
     @Test
@@ -585,6 +641,26 @@ class AgentToolRuntimeIntegrationTest {
         return adapter;
     }
 
+    private ReactAgentSessionAdapter newCodebaseAdapter(
+            ChatModel model, CodebaseService codebase, RepositoryEvidenceService evidence
+    ) {
+        List<ToolCallback> productionTools = CodebaseToolCallback.productionTools(
+                new ObjectMapper(), codebase, evidence);
+        var adapter = new ReactAgentSessionAdapter(
+                (ChatModelProvider) () -> new ChatModelHandle(model, "test-provider", "test-model"),
+                new RedissonClientProvider(redisUrl, "", true),
+                65_432, 32_768, 0.1, 200_000,
+                List.of(), productionTools,
+                4, 32_768, 32,
+                64, 32_768, 4_096,
+                Duration.ofHours(24), 3,
+                2, 1, Duration.ofSeconds(60),
+                2, 131_072L, Duration.ofSeconds(120),
+                codebase, evidence, 16, 65_536, 65_536);
+        adapters.add(adapter);
+        return adapter;
+    }
+
     private static AgentResult completeSync(ReactAgentSessionAdapter adapter, RecordingListener events, AgentRequest request) {
         adapter.stream(request, events);
         if (events.error() != null) {
@@ -973,6 +1049,69 @@ class AgentToolRuntimeIntegrationTest {
                 throw new IllegalStateException("搜索服务不可用：gate 测试注入异常");
             }
             return resultText;
+        }
+    }
+
+    /**
+     * 代码库 Stage 的确定性模型：不发送空参数选择，而是直接使用当前 Run 的 Active
+     * 快照完成定位、两次源码读取和调用链草稿，验证真实 ReactAgent Tool Loop 的顺序。
+     */
+    static final class CodebaseFlowChatModel implements ChatModel {
+
+        static final String FINAL_ANSWER = "已根据当前仓库的两段源码整理入口到服务流程。";
+
+        private final List<List<Message>> calls = new CopyOnWriteArrayList<>();
+        private final List<String> toolNames = new CopyOnWriteArrayList<>();
+
+        @Override
+        public ChatResponse call(Prompt prompt) {
+            List<Message> instructions = new ArrayList<>(prompt.getInstructions());
+            calls.add(instructions);
+            int toolResultCount = instructions.stream()
+                    .filter(ToolResponseMessage.class::isInstance)
+                    .map(ToolResponseMessage.class::cast)
+                    .mapToInt(message -> message.getResponses().size())
+                    .sum();
+            return switch (toolResultCount) {
+                case 0 -> tool("codebase-list-001", "list_repository_directory",
+                        "{\"path\":\"src\",\"limit\":20}");
+                case 1 -> tool("codebase-read-001", "read_repository_file",
+                        "{\"path\":\"src/Entry.java\",\"startLine\":1,\"lineCount\":2}");
+                case 2 -> tool("codebase-read-002", "read_repository_file",
+                        "{\"path\":\"src/Service.java\",\"startLine\":1,\"lineCount\":2}");
+                case 3 -> tool("codebase-stage-001", "stage_call_chain", """
+                        {"name":"入口到服务","nodes":[
+                          {"key":"entry","language":"java","qualifiedSymbol":"Demo.enter","signature":"void enter()","path":"src/Entry.java","startLine":1,"endLine":2,"summary":"入口"},
+                          {"key":"service","language":"java","qualifiedSymbol":"Demo.run","signature":"void run()","path":"src/Service.java","startLine":1,"endLine":2,"summary":"服务"}
+                        ],"edges":[{"from":"entry","to":"service"}]}
+                        """);
+                default -> finalAnswer();
+            };
+        }
+
+        private ChatResponse tool(String id, String name, String arguments) {
+            toolNames.add(name);
+            AssistantMessage message = AssistantMessage.builder()
+                    .toolCalls(List.of(new AssistantMessage.ToolCall(id, "function", name, arguments)))
+                    .properties(Map.of("reasoningContent", "按有界顺序读取当前仓库证据。"))
+                    .build();
+            return new ChatResponse(List.of(new Generation(message)));
+        }
+
+        private ChatResponse finalAnswer() {
+            AssistantMessage message = AssistantMessage.builder().content(FINAL_ANSWER).build();
+            return new ChatResponse(List.of(new Generation(message)),
+                    ChatResponseMetadata.builder().usage(new DefaultUsage(120, 20, 140)).build());
+        }
+
+        @Override
+        public org.springframework.ai.chat.prompt.ChatOptions getDefaultOptions() {
+            return OpenAiChatOptions.builder().build();
+        }
+
+        @Override
+        public reactor.core.publisher.Flux<ChatResponse> stream(Prompt prompt) {
+            return reactor.core.publisher.Flux.just(call(prompt));
         }
     }
 

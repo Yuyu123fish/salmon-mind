@@ -2,11 +2,12 @@ package com.yuyu.salmonmind.codebase.domain;
 
 import com.yuyu.salmonmind.codebase.api.CodebaseErrorCode;
 import com.yuyu.salmonmind.codebase.api.CodebaseException;
+import com.yuyu.salmonmind.persistence.filesystem.ServerDataRoot;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -17,7 +18,7 @@ import java.util.Set;
  * 所有文件与 Git 内容入口共享的不可关闭敏感文件策略。
  *
  * <p>策略只根据规范化路径组件和文件名判断，不先读取内容再过滤；模板环境文件可读，
- * 真实环境、私钥、凭据目录、数据库备份及 Server 自有数据目录始终拒绝。</p>
+ * 真实环境、私钥、凭据目录、数据库备份及 Server Data Root 始终拒绝。</p>
  */
 @Component
 public final class SensitiveFilePolicy {
@@ -36,11 +37,8 @@ public final class SensitiveFilePolicy {
     private final List<Path> protectedRoots;
 
     @Autowired
-    public SensitiveFilePolicy(
-            @Value("${codebase.data-dir:data/repository-understanding}") String codebaseDataDir,
-            @Value("${salmon.conversation.data-dir:data}") String conversationDataDir
-    ) {
-        protectedRoots = List.of(configuredRoot(codebaseDataDir), configuredRoot(conversationDataDir));
+    public SensitiveFilePolicy(ServerDataRoot serverDataRoot) {
+        protectedRoots = List.of(normalizeRoot(serverDataRoot.root()));
     }
 
     public SensitiveFilePolicy(List<Path> protectedRoots) {
@@ -123,7 +121,22 @@ public final class SensitiveFilePolicy {
 
     private boolean isUnderProtectedRoot(Path realPath) {
         Path normalized = normalizeRoot(realPath);
-        return protectedRoots.stream().anyMatch(root -> normalized.equals(root) || normalized.startsWith(root));
+        if (isUnderAnyProtectedRoot(normalized)) {
+            return true;
+        }
+        try {
+            // 调用方通常已给出真实路径；这里再解一次 symlink/junction，避免未来新增入口只做绝对路径规范化时绕过数据根。
+            if (Files.exists(normalized)) {
+                return isUnderAnyProtectedRoot(normalized.toRealPath());
+            }
+        } catch (IOException | SecurityException ignored) {
+            // 无法解析时保留规范化路径判断，不因保护检查改变原有不可访问错误语义。
+        }
+        return false;
+    }
+
+    private boolean isUnderAnyProtectedRoot(Path candidate) {
+        return protectedRoots.stream().anyMatch(root -> candidate.equals(root) || candidate.startsWith(root));
     }
 
     private boolean isConfigurationLike(String name) {
@@ -136,21 +149,6 @@ public final class SensitiveFilePolicy {
     private boolean containsTemplateMarker(String name) {
         return name.contains("example") || name.contains("sample")
                 || name.contains("template") || name.contains("dist");
-    }
-
-    private Path configuredRoot(String value) {
-        if (value == null || value.isBlank()) {
-            return Path.of(".").toAbsolutePath().normalize();
-        }
-        try {
-            Path path = Path.of(value).toAbsolutePath().normalize();
-            if (Files.exists(path)) {
-                return path.toRealPath();
-            }
-            return path;
-        } catch (Exception ex) {
-            return Path.of(".").toAbsolutePath().normalize();
-        }
     }
 
     private Path normalizeRoot(Path value) {

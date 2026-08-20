@@ -3,7 +3,6 @@ package com.yuyu.salmonmind.codebase.web;
 import com.yuyu.salmonmind.codebase.api.CodebaseCatalogView;
 import com.yuyu.salmonmind.codebase.api.CodebaseService;
 import com.yuyu.salmonmind.codebase.api.RepositoryView;
-import com.yuyu.salmonmind.codebase.api.SearchRootView;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -64,15 +63,6 @@ class CodebaseController {
         return codebase.setActiveRepository(request.repositoryId());
     }
 
-    @PostMapping("/search-roots")
-    ResponseEntity<SearchRootView> addSearchRoot(@RequestBody SearchRootRequest request) {
-        return ResponseEntity.status(HttpStatus.CREATED).body(codebase.addSearchRoot(request.path()));
-    }
-
-    @DeleteMapping("/search-roots/{searchRootId}")
-    CodebaseCatalogView removeSearchRoot(@PathVariable UUID searchRootId) {
-        return codebase.removeSearchRoot(searchRootId);
-    }
 
     record RegisterRepositoryRequest(String path, String name, List<String> aliases) {
     }
@@ -83,6 +73,4 @@ class CodebaseController {
     record ActiveRepositoryRequest(UUID repositoryId) {
     }
 
-    record SearchRootRequest(String path) {
-    }
 }

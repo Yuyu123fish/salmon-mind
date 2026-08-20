@@ -14,11 +14,12 @@ spring:
 
 # 本地代码库只读底座配置；目标仓库不会被写入。修改后需重启 Server。
 codebase:
-  data-dir: data/repository-understanding
   git-command: git
   git-timeout: 10s
 
 salmon:
+  # 可选：使用绝对路径覆盖项目根 data/；修改后需重启 Server。
+  # data-dir: D:/salmon-mind-data
   model:
     chat:
       # OpenAI-compatible API key；base-url 与 model-name 保留在 application.yml 的非敏感默认值中
@@ -60,8 +61,8 @@ salmon:
     max-tool-result-tokens-per-run: 32768
     codebase:
       # 可选：本地代码库工具独立预算；默认值可下调，修改后重启后端生效
-      max-tool-calls-per-run: 12
-      max-tool-result-tokens-per-run: 32768
+      max-tool-calls-per-run: 16
+      max-tool-result-tokens-per-run: 65536
       max-tool-result-chars: 65536
     # 可选：一次 Agent Loop 的模型调用硬上限；默认 32，修改后重启后端生效
     max-steps: 32
@@ -69,6 +70,7 @@ salmon:
     # 本地 Redis 无密码时留空
     password:
   conversation:
+    # Conversation 目录由唯一 salmon.data-dir 派生，不要再配置独立 data-dir。
     cache:
       # 可选：Redis 快照缓存默认开启；Redis 不可用时自动回退 JSONL
       enabled: true

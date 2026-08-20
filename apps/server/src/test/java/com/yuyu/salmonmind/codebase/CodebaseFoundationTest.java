@@ -4,6 +4,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yuyu.salmonmind.codebase.api.CodebaseErrorCode;
 import com.yuyu.salmonmind.codebase.api.CodebaseException;
 import com.yuyu.salmonmind.codebase.api.CodebaseCatalogView;
+import com.yuyu.salmonmind.codebase.api.CallChainEdgeInput;
+import com.yuyu.salmonmind.codebase.api.CallChainNodeInput;
+import com.yuyu.salmonmind.codebase.api.CallChainPrepareRequest;
+import com.yuyu.salmonmind.codebase.api.RepositoryObservation;
 import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService;
 import com.yuyu.salmonmind.codebase.api.RepositoryResolution;
 import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService.GitBlameResult;
@@ -16,12 +20,16 @@ import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService.GrepResult;
 import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService.ListDirectoryResult;
 import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService.ReadFileResult;
 import com.yuyu.salmonmind.codebase.application.RepositoryCatalogService;
+import com.yuyu.salmonmind.codebase.application.CallChainApplicationService;
 import com.yuyu.salmonmind.codebase.application.RepositoryEvidenceApplicationService;
+import com.yuyu.salmonmind.codebase.application.port.CallChainStorePort;
 import com.yuyu.salmonmind.codebase.infrastructure.filesystem.CatalogStore;
+import com.yuyu.salmonmind.codebase.infrastructure.filesystem.FileSystemCallChainStore;
 import com.yuyu.salmonmind.codebase.infrastructure.filesystem.RepositoryPathResolver;
 import com.yuyu.salmonmind.codebase.domain.SensitiveFilePolicy;
 import com.yuyu.salmonmind.codebase.infrastructure.git.GitProcessRunner;
 import com.yuyu.salmonmind.codebase.infrastructure.git.GitRepositoryQuery;
+import com.yuyu.salmonmind.persistence.filesystem.ServerDataRoot;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -32,6 +40,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -89,10 +98,6 @@ class CodebaseFoundationTest {
         assertThat(duplicate.id()).isEqualTo(first.id());
         assertThat(catalog.catalog().repositories()).hasSize(1);
 
-        var searchRoot = catalog.addSearchRoot(temporaryDirectory.toString());
-        assertThat(catalog.addSearchRoot(temporaryDirectory.toString()).id()).isEqualTo(searchRoot.id());
-        assertThat(catalog.catalog().searchRoots()).hasSize(1);
-
         CodebaseCatalogView afterCancel = catalog.unregisterRepository(first.id());
         assertThat(afterCancel.activeRepositoryId()).isNull();
         assertThat(afterCancel.repositories()).isEmpty();
@@ -123,13 +128,6 @@ class CodebaseFoundationTest {
                 .isEqualTo(activeId);
         assertThat(catalog.catalog().activeRepositoryId()).isEqualTo(activeId);
 
-        Path discovered = createGitRepository("discovered-repository");
-        catalog.addSearchRoot(temporaryDirectory.toString());
-        RepositoryResolution discoveredResolution = catalog.resolveRepository(discovered.getFileName().toString());
-        assertThat(discoveredResolution.status()).isEqualTo(RepositoryResolution.Status.RESOLVED);
-        assertThat(discoveredResolution.repository().path()).isEqualTo(discovered.toRealPath().toString());
-        assertThat(catalog.catalog().activeRepositoryId()).isEqualTo(activeId);
-
         Path second = createGitRepository("second-repository");
         catalog.registerRepository(second.toString(), "primary", List.of());
         RepositoryResolution ambiguous = catalog.resolveRepository("primary");
@@ -142,6 +140,24 @@ class CodebaseFoundationTest {
         assertThat(missing.reason()).isEqualTo("REFERENCE_NOT_FOUND");
         assertThat(missing.repository()).isNull();
         assertThat(catalog.catalog().activeRepositoryId()).isEqualTo(activeId);
+    }
+
+    @Test
+    void migratesV1SettingsWithoutAccessingSearchRootDirectories() throws Exception {
+        UUID activeId = catalog.catalog().activeRepositoryId();
+        Path forbidden = temporaryDirectory.resolve("directory-that-must-not-be-read");
+        String legacy = "{\"formatVersion\":1,\"activeRepositoryId\":\"" + activeId
+                + "\",\"searchRoots\":[{\"id\":\"00000000-0000-0000-0000-000000000001\","
+                + "\"path\":\"" + forbidden.toString().replace("\\", "\\\\")
+                + "\",\"createdAt\":\"2026-08-20T00:00:00Z\"}]}";
+        write(catalogDirectory.resolve("settings.json"), legacy);
+
+        CatalogStore restarted = new CatalogStore(new ObjectMapper(), catalogDirectory.toString());
+
+        assertThat(restarted.snapshot().activeRepositoryId()).isEqualTo(activeId);
+        assertThat(forbidden).doesNotExist();
+        String migrated = Files.readString(catalogDirectory.resolve("settings.json"));
+        assertThat(migrated).contains("\"formatVersion\" : 2").doesNotContain("searchRoots");
     }
     @Test
     void rejectsRelativePathsAndCorruptedCatalogWithoutFallingBack() throws Exception {
@@ -229,6 +245,75 @@ class CodebaseFoundationTest {
         assertThat(repositoryFingerprintByFile(repository)).containsExactlyInAnyOrderEntriesOf(before);
     }
 
+    @Test
+    void protectsOwnedDataRootFromEvidenceAndAllowsCallChainWritesInsideIt() throws Exception {
+        Path source = repository.resolve("src/Flow.java");
+        write(source, "class Flow {\n  void enter() {\n    run();\n  }\n\n  void run() {\n  }\n}\n");
+        Map<String, String> before = repositoryFingerprintByFileExcluding(repository, repository.resolve("data"));
+        Path ownedDataRoot = repository.resolve("data");
+        ServerDataRoot serverDataRoot = new ServerDataRoot(
+                ownedDataRoot.toString(), temporaryDirectory.resolve("unrelated-working-directory"));
+        write(ownedDataRoot.resolve("private.txt"), "server-owned\n");
+
+        ObjectMapper mapper = new ObjectMapper();
+        GitProcessRunner runner = new GitProcessRunner("git", Duration.ofSeconds(10));
+        CatalogStore ownedStore = new CatalogStore(mapper, serverDataRoot);
+        RepositoryPathResolver ownedPaths = new RepositoryPathResolver(runner);
+        SensitiveFilePolicy ownedPolicy = new SensitiveFilePolicy(serverDataRoot);
+        GitRepositoryQuery ownedGit = new GitRepositoryQuery(runner, ownedPolicy);
+        RepositoryCatalogService ownedCatalog = new RepositoryCatalogService(
+                ownedStore, ownedPaths, ownedGit, runner);
+        RepositoryEvidenceService ownedEvidence = new RepositoryEvidenceApplicationService(
+                ownedCatalog, ownedPaths, ownedPolicy, ownedGit);
+        UUID repositoryId = ownedCatalog.registerRepository(repository.toString(), null, List.of()).id();
+
+        ListDirectoryResult listing = ownedEvidence.listDirectory(
+                new RepositoryEvidenceService.ListDirectoryQuery(repositoryId, "", 500));
+        assertThat(listing.entries()).extracting("path").doesNotContain("data", "data/private.txt");
+        assertThatThrownBy(() -> ownedEvidence.readFile(new RepositoryEvidenceService.ReadFileQuery(
+                repositoryId, "data/private.txt", 1, 20))).isInstanceOf(CodebaseException.class)
+                .extracting("code").isEqualTo(CodebaseErrorCode.SENSITIVE_FILE_DENIED);
+        GlobResult glob = ownedEvidence.glob(new RepositoryEvidenceService.GlobQuery(repositoryId, "data/**", 500));
+        assertThat(glob.paths()).isEmpty();
+        GrepResult grep = ownedEvidence.grep(new RepositoryEvidenceService.GrepQuery(
+                repositoryId, "server-owned", true, false, 0, 200));
+        assertThat(grep.matches()).isEmpty();
+
+        ReadFileResult enter = ownedEvidence.readFile(new RepositoryEvidenceService.ReadFileQuery(
+                repositoryId, "src/Flow.java", 2, 3));
+        ReadFileResult run = ownedEvidence.readFile(new RepositoryEvidenceService.ReadFileQuery(
+                repositoryId, "src/Flow.java", 6, 3));
+        GitStatusResult status = ownedEvidence.gitStatus(
+                new RepositoryEvidenceService.GitStatusQuery(repositoryId));
+        RepositoryObservation observation = new RepositoryObservation(
+                status.branch(), status.head(), status.metadata().dirty(), status.unborn(),
+                status.detached(), status.shallow(), status.stagedCount(), status.unstagedCount(),
+                status.untrackedCount(), status.sensitiveChangedCount(), Instant.now());
+        assertThatThrownBy(() -> ownedEvidence.gitShow(new RepositoryEvidenceService.GitShowQuery(
+                repositoryId, status.head(), "data/private.txt"))).isInstanceOf(CodebaseException.class)
+                .extracting("code").isEqualTo(CodebaseErrorCode.SENSITIVE_FILE_DENIED);
+        UUID answerEntryId = UUID.randomUUID();
+        CallChainStorePort chainStore = new FileSystemCallChainStore(mapper, ownedStore);
+        CallChainApplicationService callChains = new CallChainApplicationService(
+                chainStore, ownedCatalog, ownedStore, ownedEvidence);
+
+        callChains.prepare(new CallChainPrepareRequest(
+                repositoryId, observation, "入口到服务",
+                List.of(
+                        new CallChainNodeInput("enter", "java", "Flow.enter", "void enter()",
+                                "src/Flow.java", 2, 4, "入口", sha256(enter.content())),
+                        new CallChainNodeInput("run", "java", "Flow.run", "void run()",
+                                "src/Flow.java", 6, 8, "服务", sha256(run.content()))),
+                List.of(new CallChainEdgeInput("enter", "run")),
+                UUID.randomUUID(), answerEntryId));
+
+        assertThat(ownedDataRoot.resolve("repository-understanding/repositories")
+                .resolve(repositoryId.toString()).resolve("pending").resolve(answerEntryId + ".jsonl"))
+                .isRegularFile();
+        assertThat(repositoryFingerprintByFileExcluding(repository, ownedDataRoot))
+                .containsExactlyInAnyOrderEntriesOf(before);
+    }
+
     private Path createGitRepository(String name) throws IOException, InterruptedException {
         Path root = temporaryDirectory.resolve(name);
         Files.createDirectories(root);
@@ -262,9 +347,14 @@ class CodebaseFoundationTest {
     }
 
     private Map<String, String> repositoryFingerprintByFile(Path root) throws Exception {
+        return repositoryFingerprintByFileExcluding(root, null);
+    }
+
+    private Map<String, String> repositoryFingerprintByFileExcluding(Path root, Path excludedRoot) throws Exception {
         Map<String, String> result = new java.util.TreeMap<>();
         try (var stream = Files.walk(root)) {
             stream.filter(Files::isRegularFile).sorted()
+                    .filter(path -> excludedRoot == null || !path.startsWith(excludedRoot))
                     .forEach(path -> {
                         try {
                             result.put(root.relativize(path).toString(),
@@ -278,5 +368,10 @@ class CodebaseFoundationTest {
                     });
         }
         return result;
+    }
+
+    private String sha256(String value) throws Exception {
+        return java.util.HexFormat.of().formatHex(
+                MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8)));
     }
 }

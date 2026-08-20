@@ -73,7 +73,7 @@ final class CodebaseToolCallback implements ParallelSafeToolCallback {
         this.operation = operation;
     }
 
-    /** 生产 Agent 固定注册一个选择 Tool、十个只读 Evidence Tool 和一个临时调用链 Tool。 */
+    /** 生产 Agent 固定注册一个选择 Tool、九个只读 Evidence Tool 和一个临时调用链 Tool。 */
     static List<ToolCallback> productionTools(
             ObjectMapper mapper,
             CodebaseService codebase,
@@ -161,8 +161,22 @@ final class CodebaseToolCallback implements ParallelSafeToolCallback {
 
     private String query(JsonNode root, ToolContext toolContext) {
         CodebaseRunContext context = contextOf(toolContext);
-        if (context == null || context.binding() == null) {
+        if (context == null) {
             return failure(operation.name, "REPOSITORY_NOT_SELECTED");
+        }
+        if (context.binding() == null) {
+            CodebaseRunContext.Selection selection = context.bindDefault();
+            if (selection.multipleRepositories()) {
+                return failure(operation.name, "MULTIPLE_REPOSITORIES_NOT_SUPPORTED");
+            }
+            RepositoryResolution resolution = selection.resolution();
+            if (resolution.status() == RepositoryResolution.Status.SELECTION_REQUIRED) {
+                return failure(operation.name, resolution.reason(), resolution.candidates(),
+                        resolution.candidatesTruncated());
+            }
+            if (resolution.status() != RepositoryResolution.Status.RESOLVED) {
+                return failure(operation.name, resolution.reason());
+            }
         }
         CodebaseRunContext.Binding binding = context.binding();
         try {
@@ -701,52 +715,52 @@ final class CodebaseToolCallback implements ParallelSafeToolCallback {
     enum Operation {
         SELECT(
                 "select_local_repository",
-                "选择本地仓库；引用可以是已注册名称、别名、Search Root 直接子目录或绝对路径。只读、结果可能要求用户从候选中选择。",
+                "仅当用户明确给出另一个已注册名称、别名或绝对路径时选择本地仓库；不会猜测普通目录名，也不会回退到其他仓库。只读、结果可能要求用户从候选中选择。",
                 Set.of("reference"),
                 "{\"type\":\"object\",\"properties\":{\"reference\":{\"type\":\"string\",\"maxLength\":2000}},\"additionalProperties\":false}"),
         LIST(
                 "list_repository_directory",
-                "先选择仓库后列出仓库相对目录的直接子项；只读，结果可能截断。",
+                "列出当前 Run 已绑定仓库的相对目录直接子项；首次调用会自动绑定 Run 开始时的 Active Repository。只读，结果可能截断。",
                 Set.of("path", "limit"),
                 "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"maxLength\":512},\"limit\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":500}},\"additionalProperties\":false}"),
         GLOB(
                 "glob_repository_files",
-                "先选择仓库后按受限 Glob 查找文件；只读，结果可能截断。",
+                "在当前 Run 已绑定仓库中按受限 Glob 查找文件；首次调用会自动绑定 Run 开始时的 Active Repository。只读，结果可能截断。",
                 Set.of("pattern", "limit"),
                 "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512},\"limit\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":500}},\"required\":[\"pattern\"],\"additionalProperties\":false}"),
         GREP(
                 "grep_repository",
-                "先选择仓库后在受控候选文件中搜索文本或 POSIX extended regex；只读，结果可能截断。",
+                "在当前 Run 已绑定仓库的受控候选文件中搜索文本或 POSIX extended regex；首次调用会自动绑定 Run 开始时的 Active Repository。只读，结果可能截断。",
                 Set.of("pattern", "fixedString", "ignoreCase", "contextLines", "limit"),
                 "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512},\"fixedString\":{\"type\":\"boolean\"},\"ignoreCase\":{\"type\":\"boolean\"},\"contextLines\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":3},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":500}},\"required\":[\"pattern\"],\"additionalProperties\":false}"),
         READ(
                 "read_repository_file",
-                "先选择仓库后按 1-based 行号分页读取允许的 UTF-8 文本；只读，结果可能截断。",
+                "读取当前 Run 已绑定仓库中允许的 UTF-8 文本；首次调用会自动绑定 Run 开始时的 Active Repository，使用 1-based 行号分页。只读，结果可能截断。",
                 Set.of("path", "startLine", "lineCount"),
                 "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512},\"startLine\":{\"type\":\"integer\",\"minimum\":1},\"lineCount\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":500}},\"required\":[\"path\"],\"additionalProperties\":false}"),
         STATUS(
                 "git_repository_status",
-                "先选择仓库后查看只读 Git 工作树状态；敏感路径只计数不回显。",
+                "查看当前 Run 已绑定仓库的只读 Git 工作树状态；首次调用会自动绑定 Run 开始时的 Active Repository，敏感路径只计数不回显。",
                 Set.of(),
                 "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}"),
         DIFF(
                 "git_repository_diff",
-                "先选择仓库后查看显式范围和路径的只读 Git diff；不接受原始 Git 参数，结果可能截断。",
+                "查看当前 Run 已绑定仓库的显式范围和路径只读 Git diff；首次调用会自动绑定 Run 开始时的 Active Repository，不接受原始 Git 参数，结果可能截断。",
                 Set.of("scope", "leftRef", "rightRef", "paths"),
                 "{\"type\":\"object\",\"properties\":{\"scope\":{\"type\":\"string\",\"enum\":[\"WORKTREE\",\"STAGED\",\"COMMITS\"]},\"leftRef\":{\"type\":\"string\",\"maxLength\":512},\"rightRef\":{\"type\":\"string\",\"maxLength\":512},\"paths\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":20,\"items\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512}}},\"required\":[\"scope\",\"paths\"],\"additionalProperties\":false}"),
         LOG(
                 "git_repository_log",
-                "先选择仓库后查看有界只读 Git 提交元数据；结果可能截断。",
+                "查看当前 Run 已绑定仓库的有界只读 Git 提交元数据；首次调用会自动绑定 Run 开始时的 Active Repository，结果可能截断。",
                 Set.of("path", "ref", "limit", "skip"),
                 "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"maxLength\":512},\"ref\":{\"type\":\"string\",\"maxLength\":512},\"limit\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":100},\"skip\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":1000}},\"additionalProperties\":false}"),
         SHOW(
                 "git_repository_show",
-                "先选择仓库后查看一个已验证提交的只读元数据或显式路径内容；结果可能截断。",
+                "查看当前 Run 已绑定仓库的一个已验证提交元数据或显式路径内容；首次调用会自动绑定 Run 开始时的 Active Repository，结果可能截断。",
                 Set.of("ref", "path"),
                 "{\"type\":\"object\",\"properties\":{\"ref\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512},\"path\":{\"type\":\"string\",\"maxLength\":512}},\"required\":[\"ref\"],\"additionalProperties\":false}"),
         BLAME(
                 "git_repository_blame",
-                "先选择仓库后查看连续 blame 行；只读，结果只是最后修改线索，不等于设计者或责任人。",
+                "查看当前 Run 已绑定仓库的连续 blame 行；首次调用会自动绑定 Run 开始时的 Active Repository，只读，结果只是最后修改线索，不等于设计者或责任人。",
                 Set.of("path", "ref", "startLine", "lineCount"),
                 "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512},\"ref\":{\"type\":\"string\",\"maxLength\":512},\"startLine\":{\"type\":\"integer\",\"minimum\":1},\"lineCount\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":400}},\"required\":[\"path\"],\"additionalProperties\":false}");
 

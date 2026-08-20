@@ -7,7 +7,6 @@ import com.yuyu.salmonmind.codebase.api.CodebaseService;
 import com.yuyu.salmonmind.codebase.api.PlatformView;
 import com.yuyu.salmonmind.codebase.api.RepositoryResolution;
 import com.yuyu.salmonmind.codebase.api.RepositoryView;
-import com.yuyu.salmonmind.codebase.api.SearchRootView;
 import com.yuyu.salmonmind.codebase.application.port.CatalogState;
 import com.yuyu.salmonmind.codebase.application.port.CatalogStorePort;
 import com.yuyu.salmonmind.codebase.application.port.GitObservation;
@@ -16,7 +15,6 @@ import com.yuyu.salmonmind.codebase.application.port.GitQueryPort;
 import com.yuyu.salmonmind.codebase.application.port.RepositoryLocation;
 import com.yuyu.salmonmind.codebase.application.port.RepositoryPathPort;
 import com.yuyu.salmonmind.codebase.application.port.StoredRepository;
-import com.yuyu.salmonmind.codebase.application.port.StoredSearchRoot;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -69,11 +67,8 @@ public final class RepositoryCatalogService implements CodebaseService {
                     .sorted((left, right) -> left.name().compareToIgnoreCase(right.name()))
                     .map(this::viewOf)
                     .toList();
-            List<SearchRootView> roots = snapshot.searchRoots().stream()
-                    .map(root -> new SearchRootView(root.id(), root.path(), root.createdAt()))
-                    .toList();
             return new CodebaseCatalogView(platform(), gitRunner.isAvailable(store.dataDir()),
-                    snapshot.activeRepositoryId(), repositories, roots);
+                    snapshot.activeRepositoryId(), repositories);
         } finally {
             lock.readLock().unlock();
         }
@@ -96,7 +91,7 @@ public final class RepositoryCatalogService implements CodebaseService {
                     store.saveRepository(restored);
                 }
                 if (store.snapshot().activeRepositoryId() == null) {
-                    store.saveSettings(restored.id(), store.snapshot().searchRoots());
+                    store.saveSettings(restored.id());
                 }
                 return viewOf(restored);
             }
@@ -105,7 +100,7 @@ public final class RepositoryCatalogService implements CodebaseService {
             // 仓库资料先落盘，随后才可能成为 Active；崩溃后可安全恢复为无默认仓库。
             store.saveRepository(created);
             if (store.snapshot().activeRepositoryId() == null) {
-                store.saveSettings(created.id(), store.snapshot().searchRoots());
+                store.saveSettings(created.id());
             }
             return viewOf(created);
         } finally {
@@ -138,7 +133,7 @@ public final class RepositoryCatalogService implements CodebaseService {
             CatalogState snapshot = store.snapshot();
             if (repositoryId.equals(snapshot.activeRepositoryId())) {
                 // Active 先清空，避免中途崩溃后 settings 指向随后被标记为未注册的仓库。
-                store.saveSettings(null, snapshot.searchRoots());
+                store.saveSettings(null);
             }
             StoredRepository unregistered = new StoredRepository(current.id(), current.path(), current.name(),
                     current.aliases(), false, current.createdAt(), Instant.now());
@@ -159,46 +154,7 @@ public final class RepositoryCatalogService implements CodebaseService {
                 paths.resolveRegistered(repository);
             }
             CatalogState snapshot = store.snapshot();
-            store.saveSettings(repositoryId, snapshot.searchRoots());
-            return catalog();
-        } finally {
-            lock.writeLock().unlock();
-        }
-    }
-
-    @Override
-    public SearchRootView addSearchRoot(String absolutePath) {
-        lock.writeLock().lock();
-        try {
-            Path root = paths.requireSearchRoot(absolutePath);
-            CatalogState snapshot = store.snapshot();
-            for (StoredSearchRoot existing : snapshot.searchRoots()) {
-                if (samePath(root, Path.of(existing.path()))) {
-                    return new SearchRootView(existing.id(), existing.path(), existing.createdAt());
-                }
-            }
-            StoredSearchRoot created = new StoredSearchRoot(UUID.randomUUID(), root.toString(), Instant.now());
-            List<StoredSearchRoot> roots = new ArrayList<>(snapshot.searchRoots());
-            roots.add(created);
-            store.saveSettings(snapshot.activeRepositoryId(), roots);
-            return new SearchRootView(created.id(), created.path(), created.createdAt());
-        } finally {
-            lock.writeLock().unlock();
-        }
-    }
-
-    @Override
-    public CodebaseCatalogView removeSearchRoot(UUID searchRootId) {
-        lock.writeLock().lock();
-        try {
-            CatalogState snapshot = store.snapshot();
-            if (snapshot.searchRoots().stream().noneMatch(root -> root.id().equals(searchRootId))) {
-                throw new CodebaseException(CodebaseErrorCode.REPOSITORY_NOT_FOUND, "Search Root 不存在");
-            }
-            List<StoredSearchRoot> roots = snapshot.searchRoots().stream()
-                    .filter(root -> !root.id().equals(searchRootId))
-                    .toList();
-            store.saveSettings(snapshot.activeRepositoryId(), roots);
+            store.saveSettings(repositoryId);
             return catalog();
         } finally {
             lock.writeLock().unlock();
@@ -351,22 +307,6 @@ public final class RepositoryCatalogService implements CodebaseService {
                 }
             }
 
-            if (!isDirectChildReference(value)) {
-                return RepositoryResolution.notFound("REFERENCE_NOT_FOUND");
-            }
-            List<Path> discovered = discoverDirectChildren(snapshot.searchRoots(), value);
-            if (discovered.size() > 1) {
-                return RepositoryResolution.selectionRequired(
-                        discovered.stream().limit(20).map(this::candidateOf).toList(), discovered.size() > 20);
-            }
-            if (discovered.size() == 1) {
-                try {
-                    return RepositoryResolution.resolved(
-                            resolvedRepository(registerForResolution(discovered.getFirst())));
-                } catch (CodebaseException ex) {
-                    return RepositoryResolution.notFound(ex.code().name());
-                }
-            }
             return RepositoryResolution.notFound("REFERENCE_NOT_FOUND");
         } finally {
             lock.writeLock().unlock();
@@ -412,31 +352,6 @@ public final class RepositoryCatalogService implements CodebaseService {
                 !"UNAVAILABLE".equals(view.status()), view.status(), view.branch(), view.head(), view.dirty());
     }
 
-    private List<Path> discoverDirectChildren(List<StoredSearchRoot> roots, String name) {
-        List<Path> result = new ArrayList<>();
-        for (StoredSearchRoot root : roots) {
-            try {
-                Path rootPath = Path.of(root.path()).toAbsolutePath().normalize();
-                Path candidate = rootPath.resolve(name).normalize();
-                if (!candidate.getParent().equals(rootPath) || !Files.exists(candidate)) {
-                    continue;
-                }
-                Path resolved = paths.requireRepositoryRoot(candidate.toString());
-                if (result.stream().noneMatch(existing -> samePath(existing, resolved))) {
-                    result.add(resolved);
-                }
-            } catch (RuntimeException ignored) {
-                // Search Root 只提供候选目录；不存在、非 Git 或不可访问的子项不是候选。
-            }
-        }
-        return result;
-    }
-
-    private RepositoryResolution.Candidate candidateOf(Path root) {
-        String name = root.getFileName() == null ? root.toString() : root.getFileName().toString();
-        return new RepositoryResolution.Candidate(name, root.toString(), true);
-    }
-
     private List<RepositoryResolution.Candidate> candidatesOf(List<StoredRepository> repositories) {
         return repositories.stream()
                 .sorted((left, right) -> left.path().compareToIgnoreCase(right.path()))
@@ -463,12 +378,6 @@ public final class RepositoryCatalogService implements CodebaseService {
             return true;
         }
         return repository.aliases().stream().anyMatch(alias -> alias.equalsIgnoreCase(reference));
-    }
-
-    private boolean isDirectChildReference(String value) {
-        return !value.equals(".") && !value.equals("..")
-                && !value.contains("/") && !value.contains("\\")
-                && !value.contains("\0");
     }
 
     private Path tryAbsolute(String value) {

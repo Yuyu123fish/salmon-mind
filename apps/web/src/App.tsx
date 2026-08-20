@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import KnowledgeView from './KnowledgeView.tsx'
+import CodebaseView from './CodebaseView.tsx'
 import { MarkdownRenderer } from './MarkdownRenderer.tsx'
 import { CallChainCard } from './CallChainView.tsx'
-import RepositoryMenu from './RepositoryMenu.tsx'
 import { RunTracePanel } from './RunTracePanel.tsx'
 import { mergeConversation, mergeConversationDetail } from './conversationState.ts'
 import { followModeAfterScroll } from './followMode.ts'
@@ -86,7 +86,7 @@ function App() {
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [sendErrors, setSendErrors] = useState<Record<string, string | null>>({})
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [activeView, setActiveView] = useState<'chat' | 'knowledge'>('chat')
+  const [activeView, setActiveView] = useState<'chat' | 'knowledge' | 'codebase'>('chat')
   const messagesRef = useRef<HTMLDivElement>(null)
   const selectedIdRef = useRef<string | null>(null)
   const followingRef = useRef(true)
@@ -673,9 +673,16 @@ function App() {
           >
             Knowledge
           </button>
+          <button
+            type="button"
+            className="view-switch-button"
+            aria-pressed={activeView === 'codebase'}
+            onClick={() => setActiveView('codebase')}
+          >
+            Codebase
+          </button>
         </nav>
         <div className="topbar-actions">
-          <RepositoryMenu />
           <p className="status">
             {workspaceState.status === 'ready' && '已连接'}
             {workspaceState.status === 'loading' && '正在连接'}
@@ -868,10 +875,12 @@ function App() {
           )}
         </main>
           </>
-        ) : (
+        ) : activeView === 'knowledge' ? (
           <main className="knowledge-main">
             <KnowledgeView />
           </main>
+        ) : (
+          <CodebaseView />
         )}
       </div>
     </div>

@@ -43,7 +43,7 @@ class CodebaseControllerHttpTest {
         RepositoryView repository = repository();
         when(codebaseService.catalog()).thenReturn(new CodebaseCatalogView(
                 new PlatformView("Windows 11", "\\\\", true, "D:\\repo"), true,
-                repository.id(), List.of(repository), List.of()));
+                repository.id(), List.of(repository)));
 
         mockMvc.perform(get("/api/codebase"))
                 .andExpect(status().isOk())

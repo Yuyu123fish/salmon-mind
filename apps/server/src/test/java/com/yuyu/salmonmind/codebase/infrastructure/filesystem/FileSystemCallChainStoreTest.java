@@ -153,10 +153,11 @@ class FileSystemCallChainStoreTest {
 
     private static CatalogStorePort catalogStore(Path dataDir) {
         return new CatalogStorePort() {
-            @Override public CatalogState snapshot() { return new CatalogState(java.util.Map.of(), null, List.of()); }
+            @Override public CatalogState snapshot() { return new CatalogState(java.util.Map.of(), null); }
             @Override public void saveRepository(com.yuyu.salmonmind.codebase.application.port.StoredRepository repository) { }
-            @Override public void saveSettings(UUID activeRepositoryId, List<com.yuyu.salmonmind.codebase.application.port.StoredSearchRoot> searchRoots) { }
+            @Override public void saveSettings(UUID activeRepositoryId) { }
             @Override public Path dataDir() { return dataDir; }
+            @Override public Path serverDataRoot() { return dataDir; }
         };
     }
 }

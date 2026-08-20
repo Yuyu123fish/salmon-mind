@@ -8,11 +8,9 @@ public record CodebaseCatalogView(
         PlatformView platform,
         boolean gitAvailable,
         UUID activeRepositoryId,
-        List<RepositoryView> repositories,
-        List<SearchRootView> searchRoots
+        List<RepositoryView> repositories
 ) {
     public CodebaseCatalogView {
         repositories = repositories == null ? List.of() : List.copyOf(repositories);
-        searchRoots = searchRoots == null ? List.of() : List.copyOf(searchRoots);
     }
 }

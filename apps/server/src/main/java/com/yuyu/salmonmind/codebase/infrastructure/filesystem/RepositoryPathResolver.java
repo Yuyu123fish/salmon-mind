@@ -46,21 +46,6 @@ public final class RepositoryPathResolver implements RepositoryPathPort {
         return resolveGitRoot(realInput, true);
     }
 
-    @Override
-    public Path requireSearchRoot(String input) {
-        Path candidate = requireAbsolute(input);
-        if (!Files.exists(candidate)) {
-            throw new CodebaseException(CodebaseErrorCode.PATH_NOT_FOUND, "路径不存在");
-        }
-        if (!Files.isDirectory(candidate)) {
-            throw new CodebaseException(CodebaseErrorCode.PATH_NOT_DIRECTORY, "路径不是目录");
-        }
-        if (!Files.isReadable(candidate)) {
-            throw new CodebaseException(CodebaseErrorCode.PATH_NOT_READABLE, "路径不可读取");
-        }
-        return realPath(candidate, CodebaseErrorCode.PATH_NOT_FOUND);
-    }
-
     /** 从已经登记的路径重新确认真实 Git 根；任何身份变化都视为不可用。 */
     @Override
     public RepositoryLocation resolveRegistered(StoredRepository registration) {

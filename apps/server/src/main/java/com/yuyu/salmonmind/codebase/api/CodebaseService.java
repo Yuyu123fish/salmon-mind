@@ -11,7 +11,7 @@ import java.util.UUID;
  */
 public interface CodebaseService {
 
-    /** 返回当前注册仓库、Search Root、Active 和实时平台/Git 状态；读取失败不会修改 catalog。 */
+    /** 返回当前注册仓库、Active 和实时平台/Git 状态；读取失败不会修改 catalog。 */
     CodebaseCatalogView catalog();
 
     /** 使用绝对目录注册 Git 工作树；重复真实工作树复用既有 ID，失败时不留下半份记录。 */
@@ -26,12 +26,6 @@ public interface CodebaseService {
     /** 选择已注册且当前可解析的仓库，传 null 显式清空 Active。 */
     CodebaseCatalogView setActiveRepository(UUID repositoryId);
 
-    /** 按一次用户消息中的完整引用精确解析；空白引用使用 Active，非空失败不回退 Active。 */
+    /** 按一次用户消息中的完整引用精确解析；空白引用使用当前 Active 快照，非空失败不回退 Active。 */
     RepositoryResolution resolveRepository(String reference);
-
-    /** 授权一个绝对 Search Root；重复真实目录返回既有授权。 */
-    SearchRootView addSearchRoot(String absolutePath);
-
-    /** 移除 Search Root 授权，不影响已经注册的仓库。 */
-    CodebaseCatalogView removeSearchRoot(UUID searchRootId);
 }

@@ -19,7 +19,6 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Instant;
 import java.util.Comparator;
-import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -27,8 +26,8 @@ import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
- * 网页搜索的唯一应用编排器。它把两个 Provider 的原始结果收敛成同一份边界合同，
- * 负责 URL 安全、字段裁剪、单 Provider 去重和稳定失败；不做跨 Provider 融合。
+ * 网页搜索的唯一应用编排器。它把 SearchApi.io 的原始结果收敛成边界合同，负责 URL
+ * 安全、字段裁剪、去重和稳定失败；不做 Provider fallback 或结果融合。
  */
 @Service
 class WebSearchApplicationService implements WebSearchService {
@@ -41,49 +40,40 @@ class WebSearchApplicationService implements WebSearchService {
     private static final int MAX_SNIPPET_CHARS = 4_000;
     private static final int MAX_DATE_LABEL_CHARS = 120;
     private static final Pattern HTML_TAG = Pattern.compile("<[^>]*>");
+    private static final WebSearchProvider PROVIDER = WebSearchProvider.SEARCH_API;
 
-    private final Map<WebSearchProvider, WebSearchProviderPort> providers;
+    private final WebSearchProviderPort searchApiWebSearchAdapter;
 
     WebSearchApplicationService(
-            @Qualifier("bochaWebSearchAdapter") WebSearchProviderPort bochaWebSearchAdapter,
             @Qualifier("searchApiWebSearchAdapter") WebSearchProviderPort searchApiWebSearchAdapter
     ) {
-        EnumMap<WebSearchProvider, WebSearchProviderPort> map = new EnumMap<>(WebSearchProvider.class);
-        map.put(bochaWebSearchAdapter.provider(), bochaWebSearchAdapter);
-        map.put(searchApiWebSearchAdapter.provider(), searchApiWebSearchAdapter);
-        this.providers = Map.copyOf(map);
+        this.searchApiWebSearchAdapter = searchApiWebSearchAdapter;
     }
 
     @Override
-    public WebSearchResult search(WebSearchProvider provider, WebSearchRequest request) {
-        if (provider == null) {
-            return unavailable(null, WebSearchReason.INVALID_QUERY);
-        }
+    public WebSearchResult search(WebSearchRequest request) {
         NormalizedRequest normalized = normalize(request);
         if (normalized == null) {
-            return unavailable(provider, WebSearchReason.INVALID_QUERY);
-        }
-        WebSearchProviderPort adapter = providers.get(provider);
-        if (adapter == null) {
-            return unavailable(provider, WebSearchReason.PROVIDER_FAILED);
+            return unavailable(WebSearchReason.INVALID_QUERY);
         }
         RawSearchResult raw;
         try {
-            raw = adapter.search(normalized.query(), normalized.freshness(), normalized.count());
+            raw = searchApiWebSearchAdapter.search(
+                    normalized.query(), normalized.freshness(), normalized.count());
         } catch (WebSearchProviderException ex) {
-            return unavailable(provider, ex.reason());
+            return unavailable(ex.reason());
         } catch (RuntimeException ex) {
-            return unavailable(provider, WebSearchReason.PROVIDER_FAILED);
+            return unavailable(WebSearchReason.PROVIDER_FAILED);
         }
         if (raw == null || raw.hits() == null) {
-            return unavailable(provider, WebSearchReason.INVALID_RESPONSE);
+            return unavailable(WebSearchReason.INVALID_RESPONSE);
         }
-        List<WebSearchHit> hits = normalizeHits(provider, raw.hits(), normalized.count());
+        List<WebSearchHit> hits = normalizeHits(PROVIDER, raw.hits(), normalized.count());
         if (!raw.hits().isEmpty() && hits.isEmpty()) {
-            return unavailable(provider, WebSearchReason.INVALID_RESPONSE);
+            return unavailable(WebSearchReason.INVALID_RESPONSE);
         }
         return new WebSearchResult(
-                provider,
+                PROVIDER,
                 hits.isEmpty() ? WebSearchStatus.EMPTY : WebSearchStatus.SUCCESS,
                 WebSearchReason.NONE,
                 hits,
@@ -213,8 +203,8 @@ class WebSearchApplicationService implements WebSearchService {
         return traceId;
     }
 
-    private static WebSearchResult unavailable(WebSearchProvider provider, WebSearchReason reason) {
-        return new WebSearchResult(provider, WebSearchStatus.UNAVAILABLE, reason, List.of(), null);
+    private static WebSearchResult unavailable(WebSearchReason reason) {
+        return new WebSearchResult(PROVIDER, WebSearchStatus.UNAVAILABLE, reason, List.of(), null);
     }
 
     private record NormalizedRequest(String query, WebSearchFreshness freshness, int count) {

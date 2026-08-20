@@ -15,7 +15,7 @@ import com.yuyu.salmonmind.conversation.api.UserMessagePayload;
 import org.junit.jupiter.api.Test;
 
 /**
- * 压缩纯规则聚焦测试：196,711/196,712 边界、usage 锚点失效、本次 User 参与计量、
+ * 压缩纯规则聚焦测试：显式阈值边界、usage 锚点失效、本次 User 参与计量、
  * Retained Tail 的 User 边界、64K 目标与增量摘要输入。使用确定性 estimator（1 token/字符），
  * 不依赖 I/O、数据库或模型。
  */
@@ -25,9 +25,9 @@ class ConversationCompactionPolicyTest {
 
     private final ConversationCompactionPolicy policy = new ConversationCompactionPolicy();
 
-    // 小预算便于测试：threshold = 2000 - 500 = 1500
+    // 小预算便于测试：trigger-input-tokens 显式为 1500
     private final ConversationCompactionPolicy.Budgets budgets = new ConversationCompactionPolicy.Budgets(
-            100_000, 2000, 500, 600, 800, 0.1);
+            100_000, 1500, 500, 600, 800, 0.1);
 
     private final ConversationCompactionPolicy.TokenEstimator estimator = text -> text.length();
 
@@ -193,7 +193,7 @@ class ConversationCompactionPolicyTest {
         long estimated = policy.estimateNextInputTokens(
                 budgets, String::length, 0, null, List.of(assistant), null, List.of());
         ConversationCompactionPolicy.CompactionPlan plan = policy.planCompaction(
-                new ConversationCompactionPolicy.Budgets(100_000, 2000, 500, 20, 800, 0.1),
+                new ConversationCompactionPolicy.Budgets(100_000, 1500, 500, 20, 800, 0.1),
                 String::length, null, List.of(user(1, null, "首问"), assistant, laterUser, laterAssistant));
 
         assertThat(estimated).isGreaterThan("回答".length() + 8L);
@@ -203,7 +203,7 @@ class ConversationCompactionPolicyTest {
     @Test
     void budgetsDeriveThresholdAndRejectInvalidCombinations() {
         assertThat(budgets.triggerThreshold()).isEqualTo(1500);
-        assertThat(new ConversationCompactionPolicy.Budgets(30, 20, 1, 1, 1, 0.1).triggerThreshold()).isEqualTo(19);
+        assertThat(new ConversationCompactionPolicy.Budgets(30, 20, 1, 1, 1, 0.1).triggerThreshold()).isEqualTo(20);
         org.assertj.core.api.Assertions.assertThatThrownBy(() ->
                 new ConversationCompactionPolicy.Budgets(10, 20, 5, 1, 1, 0.1))
                 .isInstanceOf(IllegalArgumentException.class);

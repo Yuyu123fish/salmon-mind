@@ -21,6 +21,7 @@ import java.util.function.Supplier;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException;
+import com.yuyu.salmonmind.agent.api.AgentCallChainReference;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException.AgentErrorCode;
 import com.yuyu.salmonmind.agent.api.AgentCitation;
 import com.yuyu.salmonmind.agent.api.AgentCompletionStatus;
@@ -29,6 +30,7 @@ import com.yuyu.salmonmind.agent.api.AgentLocalRetrievedSource;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
 import com.yuyu.salmonmind.agent.api.AgentRequest;
 import com.yuyu.salmonmind.agent.api.AgentResult;
+import com.yuyu.salmonmind.agent.api.AgentRunArtifact;
 import com.yuyu.salmonmind.agent.api.AgentRetrievedSource;
 import com.yuyu.salmonmind.agent.api.AgentRunTraceItem;
 import com.yuyu.salmonmind.agent.api.AgentStreamListener;
@@ -78,10 +80,11 @@ import org.springframework.test.context.DynamicPropertySource;
 
 /**
  * Conversation 模块 SSE 集成测试：RANDOM_PORT + Testcontainers PostgreSQL + 临时数据目录 +
- * 测试侧确定性 Agent 三接口（AgentStreamSession / AgentSummaryService / AgentTitleService，
+ * 测试侧确定性 Agent 四接口（AgentStreamSession / AgentSummaryService / AgentTitleService /
+ * AgentRunArtifact，
  * @Primary 覆盖 agent::api seam）。
  *
- * <p>压缩预算按比例缩小：working-window=2000、output-reserve=500（阈值 1500）、
+ * <p>压缩预算按比例缩小：trigger-input-tokens=1500、output-reserve=500，
  * retained-tail-target=100；usage 锚点 1200 + 584 字符 ASCII 消息（估算 300 tokens）恰好
  * 达到阈值，583 字符不触发，对应 Spec 的 196,711/196,712 边界。
  *
@@ -95,7 +98,7 @@ import org.springframework.test.context.DynamicPropertySource;
                 "spring.datasource.url=jdbc:tc:postgresql:17.10-alpine:///salmon_mind",
                 "spring.datasource.username=test",
                 "spring.datasource.password=test",
-                "salmon.compaction.working-window=2000",
+                "salmon.compaction.trigger-input-tokens=1500",
                 "salmon.compaction.output-reserve=500",
                 "salmon.compaction.retained-tail-target=100",
                 "salmon.compaction.summary-max-output-tokens=800",
@@ -222,6 +225,39 @@ class ConversationModuleIntegrationTest {
         List<Map<String, Object>> list = parseList(listJson);
         assertThat(list.stream().filter(m -> m.get("id").toString().equals(conv.toString())).findFirst().orElseThrow())
                 .containsEntry("title", "模型生成的标题");
+    }
+
+    @Test
+    void persistsAssistantCallChainReferenceThenConfirmsRunArtifact() throws IOException {
+        UUID conversationId = createId();
+        UUID repositoryId = UUID.randomUUID();
+        UUID callChainId = UUID.randomUUID();
+        AgentCallChainReference reference = new AgentCallChainReference(
+                callChainId, repositoryId, "入口到服务", 2, 1);
+        AGENT.scriptResults(List.of(new AgentResult(
+                "已形成调用链。", "test-provider", "test-model", null,
+                List.of(), List.of(), List.of(), AgentCompletionStatus.COMPLETE, null, reference)));
+
+        List<SseEvent> events = postSse(
+                "/api/conversations/" + conversationId + "/messages", Map.of("text", "分析调用链"));
+        Map<String, Object> assistant = entryOf(events.stream()
+                .filter(event -> event.event.equals("assistant_completed"))
+                .findFirst().orElseThrow().data.get("assistantEntry"));
+        Map<String, Object> payload = payloadOf(assistant);
+
+        assertThat((List<?>) payload.get("callChains")).singleElement().satisfies(item -> {
+            Map<?, ?> callChain = (Map<?, ?>) item;
+            assertThat(callChain.get("id")).isEqualTo(callChainId.toString());
+            assertThat(callChain.get("repositoryId")).isEqualTo(repositoryId.toString());
+        });
+        assertThat(AGENT.confirmations()).singleElement().satisfies(confirmation -> {
+            assertThat(confirmation.answerEntryId().toString()).isEqualTo(assistant.get("id"));
+            assertThat(confirmation.callChains()).containsExactly(reference);
+        });
+        assertThat(Files.readString(fileOf(conversationId)))
+                .contains("\"id\":\"" + assistant.get("id") + "\"")
+                .contains("\"callChains\"")
+                .contains(callChainId.toString());
     }
 
     @Test
@@ -1057,10 +1093,12 @@ class ConversationModuleIntegrationTest {
     }
 
     /**
-     * 确定性 Agent 三接口：主回答流式（记录请求、可阻塞、可失败、可溢出重试）、
-     * 结构化摘要（合法七标题 + 输入痕迹）、标题生成（可注入失败）。
+     * 确定性 Agent 四接口：主回答流式（记录请求、可阻塞、可失败、可溢出重试）、
+     * 结构化摘要（合法七标题 + 输入痕迹）、标题生成（可注入失败），并记录 Assistant
+     * 落盘后的调用链确认。
      */
-    static class DeterministicAgent implements AgentStreamSession, AgentSummaryService, AgentTitleService {
+    static class DeterministicAgent implements AgentStreamSession, AgentSummaryService,
+            AgentTitleService, AgentRunArtifact {
 
         private final List<AgentRequest> requests = new CopyOnWriteArrayList<>();
         private final List<AgentSummaryRequest> summaryRequests = new CopyOnWriteArrayList<>();
@@ -1080,6 +1118,7 @@ class ConversationModuleIntegrationTest {
         private volatile List<AgentRetrievedSource> retrievedSources = List.of();
         private volatile List<AgentRunTraceItem> trace = List.of();
         private volatile List<AgentResult> scriptedResults = List.of();
+        private final List<ArtifactConfirmation> confirmations = new CopyOnWriteArrayList<>();
 
         @Override
         public void stream(AgentRequest request, AgentStreamListener listener) {
@@ -1190,6 +1229,12 @@ class ConversationModuleIntegrationTest {
             return new AgentTitleResult("模型生成的标题", "test-provider", "test-model");
         }
 
+        @Override
+        public void confirmCallChains(List<AgentCallChainReference> callChains, UUID answerEntryId) {
+            confirmations.add(new ArtifactConfirmation(
+                    callChains == null ? List.of() : List.copyOf(callChains), answerEntryId));
+        }
+
         List<AgentRequest> requests() {
             return List.copyOf(requests);
         }
@@ -1235,6 +1280,10 @@ class ConversationModuleIntegrationTest {
             scriptedResults = nextResults == null ? List.of() : List.copyOf(nextResults);
         }
 
+        List<ArtifactConfirmation> confirmations() {
+            return List.copyOf(confirmations);
+        }
+
         void reset() {
             requests.clear();
             summaryRequests.clear();
@@ -1250,6 +1299,10 @@ class ConversationModuleIntegrationTest {
             retrievedSources = List.of();
             trace = List.of();
             scriptedResults = List.of();
+            confirmations.clear();
+        }
+
+        record ArtifactConfirmation(List<AgentCallChainReference> callChains, UUID answerEntryId) {
         }
     }
 }

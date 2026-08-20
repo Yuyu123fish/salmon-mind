@@ -18,6 +18,7 @@ import java.util.concurrent.TimeUnit;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException;
+import com.yuyu.salmonmind.agent.api.AgentCallChainReference;
 import com.yuyu.salmonmind.agent.api.AgentMessage;
 import com.yuyu.salmonmind.agent.api.AgentRequest;
 import com.yuyu.salmonmind.agent.api.AgentResult;
@@ -28,6 +29,9 @@ import com.yuyu.salmonmind.agent.api.AgentToolFailed;
 import com.yuyu.salmonmind.agent.api.AgentToolOutcomeDetail;
 import com.yuyu.salmonmind.agent.api.AgentToolStarted;
 import com.yuyu.salmonmind.agent.api.CheckpointPolicy;
+import com.yuyu.salmonmind.codebase.api.AgentCallChainService;
+import com.yuyu.salmonmind.codebase.api.CallChainConfirmation;
+import com.yuyu.salmonmind.codebase.api.CallChainReference;
 import com.yuyu.salmonmind.codebase.api.CodebaseService;
 import com.yuyu.salmonmind.codebase.api.RepositoryEvidenceService;
 import com.yuyu.salmonmind.codebase.api.RepositoryResolution;
@@ -55,6 +59,7 @@ import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.definition.ToolDefinition;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -153,8 +158,11 @@ class AgentToolRuntimeIntegrationTest {
     }
 
     @Test
-    void completesCurrentRepositoryFlowWithAutomaticBindingTwoReadsAndStagedChain() {
+    void repairsMissingEvidenceThenStagesAndPreparesOneCallChain() {
         UUID repositoryId = UUID.randomUUID();
+        UUID conversationId = UUID.randomUUID();
+        UUID answerEntryId = UUID.randomUUID();
+        UUID callChainId = UUID.randomUUID();
         CodebaseService codebase = mock(CodebaseService.class);
         when(codebase.resolveRepository((String) null)).thenReturn(RepositoryResolution.resolved(
                 new RepositoryResolution.ResolvedRepository(
@@ -169,33 +177,53 @@ class AgentToolRuntimeIntegrationTest {
                 metadata, List.of(new RepositoryEvidenceService.DirectoryEntry("src", "src", true, false))));
         when(evidence.readFile(any())).thenAnswer(invocation -> {
             RepositoryEvidenceService.ReadFileQuery query = invocation.getArgument(0);
-            return switch (query.relativePath()) {
-                case "src/Entry.java" -> new RepositoryEvidenceService.ReadFileResult(
+            if ("src/Entry.java".equals(query.relativePath())) {
+                return new RepositoryEvidenceService.ReadFileResult(
                         metadata, query.relativePath(), false, query.startLine(), query.startLine() + 1,
                         "void enter() {\n  run();");
-                case "src/Service.java" -> new RepositoryEvidenceService.ReadFileResult(
-                        metadata, query.relativePath(), false, query.startLine(), query.startLine() + 1,
-                        "void run() {\n  return; ");
-                default -> throw new AssertionError("unexpected read path: " + query.relativePath());
-            };
+            }
+            if ("src/Service.java".equals(query.relativePath()) && query.startLine() == 1) {
+                return new RepositoryEvidenceService.ReadFileResult(
+                        metadata, query.relativePath(), false, 1, 1, "void run() {");
+            }
+            if ("src/Service.java".equals(query.relativePath()) && query.startLine() == 2) {
+                return new RepositoryEvidenceService.ReadFileResult(
+                        metadata, query.relativePath(), false, 2, 2, "  return;");
+            }
+            throw new AssertionError("unexpected read path: " + query.relativePath());
         });
+        AgentCallChainService callChains = mock(AgentCallChainService.class);
+        when(callChains.prepare(any())).thenReturn(new CallChainReference(
+                callChainId, repositoryId, "入口到服务", 2, 1));
 
         CodebaseFlowChatModel model = new CodebaseFlowChatModel();
         ReactAgentSessionAdapter adapter = newCodebaseAdapter(model, codebase, evidence);
+        ReflectionTestUtils.setField(adapter, "callChainService", callChains);
         RecordingListener events = new RecordingListener();
 
         AgentResult result = completeSync(adapter, events, new AgentRequest(
-                UUID.randomUUID().toString(), null, UUID.randomUUID(),
+                conversationId.toString(), null, answerEntryId,
                 userList("请分析当前仓库的入口到服务流程"), CheckpointPolicy.REBUILD_FROM_PROJECTION));
 
         assertThat(result.text()).isEqualTo(CodebaseFlowChatModel.FINAL_ANSWER);
         assertThat(model.toolNames).containsExactly(
-                "list_repository_directory", "read_repository_file", "read_repository_file", "stage_call_chain");
+                "list_repository_directory", "read_repository_file", "read_repository_file",
+                "stage_call_chain", "read_repository_file", "stage_call_chain");
         assertThat(events.started).extracting(AgentToolStarted::toolName).containsExactly(
-                "list_repository_directory", "read_repository_file", "read_repository_file", "stage_call_chain");
-        assertThat(events.completed).hasSize(4);
+                "list_repository_directory", "read_repository_file", "read_repository_file",
+                "stage_call_chain", "read_repository_file", "stage_call_chain");
+        assertThat(events.failed).singleElement()
+                .extracting(AgentToolFailed::toolName, AgentToolFailed::stableErrorCode)
+                .containsExactly("stage_call_chain", "CALL_CHAIN_EVIDENCE_INSUFFICIENT");
+        assertThat(events.completed).hasSize(5);
+        assertThat(result.callChain()).isEqualTo(new AgentCallChainReference(
+                callChainId, repositoryId, "入口到服务", 2, 1));
         verify(codebase, times(1)).resolveRepository((String) null);
-        verify(evidence, times(2)).readFile(any());
+        verify(evidence, times(3)).readFile(any());
+        verify(callChains).prepare(any());
+
+        adapter.confirmCallChains(List.of(result.callChain()), answerEntryId);
+        verify(callChains).confirm(new CallChainConfirmation(repositoryId, callChainId, answerEntryId));
     }
 
     @Test
@@ -279,21 +307,19 @@ class AgentToolRuntimeIntegrationTest {
     }
 
     @Test
-    void cumulativeToolResultBudgetStopsProviderBeforeNextCall() {
+    void actualToolResultsDoNotConsumeACumulativePerRunGate() {
         var tool = new RecordingSearchTool(false, "x".repeat(1_000));
         var model = new BudgetCallingChatModel();
-        // 第一条结果约 508 token；第二次调用前剩余空间不足最小结构化结果，不能执行工具。
-        var adapter = newAdapter(model, List.of(tool), 200_000, 550, 32);
+        // 旧实现会把第一条结果计入累计 Gate；新构造合同已没有这项预算，两次结果都可进入模型。
+        var adapter = newAdapter(model, List.of(tool), 200_000, 32);
         var events = new RecordingListener();
 
         AgentResult result = completeSync(adapter, events, new AgentRequest(
                 "context-budget-thread", null, UUID.randomUUID(),
                 userList("连续搜索"), CheckpointPolicy.REUSE_IF_MATCH));
 
-        assertThat(tool.calls).hasSize(1);
-        assertThat(events.failed).singleElement()
-                .extracting(AgentToolFailed::stableErrorCode)
-                .isEqualTo("TOOL_CONTEXT_BUDGET_EXCEEDED");
+        assertThat(tool.calls).hasSize(2);
+        assertThat(events.failed).isEmpty();
         assertThat(result.text()).isEqualTo(BudgetCallingChatModel.FINAL_ANSWER);
     }
 
@@ -301,7 +327,7 @@ class AgentToolRuntimeIntegrationTest {
     void modelCallLimitHookHardStopsARepeatedToolLoop() {
         var tool = new RecordingSearchTool();
         var model = new LoopingToolChatModel();
-        var adapter = newAdapter(model, List.of(tool), 200_000, 32_768, 2);
+        var adapter = newAdapter(model, List.of(tool), 200_000, 2);
         var events = new RecordingListener();
 
         adapter.stream(new AgentRequest(
@@ -554,7 +580,7 @@ class AgentToolRuntimeIntegrationTest {
     void frameworkToolTimeoutProducesOneStableFailureAndSuppressesLateCompletion() throws Exception {
         var tool = new BlockingTool();
         var model = new SingleBlockingToolModel();
-        var adapter = newAdapter(model, List.of(tool), 200_000, 32_768, 32, Duration.ofSeconds(1));
+        var adapter = newAdapter(model, List.of(tool), 200_000, 32, Duration.ofSeconds(1));
         var events = new RecordingListener();
 
         Thread run = new Thread(() -> completeSync(adapter, events, new AgentRequest(
@@ -582,7 +608,7 @@ class AgentToolRuntimeIntegrationTest {
         var tools = new ParallelTimeoutTools();
         var model = new ParallelTimeoutCallingChatModel();
         var adapter = newAdapter(model, List.of(tools.blocking, tools.fast), 200_000,
-                32_768, 32, Duration.ofSeconds(1));
+                32, Duration.ofSeconds(1));
         var events = new RecordingListener();
         AgentResult[] result = new AgentResult[1];
 
@@ -614,29 +640,29 @@ class AgentToolRuntimeIntegrationTest {
     }
 
     private ReactAgentSessionAdapter newAdapter(ChatModel model, List<ToolCallback> tools, int maxResultChars) {
-        return newAdapter(model, tools, maxResultChars, 32_768, 32);
+        return newAdapter(model, tools, maxResultChars, 32);
     }
 
     private ReactAgentSessionAdapter newAdapter(
             ChatModel model, List<ToolCallback> tools, int maxResultChars,
-            int maxResultTokens, int maxSteps
+            int maxSteps
     ) {
         var adapter = new ReactAgentSessionAdapter(
                 (ChatModelProvider) () -> new ChatModelHandle(model, "test-provider", "test-model"),
                 redisUrl, "", 65_432, 32_768, 0.1, maxResultChars, tools,
-                maxResultTokens, maxSteps);
+                maxSteps);
         adapters.add(adapter);
         return adapter;
     }
 
     private ReactAgentSessionAdapter newAdapter(
             ChatModel model, List<ToolCallback> tools, int maxResultChars,
-            int maxResultTokens, int maxSteps, java.time.Duration toolExecutionTimeout
+            int maxSteps, java.time.Duration toolExecutionTimeout
     ) {
         var adapter = new ReactAgentSessionAdapter(
                 (ChatModelProvider) () -> new ChatModelHandle(model, "test-provider", "test-model"),
                 redisUrl, "", 65_432, 32_768, 0.1, maxResultChars, tools,
-                maxResultTokens, maxSteps, toolExecutionTimeout);
+                maxSteps, toolExecutionTimeout);
         adapters.add(adapter);
         return adapter;
     }
@@ -651,12 +677,12 @@ class AgentToolRuntimeIntegrationTest {
                 new RedissonClientProvider(redisUrl, "", true),
                 65_432, 32_768, 0.1, 200_000,
                 List.of(), productionTools,
-                4, 32_768, 32,
+                4, 32,
                 64, 32_768, 4_096,
                 Duration.ofHours(24), 3,
                 2, 1, Duration.ofSeconds(60),
                 2, 131_072L, Duration.ofSeconds(120),
-                codebase, evidence, 16, 65_536, 65_536);
+                codebase, evidence, 16, 65_536);
         adapters.add(adapter);
         return adapter;
     }
@@ -1054,7 +1080,8 @@ class AgentToolRuntimeIntegrationTest {
 
     /**
      * 代码库 Stage 的确定性模型：不发送空参数选择，而是直接使用当前 Run 的 Active
-     * 快照完成定位、两次源码读取和调用链草稿，验证真实 ReactAgent Tool Loop 的顺序。
+     * 快照完成定位、源码读取、缺口补读和第二次调用链暂存，验证真实 ReactAgent Tool Loop
+     * 能根据结构化失败继续修复，而不是在第一次 stage 失败后提前结束。
      */
     static final class CodebaseFlowChatModel implements ChatModel {
 
@@ -1079,14 +1106,21 @@ class AgentToolRuntimeIntegrationTest {
                         "{\"path\":\"src/Entry.java\",\"startLine\":1,\"lineCount\":2}");
                 case 2 -> tool("codebase-read-002", "read_repository_file",
                         "{\"path\":\"src/Service.java\",\"startLine\":1,\"lineCount\":2}");
-                case 3 -> tool("codebase-stage-001", "stage_call_chain", """
+                case 3 -> tool("codebase-stage-001", "stage_call_chain", stageArguments());
+                case 4 -> tool("codebase-read-003", "read_repository_file",
+                        "{\"path\":\"src/Service.java\",\"startLine\":2,\"lineCount\":1}");
+                case 5 -> tool("codebase-stage-002", "stage_call_chain", stageArguments());
+                default -> finalAnswer();
+            };
+        }
+
+        private String stageArguments() {
+            return """
                         {"name":"入口到服务","nodes":[
                           {"key":"entry","language":"java","qualifiedSymbol":"Demo.enter","signature":"void enter()","path":"src/Entry.java","startLine":1,"endLine":2,"summary":"入口"},
                           {"key":"service","language":"java","qualifiedSymbol":"Demo.run","signature":"void run()","path":"src/Service.java","startLine":1,"endLine":2,"summary":"服务"}
                         ],"edges":[{"from":"entry","to":"service"}]}
-                        """);
-                default -> finalAnswer();
-            };
+                        """;
         }
 
         private ChatResponse tool(String id, String name, String arguments) {

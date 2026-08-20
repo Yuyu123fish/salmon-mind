@@ -90,6 +90,9 @@ export type ToolOutcomeDetail = {
   durationMillis: number
   degraded: boolean
   resultTruncated: boolean
+  estimatedResultTokens?: number | null
+  remainingInputTokens?: number | null
+  contextCleaned?: boolean
 }
 
 export type LocalRetrievedSource = {
@@ -943,6 +946,23 @@ function requireOptionalOutcomeDetail(raw: unknown): void {
   requireNumber(detail, 'durationMillis')
   requireBoolean(detail, 'degraded')
   requireBoolean(detail, 'resultTruncated')
+  if (detail.estimatedResultTokens !== undefined) {
+    requireNullableNumber(detail, 'estimatedResultTokens')
+    const estimatedResultTokens = detail.estimatedResultTokens
+    if (estimatedResultTokens !== null &&
+      (typeof estimatedResultTokens !== 'number' || !Number.isInteger(estimatedResultTokens) || estimatedResultTokens < 0)) {
+      throw new ApiError('BAD_SSE_FRAME', '结果 token 估算必须为非负整数', 0)
+    }
+  }
+  if (detail.remainingInputTokens !== undefined) {
+    requireNullableNumber(detail, 'remainingInputTokens')
+    const remainingInputTokens = detail.remainingInputTokens
+    if (remainingInputTokens !== null &&
+      (typeof remainingInputTokens !== 'number' || !Number.isInteger(remainingInputTokens) || remainingInputTokens < 0)) {
+      throw new ApiError('BAD_SSE_FRAME', '剩余输入 token 必须为非负整数', 0)
+    }
+  }
+  if (detail.contextCleaned !== undefined) requireBoolean(detail, 'contextCleaned')
 }
 
 function requireCitations(raw: unknown): void {

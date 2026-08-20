@@ -30,7 +30,8 @@ import java.util.regex.Pattern;
 /**
  * 一个 Agent Run 独有的来源注册表。工具结果在进入模型前登记来源并获得 L/W 标记，
  * 注册表不写入 Redis 或 JSONL；流结束时只按最终正文中的精确标记取出 Citation。
- * 结果超出字符或累计 token 预算时只保留完整 item，未存活的本轮来源不会成为 Citation。
+ * 结果超出字符预算时只保留完整 item，未存活的本轮来源不会成为 Citation；输入 token
+ * 由 RunContextMeter 在模型调用前统一计量，这里不再维护跨工具的累计 token Gate。
  */
 final class RunSourceRegistry {
 
@@ -77,22 +78,13 @@ final class RunSourceRegistry {
      * 原有字符边界；生产来源工具始终得到合法 JSON，超限时从尾部删除完整 item。
      */
     synchronized Decoration decorate(String result, int maxChars) {
-        return decorate(result, maxChars, Long.MAX_VALUE, null);
-    }
-
-    /**
-     * 登记来源并同时执行单结果字符上限与当前 Run 剩余 token 上限。两种上限都只能删除
-     * 尾部完整 item；如果连不带 item 的 envelope 也放不进剩余预算，调用方会返回有界
-     * 工具失败，刚登记但未存活的来源在本方法末尾被撤销。
-     */
-    synchronized Decoration decorate(String result, int maxChars, long maxTokens) {
-        return decorate(result, maxChars, maxTokens, null);
+        return decorate(result, maxChars, null);
     }
 
     /**
      * 为生产拦截器登记来源。toolCallId 只用于冻结首次召回位置，不进入 Tool Result。
      */
-    synchronized Decoration decorate(String result, int maxChars, long maxTokens, String toolCallId) {
+    synchronized Decoration decorate(String result, int maxChars, String toolCallId) {
         if (result == null || result.isBlank()) {
             return null;
         }
@@ -112,7 +104,7 @@ final class RunSourceRegistry {
         AgentToolOutcomeDetail.ResultStatus resultStatus = resultStatus(envelope);
         String stableReasonCode = stableReasonCode(text(envelope, "reason"));
         if ("CODEBASE".equals(kind)) {
-            return decorateCodebase(envelope, maxChars, maxTokens, resultStatus, stableReasonCode);
+            return decorateCodebase(envelope, maxChars, resultStatus, stableReasonCode);
         }
         Set<String> newlyRegistered = new LinkedHashSet<>();
         ArrayNode decoratedItems = mapper.createArrayNode();
@@ -136,9 +128,7 @@ final class RunSourceRegistry {
         }
         envelope.set("items", decoratedItems);
         boolean truncated = envelope.path("truncated").asBoolean(false);
-        while ((serializedLength(envelope) > maxChars
-                || ToolLifecycleInterceptor.estimateToolResultTokens(serialize(envelope)) > maxTokens
-                || sourceLimitExceeded(decoratedItems, newlyRegistered))
+        while ((serializedLength(envelope) > maxChars || sourceLimitExceeded(decoratedItems, newlyRegistered))
                 && decoratedItems.size() > 0) {
             decoratedItems.remove(decoratedItems.size() - 1);
             truncated = true;
@@ -181,7 +171,6 @@ final class RunSourceRegistry {
                 truncated,
                 resultStatus == AgentToolOutcomeDetail.ResultStatus.DEGRADED,
                 estimatedTokens,
-                estimatedTokens <= maxTokens,
                 resultStatus,
                 stableReasonCode,
                 Set.copyOf(newlyRegistered));
@@ -190,7 +179,6 @@ final class RunSourceRegistry {
     private Decoration decorateCodebase(
             ObjectNode envelope,
             int maxChars,
-            long maxTokens,
             AgentToolOutcomeDetail.ResultStatus resultStatus,
             String stableReasonCode
     ) {
@@ -203,12 +191,12 @@ final class RunSourceRegistry {
         }
         envelope.set("items", boundedItems);
         boolean truncated = envelope.path("truncated").asBoolean(false);
-        while ((serializedLength(envelope) > maxChars
-                || ToolLifecycleInterceptor.estimateToolResultTokens(serialize(envelope)) > maxTokens)
+        while (serializedLength(envelope) > maxChars
                 && boundedItems.size() > 0) {
             boundedItems.remove(boundedItems.size() - 1);
             truncated = true;
         }
+        updateReadCoverage(envelope, boundedItems, truncated);
         envelope.put("resultCount", boundedItems.size());
         JsonNode coverageNode = envelope.get("coverage");
         if (coverageNode != null && coverageNode.isObject()) {
@@ -230,13 +218,6 @@ final class RunSourceRegistry {
         }
         String serialized = serialize(envelope);
         long estimatedTokens = ToolLifecycleInterceptor.estimateToolResultTokens(serialized);
-        boolean withinTokenBudget = estimatedTokens <= maxTokens && serialized.length() <= maxChars;
-        if (!withinTokenBudget) {
-            envelope.put("status", "UNAVAILABLE");
-            envelope.put("reason", "TOOL_CONTEXT_BUDGET_EXCEEDED");
-            serialized = serialize(envelope);
-            estimatedTokens = ToolLifecycleInterceptor.estimateToolResultTokens(serialized);
-        }
         return new Decoration(
                 serialized,
                 "CODEBASE",
@@ -244,14 +225,46 @@ final class RunSourceRegistry {
                 truncated,
                 resultStatus == AgentToolOutcomeDetail.ResultStatus.DEGRADED || truncated,
                 estimatedTokens,
-                withinTokenBudget,
                 resultStatus,
                 stableReasonCode,
                 Set.of());
     }
 
+    /** ReadFile 被裁剪后同步真实首尾行，避免模型按原请求范围误判证据完整性。 */
+    private void updateReadCoverage(ObjectNode envelope, ArrayNode items, boolean truncated) {
+        if (!"read_repository_file".equals(envelope.path("operation").asText())
+                || items.isEmpty()) {
+            return;
+        }
+        int startLine = items.get(0).path("line").asInt(-1);
+        int endLine = items.get(items.size() - 1).path("line").asInt(-1);
+        if (startLine < 1 || endLine < startLine) {
+            return;
+        }
+        envelope.put("startLine", startLine);
+        envelope.put("endLine", endLine);
+        String path = envelope.path("path").asText(items.get(0).path("path").asText());
+        String continuation = truncated && !path.isBlank() ? path + ":" + (endLine + 1) : null;
+        if (continuation == null) {
+            envelope.putNull("continuation");
+        } else {
+            envelope.put("continuation", continuation);
+        }
+        JsonNode coverageNode = envelope.get("coverage");
+        if (coverageNode != null && coverageNode.isObject()) {
+            ObjectNode coverage = (ObjectNode) coverageNode;
+            coverage.put("startLine", startLine);
+            coverage.put("endLine", endLine);
+            if (continuation == null) {
+                coverage.putNull("continuation");
+            } else {
+                coverage.put("continuation", continuation);
+            }
+        }
+    }
+
     /**
-     * 工具结果在预算结算阶段被拒绝时撤销本次新登记来源；只有真正送入模型的结果才能进入历史来源。
+     * 调用方丢弃本次结果时撤销本次新登记来源；只有真正送入模型的结果才能进入历史来源。
      * 已存在来源不受影响，避免一次失败工具调用抹掉前序调用的来源身份。
      */
     synchronized void rollback(Decoration decoration) {
@@ -509,7 +522,6 @@ final class RunSourceRegistry {
             boolean truncated,
             boolean degraded,
             long estimatedTokens,
-            boolean withinTokenBudget,
             AgentToolOutcomeDetail.ResultStatus resultStatus,
             String stableReasonCode,
             Set<String> newlyRegisteredReferences

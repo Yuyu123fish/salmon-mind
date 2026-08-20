@@ -93,7 +93,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 2. 数据库事务创建 RUNNING Run 并推进活动叶子（Agent 调用绝不在事务内）；
  * 3. durable 状态成立后发出 run_started；
  * 4. 主 LLM 前压缩检测：生产工具路径按 Agent 报告的静态/动态预算与当前 JSONL 投影
- *    完整计量；兼容路径可使用有效 usage 锚点。达到 196,712 阈值时生成摘要、追加
+ *    完整计量；兼容路径可使用有效 usage 锚点。达到显式配置的输入阈值时生成摘要、追加
  *    Compaction、推进叶子与压缩三元组并使旧 Checkpoint 失效，随后主调用从
  *    「Summary + Retained Tail + Compaction 后消息」的新投影重建；
  * 5. 流式主回答：delta 先在内存/SSE 中累积；模型返回完整或长度中断且文本非空时
@@ -147,7 +147,7 @@ class ConversationRunCoordinator {
             AgentRunArtifact agentRunArtifact,
             TransactionTemplate transactionTemplate,
             @Value("${salmon.compaction.physical-window:1000000}") long physicalWindow,
-            @Value("${salmon.compaction.working-window:262144}") long workingWindow,
+            @Value("${salmon.compaction.trigger-input-tokens:700000}") long triggerInputTokens,
             @Value("${salmon.compaction.output-reserve:65432}") long outputReserve,
             @Value("${salmon.compaction.retained-tail-target:65536}") long retainedTailTarget,
             @Value("${salmon.compaction.summary-max-output-tokens:32768}") long summaryMaxOutputTokens,
@@ -165,7 +165,7 @@ class ConversationRunCoordinator {
         this.transactionTemplate = transactionTemplate;
         this.compactionPolicy = new ConversationCompactionPolicy();
         this.budgets = new ConversationCompactionPolicy.Budgets(
-                physicalWindow, workingWindow, outputReserve, retainedTailTarget,
+                physicalWindow, triggerInputTokens, outputReserve, retainedTailTarget,
                 summaryMaxOutputTokens, summaryTemperature);
         // 保守 UTF-8 估算：1 token 至少对应 2 字节；英文/代码高估（安全），
         // 中文 3-6 字节/字也不低估；usage 锚点存在时本估算不参与计量
@@ -581,9 +581,9 @@ class ConversationRunCoordinator {
         long reestimated = compactionPolicy.reestimateAfterCompaction(
                 budgets, estimator, effectiveStaticInputTokens + dynamicToolInputTokens,
                 summary, plan.retainedTail(), List.of());
-        if (compactionPolicy.shouldCompact(reestimated, budgets)) {
+        if (reestimated > budgets.hardInputCeiling()) {
             throw new ConversationException(
-                    ConversationErrorCode.CONTEXT_LIMIT_REACHED, "压缩后仍超过工作输入预算，请创建新的 Conversation");
+                    ConversationErrorCode.CONTEXT_LIMIT_REACHED, "压缩后仍超过物理输入预算，请创建新的 Conversation");
         }
 
         listener.onCompactionCompleted(new RunStreamListener.CompactionCompleted(
@@ -1174,7 +1174,8 @@ class ConversationRunCoordinator {
                 ? null : ToolOutcomeDetailPayload.ResultStatus.valueOf(detail.resultStatus().name());
         return new ToolOutcomeDetailPayload(
                 detail.provider(), status, detail.stableReasonCode(), detail.sourceCount(),
-                detail.durationMillis(), detail.degraded(), detail.resultTruncated());
+                detail.durationMillis(), detail.degraded(), detail.resultTruncated(),
+                detail.estimatedResultTokens(), detail.remainingInputTokens(), detail.contextCleaned());
     }
 
     /** 手动继续时只保留新模型结果相对旧 Assistant 的新增后缀。 */

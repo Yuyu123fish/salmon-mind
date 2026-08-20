@@ -138,6 +138,12 @@ final class CodebaseToolCallback implements ParallelSafeToolCallback {
         }
     }
 
+    /** 仓库选择会改变 Run 绑定，必须作为混合工具批次的顺序屏障。 */
+    @Override
+    public boolean parallelAllowed() {
+        return operation != Operation.SELECT;
+    }
+
     private String select(JsonNode root, ToolContext toolContext) {
         CodebaseRunContext context = contextOf(toolContext);
         if (context == null) {

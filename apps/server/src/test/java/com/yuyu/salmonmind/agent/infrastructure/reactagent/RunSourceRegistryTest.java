@@ -73,18 +73,16 @@ class RunSourceRegistryTest {
     }
 
     @Test
-    void tokenBoundRemovesWholeSourceItemsAndOnlySurvivorsCanBeCited() throws Exception {
+    void characterBoundRemovesWholeSourceItemsAndOnlySurvivorsCanBeCited() throws Exception {
         String single = webEnvelope("BOCHA", "https://example.com/a", "first");
         RunSourceRegistry oneItemRegistry = new RunSourceRegistry(mapper);
-        long oneItemTokens = oneItemRegistry.decorate(single, 10_000).estimatedTokens();
+        int oneItemChars = oneItemRegistry.decorate(single, 10_000).result().length();
         RunSourceRegistry registry = new RunSourceRegistry(mapper);
 
         RunSourceRegistry.Decoration decoration = registry.decorate(
-                duplicateWebEnvelope(), 10_000, oneItemTokens + 32);
+                duplicateWebEnvelope(), oneItemChars + 5);
         JsonNode bounded = mapper.readTree(decoration.result());
 
-        assertThat(decoration.withinTokenBudget()).isTrue();
-        assertThat(decoration.estimatedTokens()).isLessThanOrEqualTo(oneItemTokens + 32);
         assertThat(bounded.path("items").isArray()).isTrue();
         assertThat(bounded.path("items")).hasSize(1);
         assertThat(registry.citationsFor("依据 [W1] [W2]")).extracting(AgentCitation::referenceId)
@@ -119,7 +117,7 @@ class RunSourceRegistryTest {
     void freezesFirstOriginAndFinalPositionAfterDuplicateAndTailTrim() throws Exception {
         RunSourceRegistry registry = new RunSourceRegistry(mapper);
         String firstCall = twoWebEnvelope();
-        RunSourceRegistry.Decoration first = registry.decorate(firstCall, 10_000, Long.MAX_VALUE, "call-1");
+        RunSourceRegistry.Decoration first = registry.decorate(firstCall, 10_000, "call-1");
         assertThat(first.sourceCount()).isEqualTo(2);
         assertThat(registry.retrievedSources())
                 .extracting("originToolCallId", "resultPosition")
@@ -136,7 +134,7 @@ class RunSourceRegistryTest {
                 + "\"snippet\":\"snippet\",\"retrievedAt\":\"2026-08-17T00:00:00Z\",\"providerRank\":99},"
                 + "{\"title\":\"new\",\"url\":\"https://example.com/c\",\"site\":\"example\","
                 + "\"snippet\":\"snippet\",\"retrievedAt\":\"2026-08-17T00:00:00Z\",\"providerRank\":3}]}";
-        registry.decorate(duplicateAndNew, 10_000, Long.MAX_VALUE, "call-2");
+        registry.decorate(duplicateAndNew, 10_000, "call-2");
 
         assertThat(registry.retrievedSources()).extracting("referenceId", "originToolCallId", "resultPosition")
                 .containsExactly(
@@ -148,7 +146,7 @@ class RunSourceRegistryTest {
                 .decorate(webEnvelope("BOCHA", "https://example.com/z", "z"), 10_000).result().length() + 5;
         RunSourceRegistry trimmedRegistry = new RunSourceRegistry(mapper);
         RunSourceRegistry.Decoration trimmed = trimmedRegistry.decorate(
-                duplicateWebEnvelope(), oneItemLimit, Long.MAX_VALUE, "call-trim");
+                duplicateWebEnvelope(), oneItemLimit, "call-trim");
         assertThat(trimmed.truncated()).isTrue();
         assertThat(trimmedRegistry.retrievedSources()).extracting("referenceId", "resultPosition")
                 .containsExactly(org.assertj.core.groups.Tuple.tuple("W1", 1));
@@ -159,7 +157,7 @@ class RunSourceRegistryTest {
         RunSourceRegistry registry = new RunSourceRegistry(mapper);
         RunSourceRegistry.Decoration decoration = registry.decorate(
                 webEnvelope("BOCHA", "https://example.com/rollback", "rollback"),
-                10_000, Long.MAX_VALUE, "call-rollback");
+                10_000, "call-rollback");
 
         registry.rollback(decoration);
 
@@ -176,13 +174,16 @@ class RunSourceRegistryTest {
                 + "{\"path\":\"src/Main.java\",\"line\":1,\"text\":\"" + longText + "\"},"
                 + "{\"path\":\"src/Main.java\",\"line\":2,\"text\":\"" + longText + "\"}]}";
 
-        RunSourceRegistry.Decoration decoration = registry.decorate(result, 500, Long.MAX_VALUE, "codebase-call");
+        RunSourceRegistry.Decoration decoration = registry.decorate(result, 500, "codebase-call");
         JsonNode bounded = mapper.readTree(decoration.result());
 
         assertThat(decoration.sourceCount()).isNull();
         assertThat(decoration.truncated()).isTrue();
         assertThat(bounded.path("sourceKind").asText()).isEqualTo("CODEBASE");
         assertThat(bounded.path("items")).hasSize(1);
+        assertThat(bounded.path("startLine").asInt()).isEqualTo(1);
+        assertThat(bounded.path("endLine").asInt()).isEqualTo(1);
+        assertThat(bounded.path("continuation").asText()).isEqualTo("src/Main.java:2");
         assertThat(bounded.path("items").get(0).has("referenceId")).isFalse();
         assertThat(registry.retrievedSources()).isEmpty();
         assertThat(registry.citationsFor("依据 [L1] [W1]")).isEmpty();

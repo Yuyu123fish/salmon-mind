@@ -1,6 +1,7 @@
 package com.yuyu.salmonmind.agent.infrastructure.reactagent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.yuyu.salmonmind.codebase.api.CodebaseException;
 import com.yuyu.salmonmind.codebase.api.CodebaseService;
 import com.yuyu.salmonmind.codebase.api.RepositoryResolution;
 import org.junit.jupiter.api.Test;
@@ -13,7 +14,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-/** Run-local 调用链边界测试：只接受预算后仍完整的 ReadFile 行，不保存源码到外部状态。 */
+/** Run-local 调用链边界测试：只接受实际返回的连续 ReadFile 行，不保存源码到外部状态。 */
 class CodebaseRunContextTest {
 
     @Test
@@ -47,7 +48,27 @@ class CodebaseRunContextTest {
     }
 
     @Test
-    void refusesTruncatedReadFileAsCallChainEvidence() {
+    void acceptsReturnedLinesFromTruncatedReadFileAsEvidence() {
+        UUID repositoryId = UUID.randomUUID();
+        CodebaseService service = mock(CodebaseService.class);
+        when(service.resolveRepository(null)).thenReturn(RepositoryResolution.resolved(
+                new RepositoryResolution.ResolvedRepository(repositoryId, "demo", "D:/demo", true,
+                        "AVAILABLE", "main", "head", false)));
+        CodebaseRunContext context = new CodebaseRunContext(service);
+        context.select(null);
+        context.registerReadFileResult("""
+                {"status":"DEGRADED","sourceKind":"CODEBASE","operation":"read_repository_file","path":"A.java","startLine":1,"endLine":2,"truncated":true,"items":[{"path":"A.java","line":1,"text":"one"}]}
+                """);
+
+        context.stage("链", List.of(
+                new CodebaseRunContext.DraftNode("A", "java", "A.enter", "void enter()", "A.java", 1, 1, "入口"),
+                new CodebaseRunContext.DraftNode("B", "java", "B.run", "void run()", "A.java", 1, 1, "服务")),
+                List.of(new CodebaseRunContext.DraftEdge("A", "B")));
+        assertThat(context.prepareRequest(repositoryId, UUID.randomUUID())).isNotNull();
+    }
+
+    @Test
+    void reportsMissingNodeRangeWhenCoverageIsIncomplete() {
         UUID repositoryId = UUID.randomUUID();
         CodebaseService service = mock(CodebaseService.class);
         when(service.resolveRepository(null)).thenReturn(RepositoryResolution.resolved(
@@ -60,9 +81,11 @@ class CodebaseRunContextTest {
                 """);
 
         assertThatThrownBy(() -> context.stage("链", List.of(
-                new CodebaseRunContext.DraftNode("A", "java", "A.enter", "void enter()", "A.java", 1, 1, "入口"),
+                new CodebaseRunContext.DraftNode("A", "java", "A.enter", "void enter()", "A.java", 1, 2, "入口"),
                 new CodebaseRunContext.DraftNode("B", "java", "B.run", "void run()", "A.java", 1, 1, "服务")),
                 List.of(new CodebaseRunContext.DraftEdge("A", "B"))))
-                .hasMessageContaining("证据");
+                .isInstanceOf(CodebaseException.class)
+                .satisfies(error -> assertThat(((CodebaseException) error).details())
+                        .containsKey("missing"));
     }
 }

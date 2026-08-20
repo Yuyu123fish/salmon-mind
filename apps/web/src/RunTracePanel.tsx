@@ -170,6 +170,15 @@ function OutcomeDetail({ detail }: { detail: ToolOutcomeDetail }) {
       <div><dt>耗时</dt><dd>{detail.durationMillis} ms</dd></div>
       <div><dt>降级</dt><dd>{detail.degraded ? '是' : '否'}</dd></div>
       <div><dt>结果裁剪</dt><dd>{detail.resultTruncated ? '是' : '否'}</dd></div>
+      {detail.estimatedResultTokens !== null && detail.estimatedResultTokens !== undefined ? (
+        <div><dt>结果 token 估算</dt><dd>{detail.estimatedResultTokens}</dd></div>
+      ) : null}
+      {detail.remainingInputTokens !== null && detail.remainingInputTokens !== undefined ? (
+        <div><dt>剩余输入 token</dt><dd>{detail.remainingInputTokens}</dd></div>
+      ) : null}
+      {detail.contextCleaned !== undefined ? (
+        <div><dt>旧结果清理</dt><dd>{detail.contextCleaned ? '是' : '否'}</dd></div>
+      ) : null}
     </dl>
   )
 }

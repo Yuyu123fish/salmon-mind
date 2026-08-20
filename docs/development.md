@@ -41,9 +41,9 @@ Conversation JSONL 与本地代码库理解数据共用一个 Server-owned 数�
 - `MODEL_EMBEDDING_BASE_URL` 指向 OpenAI-compatible API 根路径，代码会追加 `/embeddings`。
 - Chat 与 Embedding 分开配置，允许使用不同提供方与模型。
 - RustFS、Elasticsearch 和模型未配置时不做静默假实现；只有实际调用对应能力时才失败。
-- 网页搜索由 Server 侧 `salmon.websearch.bocha.*` 与 `salmon.websearch.search-api.*` 配置；博查使用原始 Web Search，SearchApi.io 使用 Google `organic_results`。两个 `api-key` 必须只放在被忽略的 `application-dev.yml` 或环境变量 `BOCHA_SEARCH_API_KEY` / `SEARCH_API_API_KEY`，不会发送到浏览器或 URL。
-- Agent 上下文边界可通过 `salmon.agent.max-tool-result-tokens-per-run`（环境变量 `AGENT_MAX_TOOL_RESULT_TOKENS_PER_RUN`，默认 32768）和 `salmon.agent.max-steps`（环境变量 `AGENT_MAX_STEPS`，默认 32）调整；两项均可选，修改后需重启后端，前者不能超过主输入触发阈值。
-- 代码库工具使用独立预算：`salmon.agent.codebase.max-tool-calls-per-run` / `SALMON_AGENT_CODEBASE_MAX_TOOL_CALLS_PER_RUN`（默认 16）、`salmon.agent.codebase.max-tool-result-tokens-per-run` / `SALMON_AGENT_CODEBASE_MAX_TOOL_RESULT_TOKENS_PER_RUN`（默认 65536）和 `salmon.agent.codebase.max-tool-result-chars` / `SALMON_AGENT_CODEBASE_MAX_TOOL_RESULT_CHARS`（默认 65536）；三项只允许下调，修改后需重启后端。
+- 网页搜索只使用 Server 侧 `salmon.websearch.search-api.*`；SearchApi.io 使用 Google `organic_results`。`SEARCH_API_API_KEY` 必须只放在被忽略的 `application-dev.yml` 或环境变量中，不会发送到浏览器或 URL。
+- Agent 主输入压缩线由 `salmon.compaction.trigger-input-tokens` / `COMPACTION_TRIGGER_INPUT_TOKENS` 控制，默认 700000；物理窗口默认 1000000，主输出预留默认 65432，修改后需重启后端。结果 token 不再使用 `max-tool-result-tokens-per-run` 累计闸门，而是在下一次模型调用前按真实 Tool Result 计量。
+- Agent 的调用次数边界由 `salmon.agent.max-tool-calls-per-run`（默认 4）、`salmon.agent.codebase.max-tool-calls-per-run` / `SALMON_AGENT_CODEBASE_MAX_TOOL_CALLS_PER_RUN`（默认 16）和 `salmon.agent.max-steps`（环境变量 `AGENT_MAX_STEPS`，默认 32）控制；代码库结果仍受 `max-tool-result-chars` 字符边界限制。修改后需重启后端。
 - 非敏感配置以 [application.yml](../apps/server/src/main/resources/application.yml) 为准；敏感配置以 [application-dev-example.yml](../apps/server/src/main/resources/application-dev-example.yml) 为模板。
 
 ### Conversation Cache 与虚拟线程

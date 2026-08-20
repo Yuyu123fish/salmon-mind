@@ -13,8 +13,25 @@ public record ToolOutcomeDetailPayload(
         Integer sourceCount,
         long durationMillis,
         boolean degraded,
-        boolean resultTruncated
+        boolean resultTruncated,
+        Long estimatedResultTokens,
+        Long remainingInputTokens,
+        boolean contextCleaned
 ) {
+
+    /** 兼容旧 JSONL/历史调用方没有上下文计量字段的构造。 */
+    public ToolOutcomeDetailPayload(
+            String provider,
+            ResultStatus resultStatus,
+            String stableReasonCode,
+            Integer sourceCount,
+            long durationMillis,
+            boolean degraded,
+            boolean resultTruncated
+    ) {
+        this(provider, resultStatus, stableReasonCode, sourceCount, durationMillis,
+                degraded, resultTruncated, null, null, false);
+    }
 
     public ToolOutcomeDetailPayload {
         if (sourceCount != null && sourceCount < 0) {
@@ -22,6 +39,10 @@ public record ToolOutcomeDetailPayload(
         }
         if (durationMillis < 0) {
             throw new IllegalArgumentException("工具耗时不能为负数");
+        }
+        if (estimatedResultTokens != null && estimatedResultTokens < 0
+                || remainingInputTokens != null && remainingInputTokens < 0) {
+            throw new IllegalArgumentException("工具上下文 token 计量不能为负数");
         }
     }
 

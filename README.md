@@ -45,7 +45,7 @@ SalmonMind 的长期目标不是再做一个通用聊天界面，而是建立一
 
 ### 多来源 RAG 与可验证引用
 
-- Agent 可以按问题选择本地知识检索、博查网页搜索或 SearchApi.io 网页搜索。
+- Agent 可以按问题选择本地知识检索或 SearchApi.io 网页搜索。
 - 支持在同一个问题中组合本地文档与网页现状；检索无结果时仍可使用模型已有知识回答。
 - 只有当前 Run 中真实返回、且被最终答案实际引用的来源才会生成 Citation。
 - 本地来源使用 `L` 编号，网页来源使用 `W` 编号；旧轮次编号不会被误当成本轮证据。
@@ -65,7 +65,7 @@ flowchart LR
 
     question["用户问题"] --> agent["多轮 Agent"]
     agent --> local["BM25 + 向量 + RRF + 精排"]
-    agent --> web["博查 / SearchApi.io"]
+    agent --> web["SearchApi.io"]
     agent --> model["模型已有知识"]
     index --> local
     local --> answer["回答与本地引用"]
@@ -123,7 +123,6 @@ Copy-Item apps/server/src/main/resources/application-dev-example.yml apps/server
 | `salmon.model.chat.api-key` | 对话必需 | 默认调用 DeepSeek `deepseek-v4-flash` |
 | `salmon.model.embedding.api-key` | 文档索引与向量检索必需 | 通过硅基流动调用 Qwen3 Embedding 4B |
 | `salmon.model.rerank.api-key` | 完整混合检索必需 | 通过硅基流动调用 Qwen3 Reranker 4B |
-| `salmon.websearch.bocha.api-key` | 可选 | 启用博查网页搜索 |
 | `salmon.websearch.search-api.api-key` | 可选 | 启用 SearchApi.io 网页搜索 |
 
 模型或搜索 Key 未配置时 Server 仍可启动，但对应能力会在实际调用时明确报告未配置。

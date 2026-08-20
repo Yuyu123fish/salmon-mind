@@ -33,10 +33,6 @@ salmon:
       base-url: https://api.siliconflow.cn/v1
       api-key: your-rerank-api-key
   websearch:
-    bocha:
-      # 原始 Web Search API；缺少 key 时服务仍可启动，调用网页工具时返回未配置
-      base-url: https://api.bochaai.com
-      api-key: your-bocha-api-key
     search-api:
       # SearchApi.io Google organic results；不在浏览器或 query 参数中保存 key
       base-url: https://www.searchapi.io
@@ -44,6 +40,14 @@ salmon:
       gl: cn
       hl: zh-cn
       safe: active
+  compaction:
+    # 主输入达到该值时先压缩；它是显式输入阈值，不再从 working-window 推导
+    physical-window: 1000000
+    trigger-input-tokens: 700000
+    output-reserve: 65432
+    retained-tail-target: 65536
+    summary-max-output-tokens: 32768
+    summary-temperature: 0.1
   agent:
     # 可选：Checkpoint 四类 Key 的滑动 Lease，默认 24h，修改后重启后端生效
     checkpoint:
@@ -57,12 +61,9 @@ salmon:
       max-concurrent-tools: 2
       max-concurrent-per-web-provider: 1
       tool-execution-timeout: 60s
-    # 可选：一次主调用内所有工具结果的累计 token 上限；默认 32768，修改后重启后端生效
-    max-tool-result-tokens-per-run: 32768
     codebase:
-      # 可选：本地代码库工具独立预算；默认值可下调，修改后重启后端生效
+      # 可选：本地代码库工具调用/字符预算；结果 token 随实际模型输入计量
       max-tool-calls-per-run: 16
-      max-tool-result-tokens-per-run: 65536
       max-tool-result-chars: 65536
     # 可选：一次 Agent Loop 的模型调用硬上限；默认 32，修改后重启后端生效
     max-steps: 32

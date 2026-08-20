@@ -4,19 +4,18 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * SalmonMind 的网页搜索公开合同。调用方只选择固定 Provider 并取得已归一化的自然结果，
+ * SalmonMind 的网页搜索公开合同。调用方通过 SearchApi.io 取得已归一化的自然结果，
  * 不接触 Provider 的 HTTP DTO、原始错误体或生成式答案。
  */
 public interface WebSearchService {
 
     /**
-     * 查询一个明确的网页 Provider。实现不会在 Provider 之间自动 fallback，也不会重试。
+     * 查询网页自然结果。当前实现固定使用 SearchApi.io，不做 Provider fallback 或重试。
      * 未配置、鉴权失败、限流、超时和非法响应均以结构化 {@link WebSearchResult} 返回。
      */
-    WebSearchResult search(WebSearchProvider provider, WebSearchRequest request);
+    WebSearchResult search(WebSearchRequest request);
 
     enum WebSearchProvider {
-        BOCHA,
         SEARCH_API
     }
 

@@ -42,10 +42,15 @@ class CodebaseExceptionHandler {
     private HttpStatus statusOf(CodebaseErrorCode code) {
         return switch (code) {
             case INVALID_ABSOLUTE_PATH, PATH_NOT_FOUND, PATH_NOT_DIRECTORY, PATH_NOT_READABLE,
-                    NOT_GIT_REPOSITORY, BARE_REPOSITORY_NOT_SUPPORTED, INVALID_QUERY -> HttpStatus.BAD_REQUEST;
-            case REPOSITORY_NOT_FOUND -> HttpStatus.NOT_FOUND;
+                    NOT_GIT_REPOSITORY, BARE_REPOSITORY_NOT_SUPPORTED, INVALID_QUERY,
+                    CALL_CHAIN_NAME_INVALID, CALL_CHAIN_DRAFT_INVALID -> HttpStatus.BAD_REQUEST;
+            case REPOSITORY_NOT_FOUND, CALL_CHAIN_NOT_FOUND -> HttpStatus.NOT_FOUND;
+            case CALL_CHAIN_DELETED -> HttpStatus.GONE;
             case PATH_OUTSIDE_REPOSITORY, SENSITIVE_FILE_DENIED -> HttpStatus.FORBIDDEN;
-            case REPOSITORY_UNAVAILABLE -> HttpStatus.CONFLICT;
+            case REPOSITORY_UNAVAILABLE, CALL_CHAIN_EVIDENCE_INSUFFICIENT,
+                    CALL_CHAIN_PENDING_NOT_FOUND, CALL_CHAIN_REPOSITORY_CHANGED,
+                    CALL_CHAIN_REVISION_UPDATE_REQUIRED, CALL_CHAIN_DATA_ROOT_CONFLICT,
+                    CALL_CHAIN_IDENTITY_CONFLICT -> HttpStatus.CONFLICT;
             case UNSUPPORTED_TEXT_FILE -> HttpStatus.UNSUPPORTED_MEDIA_TYPE;
             case GIT_NOT_AVAILABLE, GIT_QUERY_FAILED, CODEBASE_DATA_UNAVAILABLE -> HttpStatus.SERVICE_UNAVAILABLE;
             case GIT_QUERY_TIMEOUT -> HttpStatus.GATEWAY_TIMEOUT;
@@ -63,6 +68,16 @@ class CodebaseExceptionHandler {
             case BARE_REPOSITORY_NOT_SUPPORTED -> "不支持 bare repository";
             case REPOSITORY_NOT_FOUND -> "仓库不存在";
             case REPOSITORY_UNAVAILABLE -> "仓库当前不可访问";
+            case CALL_CHAIN_NOT_FOUND -> "调用链不存在";
+            case CALL_CHAIN_DELETED -> "调用链已删除";
+            case CALL_CHAIN_NAME_INVALID -> "调用链名称不合法";
+            case CALL_CHAIN_DRAFT_INVALID -> "调用链草稿不合法";
+            case CALL_CHAIN_EVIDENCE_INSUFFICIENT -> "调用链源码证据不足";
+            case CALL_CHAIN_PENDING_NOT_FOUND -> "调用链待发布记录不存在";
+            case CALL_CHAIN_REPOSITORY_CHANGED -> "仓库或源码已发生变化";
+            case CALL_CHAIN_REVISION_UPDATE_REQUIRED -> "节点已变化，需要后续 Revision 支持";
+            case CALL_CHAIN_DATA_ROOT_CONFLICT -> "调用链数据目录与目标仓库冲突";
+            case CALL_CHAIN_IDENTITY_CONFLICT -> "调用链身份不一致";
             case PATH_OUTSIDE_REPOSITORY -> "路径超出仓库边界";
             case SENSITIVE_FILE_DENIED -> "请求访问的文件受到保护";
             case UNSUPPORTED_TEXT_FILE -> "目标不是受支持的文本文件";

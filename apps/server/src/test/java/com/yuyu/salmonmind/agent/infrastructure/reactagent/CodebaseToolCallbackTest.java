@@ -29,12 +29,12 @@ class CodebaseToolCallbackTest {
     private final ObjectMapper mapper = new ObjectMapper();
 
     @Test
-    void exposesTenStrictToolsAndDoesNotCreateLwSources() throws Exception {
+    void exposesElevenStrictToolsAndDoesNotCreateLwSources() throws Exception {
         CodebaseService codebase = mock(CodebaseService.class);
         RepositoryEvidenceService evidence = mock(RepositoryEvidenceService.class);
         List<ToolCallback> tools = CodebaseToolCallback.productionTools(mapper, codebase, evidence);
 
-        assertThat(tools).hasSize(10);
+        assertThat(tools).hasSize(11);
         for (ToolCallback tool : tools) {
             JsonNode schema = mapper.readTree(tool.getToolDefinition().inputSchema());
             assertThat(schema.path("additionalProperties").asBoolean()).isFalse();
@@ -89,6 +89,35 @@ class CodebaseToolCallbackTest {
 
         assertThat(result.path("reason").asText()).isEqualTo("INVALID_QUERY");
         verifyNoEvidenceCalls(evidence);
+    }
+
+    @Test
+    void stagesOnlyIdentityAndEdgesAndRejectsModelSuppliedSource() throws Exception {
+        UUID repositoryId = UUID.randomUUID();
+        CodebaseService codebase = mock(CodebaseService.class);
+        when(codebase.resolveRepository(null)).thenReturn(RepositoryResolution.resolved(
+                repository(repositoryId, "demo")));
+        CodebaseRunContext context = new CodebaseRunContext(codebase, mapper);
+        context.select(null);
+        context.registerReadFileResult("""
+                {"status":"SUCCESS","sourceKind":"CODEBASE","operation":"read_repository_file","path":"A.java","startLine":1,"endLine":1,"truncated":false,"items":[{"path":"A.java","line":1,"text":"void enter() {}"}]}
+                """);
+        context.registerReadFileResult("""
+                {"status":"SUCCESS","sourceKind":"CODEBASE","operation":"read_repository_file","path":"B.java","startLine":1,"endLine":1,"truncated":false,"items":[{"path":"B.java","line":1,"text":"void run() {}"}]}
+                """);
+        ToolContext toolContext = new ToolContext(Map.of(CodebaseRunContext.METADATA_KEY, context));
+        CallChainToolCallback callback = new CallChainToolCallback(mapper);
+
+        JsonNode staged = mapper.readTree(callback.call("""
+                {"name":"入口链","nodes":[{"key":"a","language":"java","qualifiedSymbol":"Demo.enter","signature":"void enter() {}","path":"A.java","startLine":1,"endLine":1,"summary":"入口"},{"key":"b","language":"java","qualifiedSymbol":"Demo.run","signature":"void run() {}","path":"B.java","startLine":1,"endLine":1,"summary":"服务"}],"edges":[{"from":"a","to":"b"}]}
+                """, toolContext));
+        assertThat(staged.path("status").asText()).isEqualTo("SUCCESS");
+        assertThat(staged.path("operation").asText()).isEqualTo("stage_call_chain");
+
+        JsonNode withSource = mapper.readTree(callback.call("""
+                {"name":"入口链","nodes":[],"edges":[],"source":"不要接受"}
+                """, toolContext));
+        assertThat(withSource.path("reason").asText()).isEqualTo("INVALID_QUERY");
     }
 
     private RepositoryResolution.ResolvedRepository repository(UUID id, String name) {

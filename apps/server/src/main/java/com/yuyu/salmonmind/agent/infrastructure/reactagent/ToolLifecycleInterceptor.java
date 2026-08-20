@@ -202,6 +202,11 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                         budgetResult(request, TOOL_CONTEXT_BUDGET_EXCEEDED));
             }
             ToolCallResponse response = bounded.response();
+            // 只有最终裁剪结果已经成功提交到本 Run 的结果预算后，才把 ReadFile 行登记为
+            // 可用于 prepare 的证据；原始超长结果和预算失败结果永远不能形成调用链。
+            if (codebaseTool && !response.isError()) {
+                registerCodebaseEvidence(request, response.getResult());
+            }
             RunSourceRegistry.Decoration source = bounded.decoration();
             long durationMillis = elapsedMillis(startedNanos);
             if (listener != null) {
@@ -572,6 +577,14 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
                 .orElse(null);
     }
 
+    private static void registerCodebaseEvidence(ToolCallRequest request, String result) {
+        request.getExecutionContext()
+                .flatMap(context -> context.config().metadata(CodebaseRunContext.METADATA_KEY))
+                .filter(CodebaseRunContext.class::isInstance)
+                .map(CodebaseRunContext.class::cast)
+                .ifPresent(context -> context.registerReadFileResult(result));
+    }
+
     private static void rollbackSource(ToolCallRequest request, RunSourceRegistry.Decoration decoration) {
         RunSourceRegistry registry = sourceRegistryOf(request);
         if (registry != null) {
@@ -670,6 +683,7 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             case "git_repository_status" -> "查看 Git 状态";
             case "git_repository_diff" -> "查看 Git 差异";
             case "git_repository_log", "git_repository_show", "git_repository_blame" -> "查看 Git 历史";
+            case CallChainToolCallback.NAME -> "整理临时调用链";
             default -> "工具执行中";
         };
     }
@@ -692,6 +706,10 @@ class ToolLifecycleInterceptor extends ToolInterceptor {
             case "REPOSITORY_SELECTION_REQUIRED" -> "需要选择一个本地仓库";
             case "MULTIPLE_REPOSITORIES_NOT_SUPPORTED" -> "一次对话只能绑定一个本地仓库";
             case "REPOSITORY_NOT_FOUND", "REFERENCE_NOT_FOUND" -> "未找到本地仓库";
+            case "CALL_CHAIN_DRAFT_INVALID" -> "调用链草稿不合法";
+            case "CALL_CHAIN_EVIDENCE_INSUFFICIENT" -> "调用链源码证据不足";
+            case "CALL_CHAIN_REPOSITORY_CHANGED" -> "仓库或源码已发生变化";
+            case "CALL_CHAIN_REVISION_UPDATE_REQUIRED" -> "节点已变化，需要后续 Revision 支持";
             case "PATH_OUTSIDE_REPOSITORY" -> "查询路径超出仓库边界";
             case "INVALID_QUERY" -> "代码库查询参数无效";
             case "CODEBASE_UNAVAILABLE", "PATH_NOT_FOUND", "REPOSITORY_UNAVAILABLE",

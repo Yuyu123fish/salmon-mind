@@ -2,14 +2,17 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   addSearchRoot,
   fetchCodebase,
+  listCallChains,
   registerRepository,
   removeSearchRoot,
   setActiveRepository,
   unregisterRepository,
   updateRepository,
   type CodebaseCatalog,
+  type CallChainSummary,
   type Repository,
 } from './codebaseApi.ts'
+import CallChainView from './CallChainView.tsx'
 
 type LoadState =
   | { status: 'loading' }
@@ -31,9 +34,15 @@ export default function RepositoryMenu() {
   const [editDrafts, setEditDrafts] = useState<Record<string, EditDraft>>({})
   const [mutation, setMutation] = useState(false)
   const [mutationError, setMutationError] = useState<string | null>(null)
+  const [callChains, setCallChains] = useState<CallChainSummary[]>([])
+  const [callChainState, setCallChainState] = useState<LoadState>({ status: 'ready' })
+  const [openCallChainId, setOpenCallChainId] = useState<string | null>(null)
+  const [callChainRefresh, setCallChainRefresh] = useState(0)
   const loadSequence = useRef(0)
   const mutationSequence = useRef(0)
+  const callChainSequence = useRef(0)
   const loadAbort = useRef<AbortController | null>(null)
+  const callChainAbort = useRef<AbortController | null>(null)
 
   const refresh = useCallback(async () => {
     const sequence = ++loadSequence.current
@@ -60,6 +69,32 @@ export default function RepositoryMenu() {
   useEffect(() => {
     if (open) void refresh()
   }, [open, refresh])
+
+  useEffect(() => {
+    const sequence = ++callChainSequence.current
+    const repositoryId = activeRepositoryId(catalog)
+    callChainAbort.current?.abort()
+    if (!open || repositoryId === null) {
+      setCallChains([])
+      setOpenCallChainId(null)
+      setCallChainState({ status: 'ready' })
+      return
+    }
+    const controller = new AbortController()
+    callChainAbort.current = controller
+    setCallChainState({ status: 'loading' })
+    void listCallChains(repositoryId, controller.signal)
+      .then((next) => {
+        if (controller.signal.aborted || sequence !== callChainSequence.current) return
+        setCallChains(next)
+        setCallChainState({ status: 'ready' })
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return
+        setCallChainState({ status: 'error', message: errorMessage(error) })
+      })
+    return () => controller.abort()
+  }, [catalog, callChainRefresh, open])
 
   const runMutation = useCallback(async (action: () => Promise<void>) => {
     const sequence = ++mutationSequence.current
@@ -263,6 +298,45 @@ export default function RepositoryMenu() {
                   </ul>
                 ) : <p className="repository-hint">尚未授权发现目录。</p>}
               </div>
+
+              <div className="repository-section">
+                <div className="repository-section-title">
+                  <h3>当前仓库调用链</h3>
+                  {active !== null && <button type="button" className="text-button" onClick={() => setCallChainRefresh((current) => current + 1)}>刷新</button>}
+                </div>
+                {active === null && <p className="repository-hint">选择一个当前仓库后，这里会显示已保存的调用链。</p>}
+                {active !== null && callChainState.status === 'loading' && <p className="repository-hint">正在读取调用链…</p>}
+                {active !== null && callChainState.status === 'error' && <p className="repository-error" role="alert">{callChainState.message}</p>}
+                {active !== null && callChainState.status === 'ready' && callChains.length === 0 && <p className="repository-hint">当前仓库还没有已保存的调用链。</p>}
+                {callChains.length > 0 && (
+                  <div className="call-chain-menu-list">
+                    {callChains.map((callChain) => (
+                      <article className="call-chain-menu-item" key={callChain.id}>
+                        <div>
+                          <strong>{callChain.name}</strong>
+                          <small>{callChain.nodeCount} 个节点 · {callChain.edgeCount} 条边</small>
+                        </div>
+                        <button type="button" onClick={() => setOpenCallChainId(callChain.id)}>查看</button>
+                      </article>
+                    ))}
+                  </div>
+                )}
+                {active !== null && openCallChainId !== null && (
+                  <CallChainView
+                    repositoryId={active.id}
+                    callChainId={openCallChainId}
+                    fallbackName={callChains.find((callChain) => callChain.id === openCallChainId)?.name ?? '调用链'}
+                    onClose={() => {
+                      setOpenCallChainId(null)
+                      setCallChainRefresh((current) => current + 1)
+                    }}
+                    onDeleted={() => {
+                      setCallChains((current) => current.filter((callChain) => callChain.id !== openCallChainId))
+                      setOpenCallChainId(null)
+                    }}
+                  />
+                )}
+              </div>
             </div>
           )}
         </section>
@@ -284,4 +358,8 @@ function statusLabel(repository: Repository): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '代码库服务请求失败'
+}
+
+function activeRepositoryId(catalog: CodebaseCatalog | null): string | null {
+  return catalog?.activeRepositoryId ?? null
 }

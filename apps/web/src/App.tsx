@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import KnowledgeView from './KnowledgeView.tsx'
 import { MarkdownRenderer } from './MarkdownRenderer.tsx'
+import { CallChainCard } from './CallChainView.tsx'
 import RepositoryMenu from './RepositoryMenu.tsx'
 import { RunTracePanel } from './RunTracePanel.tsx'
 import { mergeConversation, mergeConversationDetail } from './conversationState.ts'
@@ -936,6 +937,9 @@ function MessageEntry({
               />
             )}
           </AssistantEvidenceView>
+          {(entry.payload.callChains ?? []).map((callChain) => (
+            <CallChainCard key={callChain.id} reference={callChain} />
+          ))}
           {entry.payload.completionStatus === 'INCOMPLETE_LENGTH' && (
             <div className="incomplete-answer" role="status">
               <span>回答未完成</span>

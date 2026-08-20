@@ -2,6 +2,12 @@
 
 Status: Specified
 
+## Stage Plans
+
+- [Stage 01：本地仓库接入与只读工具底座](./plan-01-repository-access-and-readonly-foundation.md)
+- [Stage 02：对话式代码库理解闭环](./plan-02-conversational-codebase-understanding.md)
+- [Stage 03：简单调用链沉淀与展示](./plan-03-call-chain-persistence-and-display.md)
+
 ## Problem Statement
 
 AI 生成代码的速度已经明显快于开发者理解代码的速度。开发者可能拥有多个由自己主导、与 AI 协作完成或长期没有打开的本地项目，但现有 SalmonMind 只能围绕对话、本地文档和网页资料回答，不能直接核对当前源码、工作树和 Git 历史。开发者仍要在 IDE、终端和聊天窗口之间手动查找文件、拼接调用关系，也无法把一次已经核实的项目理解留给后续对话复用。

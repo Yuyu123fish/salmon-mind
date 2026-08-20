@@ -2386,3 +2386,258 @@ button:focus-visible {
     transition: none !important;
   }
 }
+
+.call-chain-card,
+.call-chain-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--salmon);
+  border-radius: 8px;
+  padding: 9px 11px;
+  background: rgba(47, 79, 72, 0.04);
+}
+
+.call-chain-card > div,
+.call-chain-menu-item > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.call-chain-card strong,
+.call-chain-menu-item strong {
+  overflow-wrap: anywhere;
+}
+
+.call-chain-card small,
+.call-chain-menu-item small {
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.call-chain-card button,
+.call-chain-menu-item button,
+.call-chain-actions button {
+  flex: 0 0 auto;
+  border: 1px solid var(--river);
+  border-radius: 6px;
+  padding: 5px 8px;
+  color: var(--river);
+  background: transparent;
+  font-size: 0.72rem;
+}
+
+.call-chain-menu-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.call-chain-menu-item {
+  margin-top: 0;
+}
+
+.call-chain-view {
+  min-width: 0;
+  border-top: 1px solid var(--line);
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.call-chain-view-head,
+.call-chain-actions,
+.call-chain-section h4 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.call-chain-view-head h3 {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.call-chain-view-head small {
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.call-chain-actions {
+  align-items: flex-end;
+  flex-wrap: wrap;
+  margin: 12px 0;
+}
+
+.call-chain-actions label {
+  display: flex;
+  min-width: min(260px, 100%);
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.call-chain-actions input {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  color: var(--ink);
+  background: var(--paper);
+}
+
+.call-chain-actions .danger-button {
+  border-color: var(--salmon);
+  color: #a34d42;
+}
+
+.call-chain-layout {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.8fr) minmax(0, 1.2fr);
+  gap: 14px;
+}
+
+.call-chain-section {
+  min-width: 0;
+}
+
+.call-chain-section h4 {
+  justify-content: flex-start;
+  margin: 10px 0 7px;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.call-chain-node-list,
+.call-chain-edge-list,
+.call-chain-revision-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.call-chain-node {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 8px;
+  color: var(--ink);
+  background: transparent;
+  text-align: left;
+}
+
+.call-chain-node[data-selected='true'] {
+  border-color: var(--salmon);
+  background: rgba(219, 121, 101, 0.08);
+}
+
+.call-chain-node strong,
+.call-chain-node small {
+  overflow-wrap: anywhere;
+}
+
+.call-chain-node small,
+.call-chain-edge-list li,
+.call-chain-revision-list li {
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.call-chain-edge-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content minmax(0, 1fr);
+  gap: 6px;
+  overflow-wrap: anywhere;
+}
+
+.call-chain-edge-list li span:last-child {
+  text-align: right;
+}
+
+.call-chain-summary {
+  margin: 0;
+  color: var(--ink);
+  font-size: 0.78rem;
+}
+
+.call-chain-node-detail .source-detail-list {
+  margin-top: 8px;
+}
+
+.call-chain-node-detail h5 {
+  margin: 12px 0 5px;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.call-chain-source {
+  max-height: 260px;
+  overflow: auto;
+  margin: 10px 0 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px;
+  background: #f3f6f4;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.call-chain-modal-backdrop {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(22, 39, 35, 0.42);
+}
+
+.call-chain-modal {
+  width: min(960px, 100%);
+  max-height: min(88vh, 820px);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 18px;
+  background: var(--paper);
+  box-shadow: 0 20px 70px rgba(22, 39, 35, 0.22);
+}
+
+.call-chain-modal .call-chain-view {
+  border-top: 0;
+  margin-top: 0;
+  padding-top: 0;
+}
+
+@media (max-width: 720px) {
+  .call-chain-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .call-chain-modal-backdrop {
+    align-items: flex-start;
+    padding: 10px;
+  }
+
+  .call-chain-modal {
+    max-height: calc(100vh - 20px);
+    padding: 13px;
+  }
+}

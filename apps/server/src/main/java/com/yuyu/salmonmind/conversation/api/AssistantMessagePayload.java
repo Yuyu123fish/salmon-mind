@@ -17,7 +17,8 @@ public record AssistantMessagePayload(
         List<RetrievedSourcePayload> retrievedSources,
         List<RunTraceItemPayload> trace,
         AssistantCompletionStatus completionStatus,
-        String completionDetailCode
+        String completionDetailCode,
+        List<CallChainReferencePayload> callChains
 ) implements EntryPayload {
 
     public AssistantMessagePayload {
@@ -25,6 +26,7 @@ public record AssistantMessagePayload(
         retrievedSources = retrievedSources == null ? List.of() : List.copyOf(retrievedSources);
         trace = trace == null ? List.of() : List.copyOf(trace);
         completionStatus = completionStatus == null ? AssistantCompletionStatus.COMPLETE : completionStatus;
+        callChains = callChains == null ? List.of() : List.copyOf(callChains);
     }
 
     /** 兼容已有 Citation + Trace 调用；旧调用没有 Retrieved Source。 */
@@ -33,7 +35,7 @@ public record AssistantMessagePayload(
             List<CitationPayload> citations, List<RunTraceItemPayload> trace
     ) {
         this(text, runId, provider, model, usage, citations, List.of(), trace,
-                AssistantCompletionStatus.COMPLETE, null);
+                AssistantCompletionStatus.COMPLETE, null, List.of());
     }
 
     /** 兼容已有调用方同时提供 Retrieved Source 与 Trace 的八参数构造。 */
@@ -43,7 +45,7 @@ public record AssistantMessagePayload(
             List<RunTraceItemPayload> trace
     ) {
         this(text, runId, provider, model, usage, citations, retrievedSources, trace,
-                AssistantCompletionStatus.COMPLETE, null);
+                AssistantCompletionStatus.COMPLETE, null, List.of());
     }
 
     /** 旧调用兼容：已有代码提供 Citation 但没有 Trace 时按空列表处理。 */
@@ -52,7 +54,7 @@ public record AssistantMessagePayload(
             List<CitationPayload> citations
     ) {
         this(text, runId, provider, model, usage, citations, List.of(), List.of(),
-                AssistantCompletionStatus.COMPLETE, null);
+                AssistantCompletionStatus.COMPLETE, null, List.of());
     }
 
     /** 旧调用兼容：历史/测试构造未提供 Citation 时按空列表处理。 */
@@ -60,6 +62,17 @@ public record AssistantMessagePayload(
             String text, UUID runId, String provider, String model, TokenUsage usage
     ) {
         this(text, runId, provider, model, usage, List.of(), List.of(), List.of(),
-                AssistantCompletionStatus.COMPLETE, null);
+                AssistantCompletionStatus.COMPLETE, null, List.of());
+    }
+
+    /** 兼容已有完整状态构造；旧调用没有调用链引用。 */
+    public AssistantMessagePayload(
+            String text, UUID runId, String provider, String model, TokenUsage usage,
+            List<CitationPayload> citations, List<RetrievedSourcePayload> retrievedSources,
+            List<RunTraceItemPayload> trace, AssistantCompletionStatus completionStatus,
+            String completionDetailCode
+    ) {
+        this(text, runId, provider, model, usage, citations, retrievedSources, trace,
+                completionStatus, completionDetailCode, List.of());
     }
 }

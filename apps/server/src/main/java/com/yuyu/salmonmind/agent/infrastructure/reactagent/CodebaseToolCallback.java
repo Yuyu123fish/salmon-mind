@@ -73,7 +73,7 @@ final class CodebaseToolCallback implements ParallelSafeToolCallback {
         this.operation = operation;
     }
 
-    /** 生产 Agent 固定注册的一个选择 Tool 和九个只读 Evidence Tool。 */
+    /** 生产 Agent 固定注册一个选择 Tool、十个只读 Evidence Tool 和一个临时调用链 Tool。 */
     static List<ToolCallback> productionTools(
             ObjectMapper mapper,
             CodebaseService codebase,
@@ -89,12 +89,16 @@ final class CodebaseToolCallback implements ParallelSafeToolCallback {
                 new CodebaseToolCallback(mapper, codebase, evidence, Operation.DIFF),
                 new CodebaseToolCallback(mapper, codebase, evidence, Operation.LOG),
                 new CodebaseToolCallback(mapper, codebase, evidence, Operation.SHOW),
-                new CodebaseToolCallback(mapper, codebase, evidence, Operation.BLAME));
+                new CodebaseToolCallback(mapper, codebase, evidence, Operation.BLAME),
+                new CallChainToolCallback(mapper));
     }
 
     static boolean isCodebaseToolName(String toolName) {
         if (toolName == null) {
             return false;
+        }
+        if (CallChainToolCallback.NAME.equals(toolName)) {
+            return true;
         }
         for (Operation value : Operation.values()) {
             if (value.name.equals(toolName)) {

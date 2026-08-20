@@ -3,6 +3,7 @@ package com.yuyu.salmonmind.conversation.application;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException;
 import com.yuyu.salmonmind.agent.api.AgentExecutionException.AgentErrorCode;
 import com.yuyu.salmonmind.agent.api.AgentCitation;
+import com.yuyu.salmonmind.agent.api.AgentCallChainReference;
 import com.yuyu.salmonmind.agent.api.AgentContextBudget;
 import com.yuyu.salmonmind.agent.api.AgentCompletionStatus;
 import com.yuyu.salmonmind.agent.api.AgentLocalCitation;
@@ -12,6 +13,7 @@ import com.yuyu.salmonmind.agent.api.AgentRequest;
 import com.yuyu.salmonmind.agent.api.AgentResult;
 import com.yuyu.salmonmind.agent.api.AgentRetrievedSource;
 import com.yuyu.salmonmind.agent.api.AgentRunTraceItem;
+import com.yuyu.salmonmind.agent.api.AgentRunArtifact;
 import com.yuyu.salmonmind.agent.api.AgentStreamListener;
 import com.yuyu.salmonmind.agent.api.AgentStreamSession;
 import com.yuyu.salmonmind.agent.api.AgentSummaryRequest;
@@ -27,6 +29,7 @@ import com.yuyu.salmonmind.agent.api.AgentWebCitation;
 import com.yuyu.salmonmind.agent.api.AgentWebRetrievedSource;
 import com.yuyu.salmonmind.agent.api.CheckpointPolicy;
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
+import com.yuyu.salmonmind.conversation.api.CallChainReferencePayload;
 import com.yuyu.salmonmind.conversation.api.AssistantCompletionStatus;
 import com.yuyu.salmonmind.conversation.api.CompactionPayload;
 import com.yuyu.salmonmind.conversation.api.Conversation;
@@ -126,6 +129,7 @@ class ConversationRunCoordinator {
     private final AgentStreamSession agentStream;
     private final AgentSummaryService summaryService;
     private final AgentTitleService titleService;
+    private final AgentRunArtifact agentRunArtifact;
     private final TransactionTemplate transactionTemplate;
     private final ConversationCompactionPolicy compactionPolicy;
     private final ConversationCompactionPolicy.Budgets budgets;
@@ -140,6 +144,7 @@ class ConversationRunCoordinator {
             AgentStreamSession agentStream,
             AgentSummaryService summaryService,
             AgentTitleService titleService,
+            AgentRunArtifact agentRunArtifact,
             TransactionTemplate transactionTemplate,
             @Value("${salmon.compaction.physical-window:1000000}") long physicalWindow,
             @Value("${salmon.compaction.working-window:262144}") long workingWindow,
@@ -156,6 +161,7 @@ class ConversationRunCoordinator {
         this.agentStream = agentStream;
         this.summaryService = summaryService;
         this.titleService = titleService;
+        this.agentRunArtifact = agentRunArtifact;
         this.transactionTemplate = transactionTemplate;
         this.compactionPolicy = new ConversationCompactionPolicy();
         this.budgets = new ConversationCompactionPolicy.Budgets(
@@ -354,7 +360,8 @@ class ConversationRunCoordinator {
                 history = historyRepository.read(conversationId);
             }
             MainOutcome outcome = streamMain(
-                    listener, conversationId, current, history, running, answerEntryId, compaction.compacted());
+                    listener, conversationId, current, history, running, answerEntryId,
+                    compaction.compacted(), continuationSource == null);
             finishSuccess(listener, conversationId, outcome, running, answerEntryId, continuationSource);
         } catch (ConversationException ex) {
             if (!reconcileDurableAssistant(listener, conversationId, current, running, answerEntryId)) {
@@ -404,6 +411,9 @@ class ConversationRunCoordinator {
                 return false;
             }
             AssistantMessagePayload payload = (AssistantMessagePayload) assistant.payload();
+            // 数据库不可用或事务失败时仍先确认 JSONL 中声明的 pending，不能因为走了
+            // 运行期兜底路径而绕过调用链的唯一可见性边界。
+            agentRunArtifact.confirmCallChains(toAgentCallChains(payload.callChains()), assistant.id());
             Run recoveredRun = new Run(
                     running.id(), conversationId, running.triggerEntryId(), RunStatus.SUCCEEDED,
                     resultErrorCode(payload), running.startedAt(), assistant.createdAt(),
@@ -588,7 +598,8 @@ class ConversationRunCoordinator {
      */
     private MainOutcome streamMain(
             RunStreamListener listener, UUID conversationId, Conversation conversation,
-            ConversationHistory history, Run running, UUID answerEntryId, boolean alreadyCompacted
+            ConversationHistory history, Run running, UUID answerEntryId,
+            boolean alreadyCompacted, boolean callChainAllowed
     ) {
         List<Entry> path = history.activePath(conversation.activeLeafEntryId());
         List<AgentMessage> projection = project(path);
@@ -596,7 +607,7 @@ class ConversationRunCoordinator {
                 ? CheckpointPolicy.REBUILD_FROM_PROJECTION : CheckpointPolicy.REUSE_IF_MATCH;
         AgentRequest request = new AgentRequest(
                 conversationId.toString(), expectedCheckpointLeaf(path), answerEntryId, projection,
-                checkpointPolicy);
+                checkpointPolicy, callChainAllowed);
 
         boolean[] deltaSeen = {false};
         AgentResult[] success = {null};
@@ -657,7 +668,7 @@ class ConversationRunCoordinator {
                             ConversationErrorCode.CONTEXT_LIMIT_REACHED, "模型上下文溢出，且没有可压缩内容");
                 }
                 return streamMain(listener, conversationId, retried.conversation(),
-                        historyRepository.read(conversationId), running, answerEntryId, true);
+                        historyRepository.read(conversationId), running, answerEntryId, true, callChainAllowed);
             }
             if (error.code() == AgentErrorCode.CONTEXT_OVERFLOW) {
                 throw new ConversationException(
@@ -712,8 +723,12 @@ class ConversationRunCoordinator {
                         answerText, running.id(), result.provider(), result.model(), mapUsage(result.usage()),
                         mapCitations(result.citations()), mapRetrievedSources(result.retrievedSources()),
                         mapTrace(result.trace()), mapCompletionStatus(result.completionStatus()),
-                        result.completionDetailCode()));
+                        result.completionDetailCode(), mapCallChains(result.callChain(), continuationSource)));
         historyRepository.append(conversationId, assistantEntry);
+        // Assistant JSONL 已经成为成功依据；此后才允许把 pending 调用链移动到正式目录。
+        agentRunArtifact.confirmCallChains(
+                toAgentCallChains(((AssistantMessagePayload) assistantEntry.payload()).callChains()),
+                assistantEntry.id());
 
         String resultErrorCode = result.completionStatus() == AgentCompletionStatus.INCOMPLETE_LENGTH
                 && "OUTPUT_CONTINUATION_FAILED".equals(result.completionDetailCode())
@@ -735,6 +750,31 @@ class ConversationRunCoordinator {
                 conversationId, finalConversation, assistantEntry, running);
         sendSuccessEvents(listener, conversationId, finished, titleOutcome.conversation(),
                 assistantEntry, titleOutcome.event());
+    }
+
+    private static List<CallChainReferencePayload> mapCallChains(
+            AgentCallChainReference prepared, Entry continuationSource
+    ) {
+        if (continuationSource != null
+                && continuationSource.payload() instanceof AssistantMessagePayload source) {
+            return source.callChains();
+        }
+        if (prepared == null) {
+            return List.of();
+        }
+        return List.of(new CallChainReferencePayload(
+                prepared.id(), prepared.repositoryId(), prepared.name(),
+                prepared.nodeCount(), prepared.edgeCount()));
+    }
+
+    private static List<AgentCallChainReference> toAgentCallChains(
+            List<CallChainReferencePayload> references
+    ) {
+        return references.stream()
+                .map(reference -> new AgentCallChainReference(
+                        reference.id(), reference.repositoryId(), reference.name(),
+                        reference.nodeCount(), reference.edgeCount()))
+                .toList();
     }
 
     /**

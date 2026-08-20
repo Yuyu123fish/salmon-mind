@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yuyu.salmonmind.conversation.api.AssistantMessagePayload;
 import com.yuyu.salmonmind.conversation.api.AssistantCompletionStatus;
 import com.yuyu.salmonmind.conversation.api.CitationPayload;
+import com.yuyu.salmonmind.conversation.api.CallChainReferencePayload;
 import com.yuyu.salmonmind.conversation.api.CompactionPayload;
 import com.yuyu.salmonmind.conversation.api.Entry;
 import com.yuyu.salmonmind.conversation.api.EntryPayload;
@@ -149,6 +150,17 @@ class JsonlCodec {
                         trace.add(encodeTraceItem(item));
                     }
                 }
+                if (!p.callChains().isEmpty()) {
+                    ArrayNode callChains = node.putArray("callChains");
+                    for (CallChainReferencePayload callChain : p.callChains()) {
+                        ObjectNode item = callChains.addObject();
+                        item.put("id", callChain.id().toString());
+                        item.put("repositoryId", callChain.repositoryId().toString());
+                        item.put("name", callChain.name());
+                        item.put("nodeCount", callChain.nodeCount());
+                        item.put("edgeCount", callChain.edgeCount());
+                    }
+                }
                 yield node;
             }
             case CompactionPayload p -> {
@@ -221,11 +233,13 @@ class JsonlCodec {
                 List<CitationPayload> citations = decodeCitations(node.get("citations"));
                 List<RetrievedSourcePayload> retrievedSources = decodeRetrievedSources(node.get("retrievedSources"));
                 List<RunTraceItemPayload> trace = decodeTrace(node.get("trace"));
+                List<CallChainReferencePayload> callChains = decodeCallChains(node.get("callChains"));
                 AssistantCompletionStatus completionStatus = completionStatus(node);
                 yield new AssistantMessagePayload(
                         text(node, "text"), uuid(node, "runId"), text(node, "provider"), text(node, "model"),
                         usage, citations, retrievedSources, trace, completionStatus,
-                        node.hasNonNull("completionDetailCode") ? text(node, "completionDetailCode") : null);
+                        node.hasNonNull("completionDetailCode") ? text(node, "completionDetailCode") : null,
+                        callChains);
             }
             case COMPACTION -> {
                 TokenUsage usage = node.hasNonNull("usage") ? decodeUsage(node.get("usage")) : null;
@@ -443,6 +457,32 @@ class JsonlCodec {
             }
         }
         return List.copyOf(citations);
+    }
+
+    private List<CallChainReferencePayload> decodeCallChains(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return List.of();
+        }
+        if (!node.isArray() || node.size() > 1) {
+            throw corrupted("assistant callChains 不是单项数组");
+        }
+        List<CallChainReferencePayload> result = new ArrayList<>();
+        for (JsonNode item : node) {
+            String name = text(item, "name");
+            int nodeCount = positive(item, "nodeCount");
+            int edgeCount = positive(item, "edgeCount");
+            if (name == null || name.isBlank() || nodeCount < 2 || edgeCount < 1) {
+                throw corrupted("assistant callChain 引用字段损坏");
+            }
+            result.add(new CallChainReferencePayload(
+                    uuid(item, "id"), uuid(item, "repositoryId"), name, nodeCount, edgeCount));
+        }
+        return List.copyOf(result);
+    }
+
+    private int positive(JsonNode node, String field) {
+        return node != null && node.has(field) && node.get(field).canConvertToInt()
+                && node.get(field).asInt() > 0 ? node.get(field).asInt() : -1;
     }
 
     private List<RetrievedSourcePayload> decodeRetrievedSources(JsonNode node) {

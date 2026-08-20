@@ -35,6 +35,75 @@ export type SearchRoot = {
   createdAt: string
 }
 
+export type RepositoryObservation = {
+  branch: string | null
+  head: string | null
+  dirty: boolean
+  unborn: boolean
+  detached: boolean
+  shallow: boolean
+  stagedCount: number
+  unstagedCount: number
+  untrackedCount: number
+  sensitiveChangedCount: number
+  observedAt: string
+}
+
+export type CallChainReference = {
+  id: string
+  repositoryId: string
+  name: string
+  nodeCount: number
+  edgeCount: number
+}
+
+export type CallChainSummary = CallChainReference & {
+  repositoryName: string
+  createdAt: string
+  updatedAt: string
+}
+
+export type NodeRevisionView = {
+  id: string
+  parentRevisionId: string | null
+  sourceHash: string
+  path: string
+  startLine: number
+  endLine: number
+  observation: RepositoryObservation
+  observedAt: string
+}
+
+export type CallChainNodeDetail = {
+  nodeId: string
+  revisionId: string
+  language: string
+  qualifiedSymbol: string
+  signature: string
+  summary: string
+  sourceHash: string
+  path: string
+  startLine: number
+  endLine: number
+  source: string
+  observation: RepositoryObservation
+  revisions: NodeRevisionView[]
+}
+
+export type CallChainEdge = {
+  fromNodeId: string
+  toNodeId: string
+}
+
+export type CallChainDetail = CallChainSummary & {
+  originConversationId: string
+  originAnswerEntryId: string
+  createdAt: string
+  updatedAt: string
+  nodes: CallChainNodeDetail[]
+  edges: CallChainEdge[]
+}
+
 export type CodebaseCatalog = {
   platform: PlatformView
   gitAvailable: boolean
@@ -114,6 +183,47 @@ export async function removeSearchRoot(id: string, signal?: AbortSignal): Promis
     method: 'DELETE',
     signal,
   })
+}
+
+export async function listCallChains(repositoryId: string, signal?: AbortSignal): Promise<CallChainSummary[]> {
+  return request<CallChainSummary[]>(
+    `/api/codebase/repositories/${encodeURIComponent(repositoryId)}/call-chains`,
+    { signal },
+  )
+}
+
+export async function fetchCallChain(
+  repositoryId: string,
+  callChainId: string,
+  signal?: AbortSignal,
+): Promise<CallChainDetail> {
+  return request<CallChainDetail>(
+    `/api/codebase/repositories/${encodeURIComponent(repositoryId)}/call-chains/${encodeURIComponent(callChainId)}`,
+    { signal },
+  )
+}
+
+export async function renameCallChain(
+  repositoryId: string,
+  callChainId: string,
+  name: string,
+  signal?: AbortSignal,
+): Promise<CallChainDetail> {
+  return request<CallChainDetail>(
+    `/api/codebase/repositories/${encodeURIComponent(repositoryId)}/call-chains/${encodeURIComponent(callChainId)}`,
+    { method: 'PATCH', body: JSON.stringify({ name }), signal },
+  )
+}
+
+export async function deleteCallChain(
+  repositoryId: string,
+  callChainId: string,
+  signal?: AbortSignal,
+): Promise<CallChainDetail> {
+  return request<CallChainDetail>(
+    `/api/codebase/repositories/${encodeURIComponent(repositoryId)}/call-chains/${encodeURIComponent(callChainId)}`,
+    { method: 'DELETE', signal },
+  )
 }
 
 async function request<T>(url: string, init: RequestInit = {}): Promise<T> {

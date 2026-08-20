@@ -14,6 +14,7 @@ import java.util.List;
  * @param trace            有界展示轨迹；只用于 UI/历史审查，禁止重新送入模型上下文
  * @param completionStatus 输出是否自然结束；长度收束时保留已生成正文
  * @param completionDetailCode 仅描述续写阶段异常等稳定诊断，普通长度收束为空
+ * @param callChain 本次 Run 成功准备的调用链最小引用；准备失败或没有有效草稿时为空
  */
 public record AgentResult(
         String text,
@@ -24,7 +25,8 @@ public record AgentResult(
         List<AgentRetrievedSource> retrievedSources,
         List<AgentRunTraceItem> trace,
         AgentCompletionStatus completionStatus,
-        String completionDetailCode
+        String completionDetailCode,
+        AgentCallChainReference callChain
 ) {
 
     public AgentResult {
@@ -39,7 +41,7 @@ public record AgentResult(
         String text, String provider, String model, AgentUsage usage, List<AgentCitation> citations
     ) {
         this(text, provider, model, usage, citations, List.of(), List.of(),
-                AgentCompletionStatus.COMPLETE, null);
+                AgentCompletionStatus.COMPLETE, null, null);
     }
 
     /** 保持既有六参数调用兼容；旧调用没有 Retrieved Source。 */
@@ -48,7 +50,7 @@ public record AgentResult(
             List<AgentCitation> citations, List<AgentRunTraceItem> trace
     ) {
         this(text, provider, model, usage, citations, List.of(), trace,
-                AgentCompletionStatus.COMPLETE, null);
+                AgentCompletionStatus.COMPLETE, null, null);
     }
 
     /** 兼容已有调用方提供 Retrieved Source 与 Trace 的七参数构造。 */
@@ -58,13 +60,24 @@ public record AgentResult(
             List<AgentRunTraceItem> trace
     ) {
         this(text, provider, model, usage, citations, retrievedSources, trace,
-                AgentCompletionStatus.COMPLETE, null);
+                AgentCompletionStatus.COMPLETE, null, null);
     }
 
     /** 保持测试替身和既有调用方的四参数构造兼容；旧调用没有 Citation。 */
     public AgentResult(String text, String provider, String model, AgentUsage usage) {
         this(text, provider, model, usage, List.of(), List.of(), List.of(),
-                AgentCompletionStatus.COMPLETE, null);
+                AgentCompletionStatus.COMPLETE, null, null);
+    }
+
+    /** 兼容已有调用方提供完整完成状态但没有调用链引用的九参数构造。 */
+    public AgentResult(
+            String text, String provider, String model, AgentUsage usage,
+            List<AgentCitation> citations, List<AgentRetrievedSource> retrievedSources,
+            List<AgentRunTraceItem> trace, AgentCompletionStatus completionStatus,
+            String completionDetailCode
+    ) {
+        this(text, provider, model, usage, citations, retrievedSources, trace,
+                completionStatus, completionDetailCode, null);
     }
 
 }
